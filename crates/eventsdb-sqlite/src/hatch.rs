@@ -145,6 +145,19 @@ fn authorize(context: &AuthContext<'_>, trusted: bool) -> Authorization {
     }
 }
 
+/// Turn SQLite's bare "not authorized" into a message that says what was
+/// refused and where to go instead.
+///
+/// Applied wherever a guarded body's error surfaces — which is not only
+/// [`guarded`] itself: the projection runner carries its outcome out inside a
+/// tuple, so the mapping has to be reachable from there too.
+pub(crate) fn map_denial(error: Error) -> Error {
+    match &error {
+        Error::Storage(message) if message.contains("not authorized") => denied(),
+        _ => error,
+    }
+}
+
 /// The message a denial produces, which SQLite reports only as
 /// "not authorized".
 fn denied() -> Error {
@@ -354,7 +367,7 @@ impl SqliteEventLog {
 /// A log that looks alive and silently cannot be written to is the worst
 /// failure available here, so the unwind is caught and reported rather than
 /// allowed past this frame.
-fn guarded<T, F>(conn: &mut Connection, trusted: Arc<AtomicBool>, body: F) -> Result<T>
+pub(crate) fn guarded<T, F>(conn: &mut Connection, trusted: Arc<AtomicBool>, body: F) -> Result<T>
 where
     F: FnOnce(&mut Connection) -> Result<T>,
 {
@@ -370,10 +383,7 @@ where
 
     match outcome {
         Ok(Ok(value)) => Ok(value),
-        // SQLite reports every denial the same way, so the useful message has
-        // to be built here.
-        Ok(Err(Error::Storage(message))) if message.contains("not authorized") => Err(denied()),
-        Ok(Err(error)) => Err(error),
+        Ok(Err(error)) => Err(map_denial(error)),
         Err(panic) => Err(Error::storage(format!(
             "the statement panicked: {}",
             panic_message(&panic)

@@ -57,18 +57,37 @@ use crate::store::{insert_stamped, next_seq, select_stream, set_next_seq};
 /// A `Drop` guard rather than a set/clear pair on purpose: a panic between the
 /// two would leave the flag raised, and the caller's next raw statement could
 /// then write `events` — forging precisely what the hatch exists to prevent.
-struct Trusted<'a>(&'a AtomicBool);
+/// Restores the previous value rather than clearing, so the guards nest. The
+/// projection runner raises trust for its own work and lowers it again around
+/// the projection's callbacks, and an append inside such a callback must put
+/// back what it found.
+pub(crate) struct Trusted<'a>(&'a AtomicBool, bool);
 
 impl<'a> Trusted<'a> {
-    fn raise(flag: &'a AtomicBool) -> Self {
-        flag.store(true, Ordering::SeqCst);
-        Trusted(flag)
+    pub(crate) fn raise(flag: &'a AtomicBool) -> Self {
+        Trusted(flag, flag.swap(true, Ordering::SeqCst))
     }
 }
 
 impl Drop for Trusted<'_> {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
+        self.0.store(self.1, Ordering::SeqCst);
+    }
+}
+
+/// The inverse: drop trust for the duration of a callback the crate does not
+/// control, and put it back afterwards.
+pub(crate) struct Untrusted<'a>(&'a AtomicBool, bool);
+
+impl<'a> Untrusted<'a> {
+    pub(crate) fn lower(flag: &'a AtomicBool) -> Self {
+        Untrusted(flag, flag.swap(false, Ordering::SeqCst))
+    }
+}
+
+impl Drop for Untrusted<'_> {
+    fn drop(&mut self) {
+        self.0.store(self.1, Ordering::SeqCst);
     }
 }
 

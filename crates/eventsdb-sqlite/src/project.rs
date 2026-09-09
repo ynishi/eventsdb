@@ -24,6 +24,7 @@
 //! - **Resumable.** The cursor is in the same database as the log, so a
 //!   process that stops mid-catch-up resumes where it stopped.
 
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use eventsdb_core::error::{Error, Result};
@@ -31,18 +32,60 @@ use eventsdb_core::log::Filter;
 use eventsdb_core::position::{Position, Recorded};
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 
+use crate::hatch::{guarded, map_denial};
 use crate::log::{head_position_in, load_checkpoint, save_checkpoint, select_recorded};
 use crate::retention::require_complete_from;
 use crate::shared::{classify, map_isle, Shared};
+use crate::txn::{Trusted, Untrusted};
 
 /// How many events a runner applies per transaction unless told otherwise.
 pub const DEFAULT_BATCH: usize = 256;
+
+/// The runner's own view of its transaction.
+///
+/// It derefs to the [`Transaction`] for the runner's own bookkeeping — reading
+/// and writing `checkpoints`, which is a reserved table and therefore needs
+/// the guard's trust — and [`RunnerTxn::callback`] is the one way into the
+/// projection, which drops that trust for the duration of the call.
+///
+/// The projection is a public trait, so its body is caller code. Before this
+/// existed it was handed a transaction with no authorizer installed at all: a
+/// second, unguarded door onto `events`, `checkpoints` and `retention`,
+/// sitting beside the one the hatch carefully closes.
+pub(crate) struct RunnerTxn<'t> {
+    pub(crate) tx: &'t Transaction<'t>,
+    pub(crate) trusted: &'t AtomicBool,
+}
+
+impl<'t> std::ops::Deref for RunnerTxn<'t> {
+    type Target = Transaction<'t>;
+
+    fn deref(&self) -> &Self::Target {
+        self.tx
+    }
+}
+
+impl RunnerTxn<'_> {
+    /// Call into the projection with the guard's trust dropped, so its body is
+    /// held to the same rules as a hatch closure: its own tables, yes; the
+    /// log's, no.
+    fn callback<R>(&self, body: impl FnOnce(&Transaction<'_>) -> Result<R>) -> Result<R> {
+        let _untrusted = Untrusted::lower(self.trusted);
+        body(self.tx)
+    }
+}
 
 /// A read model built from the log.
 ///
 /// Every method that writes is handed the transaction the log is being read
 /// on. Writing anywhere else — another connection, another file, a network
 /// call — gives up the one guarantee this is for.
+///
+/// That transaction is guarded: your own tables are yours, and the log's are
+/// refused, exactly as in [`crate::SqliteEventLog::with_transaction`]. A fold
+/// is not a place to append events or move another consumer's cursor from, and
+/// a public trait handed an unguarded transaction is a second door onto the
+/// invariants the rest of the crate maintains.
 pub trait Projection: Send + 'static {
     /// The consumer name the cursor is stored under. Stable across restarts,
     /// because it *is* the identity of the cursor.
@@ -126,7 +169,7 @@ impl<P: Projection> ProjectionRunner<P> {
 
     /// Create the read model's tables.
     pub async fn init(&mut self) -> Result<()> {
-        self.in_transaction(|projection, tx, _| projection.init(tx))
+        self.in_transaction(|projection, tx, _| tx.callback(|raw| projection.init(raw)))
             .await
     }
 
@@ -158,7 +201,7 @@ impl<P: Projection> ProjectionRunner<P> {
 
             let mut last = cursor;
             for event in &events {
-                projection.apply(tx, event)?;
+                tx.callback(|raw| projection.apply(raw, event))?;
                 last = event.position;
             }
 
@@ -218,8 +261,8 @@ impl<P: Projection> ProjectionRunner<P> {
                 require_complete_from(tx, Position::BEGINNING)?;
             }
             let name = projection.name().to_string();
-            projection.reset(tx)?;
-            projection.init(tx)?;
+            tx.callback(|raw| projection.reset(raw))?;
+            tx.callback(|raw| projection.init(raw))?;
             save_checkpoint(tx, &name, Position::BEGINNING)
         })
         .await?;
@@ -245,28 +288,50 @@ impl<P: Projection> ProjectionRunner<P> {
     async fn in_transaction<T, Body>(&mut self, body: Body) -> Result<T>
     where
         T: Send + 'static,
-        Body: FnOnce(&mut P, &Transaction<'_>, &eventsdb_core::upcast::UpcastChain) -> Result<T>
+        Body: FnOnce(&mut P, &RunnerTxn<'_>, &eventsdb_core::upcast::UpcastChain) -> Result<T>
             + Send
             + 'static,
     {
         let mut projection = self.projection.take().ok_or_else(Self::lost)?;
         let chain = self.shared.chain.clone();
+        let trusted = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&trusted);
 
         let job = move |conn: &mut Connection| {
-            let outcome = (|| {
-                let tx = conn
-                    .transaction_with_behavior(TransactionBehavior::Immediate)
-                    .map_err(classify)?;
-                let value = body(&mut projection, &tx, &chain)?;
-                tx.commit().map_err(classify)?;
-                Ok(value)
-            })();
-            Ok((projection, outcome))
+            // The runner reads and writes `checkpoints`, which is a reserved
+            // table — so it runs trusted, and drops that trust around every
+            // call into the projection (`RunnerTxn::callback`). Before this,
+            // `apply` was handed a transaction with no authorizer on it at
+            // all: a public trait with an unguarded second door onto `events`,
+            // `checkpoints` and `retention`.
+            let result = guarded(conn, trusted, move |conn| {
+                let _trusted = Trusted::raise(&flag);
+                let outcome = (|| {
+                    let tx = conn
+                        .transaction_with_behavior(TransactionBehavior::Immediate)
+                        .map_err(classify)?;
+                    let runner_tx = RunnerTxn {
+                        tx: &tx,
+                        trusted: &flag,
+                    };
+                    let value = body(&mut projection, &runner_tx, &chain)?;
+                    tx.commit().map_err(classify)?;
+                    Ok(value)
+                })();
+                Ok((projection, outcome))
+            });
+
+            // `guarded` catches a panic, and a projection that travelled into
+            // one cannot come back — the runner is poisoned, as it already was.
+            Ok(match result {
+                Ok((projection, outcome)) => (Some(projection), outcome.map_err(map_denial)),
+                Err(error) => (None, Err(error)),
+            })
         };
 
         match self.shared.isle.call(job).await {
             Ok((projection, outcome)) => {
-                self.projection = Some(projection);
+                self.projection = projection;
                 outcome
             }
             Err(isle) => Err(map_isle(isle)),

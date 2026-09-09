@@ -5,8 +5,9 @@
 //! was undone.
 
 use eventsdb_core::error::{Error, Result};
+use eventsdb_core::position::Recorded;
 use eventsdb_core::{EventLog, EventStore, Filter, Position};
-use eventsdb_sqlite::{Guard, Plan, SqliteEventLog};
+use eventsdb_sqlite::{Guard, Plan, Projection, SqliteEventLog, Transaction};
 use serde_json::{json, Map, Value};
 
 fn event(kind: &str) -> Map<String, Value> {
@@ -226,6 +227,111 @@ async fn the_hatch_may_index_the_log_but_not_drop_the_shipped_indices() {
         .await
         .unwrap_err();
     assert!(matches!(dropped, Error::Unsupported(_)), "got {dropped}");
+}
+
+/// A `Projection` is a public trait, so `apply` is caller code — and it used
+/// to be handed a transaction with no authorizer on it at all. That was a
+/// second door onto the log's tables sitting beside the one the hatch closes:
+/// a projection could insert an event that never went through validation or
+/// stamping, and it would read back as legitimate.
+#[tokio::test]
+async fn a_projection_cannot_write_the_logs_own_tables() {
+    struct Saboteur {
+        statement: &'static str,
+    }
+
+    impl Projection for Saboteur {
+        fn name(&self) -> &str {
+            "saboteur"
+        }
+        fn reset(&mut self, _tx: &Transaction<'_>) -> Result<()> {
+            Ok(())
+        }
+        fn apply(&mut self, tx: &Transaction<'_>, _event: &Recorded) -> Result<()> {
+            tx.execute_batch(self.statement).map_err(sql_error)
+        }
+    }
+
+    for statement in [
+        "INSERT INTO events (stream, seq, epoch_ms, kind, schema_version, meta, data) \
+         VALUES ('x', 1, 0, 'forged', 1, '{}', '{}')",
+        // Erasing these would remove retention's only input for deciding what
+        // is safe to delete.
+        "DELETE FROM checkpoints",
+        "DELETE FROM retention",
+        "UPDATE stream_seq SET next_seq = 1",
+    ] {
+        let log = SqliteEventLog::open_in_memory().await.unwrap();
+        let mut s = log.stream_handle("s");
+        s.append(event("real")).await.unwrap();
+
+        let mut runner = log.runner(Saboteur { statement });
+        runner.init().await.unwrap();
+        let error = runner.catch_up().await.unwrap_err();
+        assert!(
+            matches!(error, Error::Unsupported(_)),
+            "`{statement}` should be refused, got {error}"
+        );
+
+        // Refused *and* rolled back: one event, the real one.
+        let all = log
+            .read_all(Position::BEGINNING, &Filter::all(), 10)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].kind(), "real");
+    }
+}
+
+/// The other half: the runner's own bookkeeping writes `checkpoints`, which is
+/// reserved, so it runs trusted — and the projection's own tables stay
+/// writable. Trust is dropped only for the duration of the callback.
+#[tokio::test]
+async fn a_projection_still_writes_its_own_tables_and_the_cursor_still_moves() {
+    struct Counter;
+
+    impl Projection for Counter {
+        fn name(&self) -> &str {
+            "counter"
+        }
+        fn init(&mut self, tx: &Transaction<'_>) -> Result<()> {
+            tx.execute_batch("CREATE TABLE IF NOT EXISTS seen (n INTEGER)")
+                .map_err(sql_error)
+        }
+        fn reset(&mut self, tx: &Transaction<'_>) -> Result<()> {
+            tx.execute_batch("DELETE FROM seen").map_err(sql_error)
+        }
+        fn apply(&mut self, tx: &Transaction<'_>, _event: &Recorded) -> Result<()> {
+            tx.execute("INSERT INTO seen (n) VALUES (1)", [])
+                .map(|_| ())
+                .map_err(sql_error)
+        }
+    }
+
+    let log = SqliteEventLog::open_in_memory().await.unwrap();
+    let mut s = log.stream_handle("s");
+    for _ in 0..3 {
+        s.append(event("a")).await.unwrap();
+    }
+
+    let mut runner = log.runner(Counter);
+    runner.init().await.unwrap();
+    assert_eq!(runner.catch_up().await.unwrap(), 3);
+    assert_eq!(runner.position().await.unwrap(), Position::new(3));
+
+    let rows = log
+        .query("SELECT count(*) AS n FROM seen", Vec::new())
+        .await
+        .unwrap();
+    assert_eq!(rows[0]["n"], serde_json::json!(3));
+
+    // And a rebuild, which calls reset + init inside the same guard.
+    assert_eq!(runner.rebuild().await.unwrap(), 3);
+    let rows = log
+        .query("SELECT count(*) AS n FROM seen", Vec::new())
+        .await
+        .unwrap();
+    assert_eq!(rows[0]["n"], serde_json::json!(3));
 }
 
 #[tokio::test]
