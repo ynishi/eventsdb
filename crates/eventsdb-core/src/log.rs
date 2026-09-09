@@ -28,8 +28,16 @@ pub struct Filter {
     /// Kinds to include. `None` includes every kind; an empty vector selects
     /// nothing, which is the honest reading of "include these" given none.
     pub kinds: Option<Vec<String>>,
-    /// Restrict to one stream. `None` reads every stream.
-    pub stream: Option<String>,
+    /// Streams to include. `None` reads every stream; an empty vector selects
+    /// nothing, the same reading `kinds` gets.
+    ///
+    /// **A set, not one name.** Restricting to a single stream is the common
+    /// case and [`Filter::stream`] still spells it, but the question a caller
+    /// actually has is often about a *group* — the streams of one session, of
+    /// one tenant, of one run. Given only a single-stream filter that has to
+    /// be answered with one read per stream and a merge in the caller, which
+    /// loses the position order the log exists to provide.
+    pub streams: Option<Vec<String>>,
 }
 
 impl Filter {
@@ -44,19 +52,42 @@ impl Filter {
     {
         Filter {
             kinds: Some(kinds.into_iter().map(Into::into).collect()),
-            stream: None,
+            streams: None,
         }
     }
 
+    /// Restrict to one stream.
+    ///
+    /// Replaces whatever set was there, rather than adding to it: reading it
+    /// as "and also this one" would make `.stream("a").stream("b")` mean
+    /// something no reader would guess from the singular name.
     pub fn stream(mut self, stream: impl Into<String>) -> Self {
-        self.stream = Some(stream.into());
+        self.streams = Some(vec![stream.into()]);
         self
     }
 
-    /// Whether this filter can match anything at all. An empty kind list
-    /// cannot, and a backend can skip the query entirely.
+    /// Restrict to a set of streams.
+    ///
+    /// An empty set selects nothing, which is what "include these" given none
+    /// says. A caller assembling a set from somewhere that can legitimately
+    /// come back empty should check before asking.
+    pub fn streams<I, S>(mut self, streams: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.streams = Some(streams.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Whether this filter can match anything at all. An empty list of either
+    /// kind cannot, and a backend can skip the query entirely.
     pub fn selects_nothing(&self) -> bool {
         self.kinds.as_ref().is_some_and(|kinds| kinds.is_empty())
+            || self
+                .streams
+                .as_ref()
+                .is_some_and(|streams| streams.is_empty())
     }
 }
 

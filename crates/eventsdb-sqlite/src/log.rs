@@ -24,7 +24,7 @@ use crate::project::{Projection, ProjectionRunner};
 use crate::row;
 use crate::schema;
 use crate::shared::{classify, map_isle, Shared};
-use crate::store::{self, clamp_limit, SqliteEventStore};
+use crate::store::{clamp_limit, SqliteEventStore};
 
 /// Default wait before a subscriber looks again when nothing woke it.
 ///
@@ -286,17 +286,12 @@ impl SqliteEventLog {
     ///
     /// Call [`SqliteEventLog::shutdown`] before exiting to be sure the queue
     /// drained.
+    ///
+    /// Naming the stream, for a caller that holds the log. One that holds a
+    /// stream handle has the same verb without the parameter — it is
+    /// [`EventStore::detach_append`], which this is.
     pub fn detach_append(&self, stream: &str, event: Map<String, Value>) -> Result<()> {
-        eventsdb_core::event::validate(&event)?;
-        let stream = stream.to_string();
-        self.shared
-            .isle
-            .spawn_call(move |conn: &mut Connection| {
-                let _ = store::append_stamped_now(conn, &stream, event);
-                Ok(())
-            })
-            .detach();
-        Ok(())
+        self.stream_handle(stream).detach_append(event)
     }
 
     /// A typed handle rather than the boxed trait object, for callers that
@@ -395,9 +390,16 @@ pub(crate) fn select_stored(
     let mut sql = format!("SELECT {} FROM events WHERE position > ?1", row::COLUMNS);
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(stored_position(from)?)];
 
-    if let Some(stream) = &filter.stream {
-        params.push(Box::new(stream.clone()));
-        sql.push_str(&format!(" AND stream = ?{}", params.len()));
+    if let Some(streams) = &filter.streams {
+        check_placeholders(streams.len(), "streams")?;
+        let first = params.len() + 1;
+        let holes: Vec<String> = (0..streams.len())
+            .map(|i| format!("?{}", first + i))
+            .collect();
+        sql.push_str(&format!(" AND stream IN ({})", holes.join(", ")));
+        for stream in streams {
+            params.push(Box::new(stream.clone()));
+        }
     }
     if let Some(kinds) = &filter.kinds {
         check_placeholders(kinds.len(), "kinds")?;

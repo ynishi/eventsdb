@@ -223,6 +223,35 @@ async fn the_trigger_leaves_the_paths_that_must_still_work_alone() {
     assert_eq!(s.len().await.unwrap(), 1);
 }
 
+/// The same refusals, whichever handle the SQL came in through.
+///
+/// `ATTACH` is the one that separates the two gates. `sqlite3_stmt_readonly`
+/// answers *true* for it — it changes the connection's configuration rather
+/// than any file's contents — so a path that relies on the readonly check
+/// alone lets a caller attach a database to a long-lived pooled connection and
+/// leave it there for whoever gets that connection next. Only the authorizer
+/// refuses it, and the authorizer has to be installed on both paths.
+#[tokio::test]
+async fn a_stream_handles_sql_is_gated_exactly_as_the_logs_is() {
+    let log = seeded().await;
+    let s = log.stream_handle("s");
+
+    for statement in [
+        "ATTACH DATABASE ':memory:' AS smuggled",
+        "DELETE FROM events",
+        "PRAGMA journal_mode = DELETE",
+    ] {
+        let by_log = log.query(statement, Vec::new()).await;
+        let by_handle = s.query(statement, Vec::new()).await;
+
+        assert!(by_log.is_err(), "the log should refuse `{statement}`");
+        assert!(
+            by_handle.is_err(),
+            "the handle let `{statement}` through, and the log did not"
+        );
+    }
+}
+
 #[tokio::test]
 async fn the_hatch_refuses_to_attach_a_database_or_set_a_pragma() {
     let log = seeded().await;

@@ -229,6 +229,62 @@ async fn a_detached_append_refuses_a_malformed_event_synchronously() {
     assert!(matches!(error, Error::Validation(_)), "got {error}");
 }
 
+/// The verb is on the handle, not only on the log, which is what puts it
+/// within reach of the case it exists for.
+///
+/// A `Drop` has a `&mut self` of its own type and whatever that yields — here
+/// a `&` of the field. It has no runtime, so it cannot `.await`, and it must
+/// not block. Taking `&self` is what makes those three facts compatible.
+#[tokio::test]
+async fn a_drop_holding_a_handle_can_record_its_own_close() {
+    struct Session {
+        store: eventsdb_sqlite::SqliteEventStore,
+    }
+
+    impl Drop for Session {
+        fn drop(&mut self) {
+            // No log in sight, no `.await`, no `block_on`.
+            let _ = self.store.detach_append(event("closed"));
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("events.db");
+
+    {
+        let log = SqliteEventLog::open(&path).await.unwrap();
+        {
+            let mut opener = log.stream_handle("s");
+            opener.append(event("opened")).await.unwrap();
+            let _session = Session {
+                store: log.stream_handle("s"),
+            };
+        } // the close is recorded here
+        log.close().await.unwrap(); // joins, so the queue drained
+    }
+
+    let log = SqliteEventLog::open(&path).await.unwrap();
+    let read = log
+        .read_all(Position::BEGINNING, &Filter::all(), 10)
+        .await
+        .unwrap();
+    let kinds: Vec<&str> = read.iter().map(|r| r.kind()).collect();
+    assert_eq!(kinds, vec!["opened", "closed"]);
+    log.close().await.unwrap();
+}
+
+/// A store with nowhere to queue it says so, rather than accepting the event
+/// and dropping it — which would leave a stream reading as open for ever with
+/// nothing to say why.
+#[tokio::test]
+async fn a_store_with_nowhere_to_queue_it_declines() {
+    use eventsdb_core::MemEventStore;
+
+    let store = MemEventStore::new("s");
+    let error = store.detach_append(event("closed")).unwrap_err();
+    assert!(matches!(error, Error::Unsupported(_)), "got {error}");
+}
+
 /// Joining is what makes a queued detached append land before a host exits —
 /// and `close(self)` cannot be called on a log behind an `Arc`.
 #[tokio::test]
@@ -283,6 +339,44 @@ async fn a_deadline_interrupts_an_expensive_statement() {
     // And the log is still usable: the interrupt did not poison the thread.
     let mut s = log.stream_handle("s");
     assert_eq!(s.append(event("after")).await.unwrap().seq, 1);
+}
+
+/// The same bound, reached from a stream handle rather than the log — which is
+/// what a caller generic over the trait holds.
+#[tokio::test]
+async fn a_handle_can_bound_a_statement_too() {
+    let log = SqliteEventLog::open_in_memory().await.unwrap();
+    let s = log.stream_handle("s");
+
+    let runaway = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c \
+                   WHERE x < 1000000000) SELECT count(*) FROM c";
+
+    let error = s
+        .query_timeout(runaway, Vec::new(), Duration::from_millis(150))
+        .await
+        .unwrap_err();
+    assert!(error.is_timeout(), "got {error}");
+
+    // A statement that finishes inside the bound comes back normally.
+    let rows = s
+        .query_timeout("SELECT 1 AS one", Vec::new(), Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(rows[0]["one"], json!(1));
+}
+
+/// A store with no statement to bound says so, rather than silently running an
+/// unbounded one for a caller who asked for a bound.
+#[tokio::test]
+async fn a_store_that_cannot_bound_a_statement_declines() {
+    use eventsdb_core::MemEventStore;
+
+    let store = MemEventStore::new("s");
+    let error = store
+        .query_timeout("SELECT 1", Vec::new(), Duration::from_secs(1))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Unsupported(_)), "got {error}");
 }
 
 #[tokio::test]

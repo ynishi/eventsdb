@@ -46,6 +46,8 @@
 //! is *fold*. The version that really does detect too late is the one whose
 //! lookup sits outside the transaction, which is not what this offers.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use serde_json::{Map, Value};
 
@@ -193,6 +195,44 @@ pub trait EventStore: Send + Sync {
         ))
     }
 
+    /// Queue an append and return without waiting for it to land.
+    ///
+    /// For a fact that has to be recorded from somewhere that cannot await:
+    /// a `Drop` closing a session is the case this exists for, and there
+    /// blocking is not allowed either, so neither `.await` nor
+    /// `block_on` is available. Hence a plain `fn` — an `async fn` would need
+    /// an executor the caller does not have.
+    ///
+    /// **`&self`, not `&mut self`.** A `Drop` has whatever reference it has,
+    /// and demanding a unique one is the difference between reachable from
+    /// there and not. Every other write on this trait takes `&mut self`
+    /// because it returns coordinates the caller is expected to use; this one
+    /// returns nothing to hold.
+    ///
+    /// **The envelope is checked here; the write is not reported.** A
+    /// malformed event is refused synchronously, before the call returns.
+    /// After that there is no channel back: a storage failure is dropped and
+    /// nothing is woken, because the caller has already gone. Use it for the
+    /// boundary record whose absence a reader would notice — the close of a
+    /// session that would otherwise read as still open — not for a fact
+    /// nothing else in the system knows.
+    ///
+    /// **Ordering is the backend's to keep.** The queued write must land
+    /// before anything submitted after it; a backend that spawns a task which
+    /// later calls [`EventStore::append`] has left the queue and races every
+    /// other writer, which is worse than declining.
+    ///
+    /// The default declines rather than dropping the event quietly. A store
+    /// with nowhere to queue it has no way to keep that ordering, and silence
+    /// here would leave a stream looking open for ever with nothing to say
+    /// why.
+    fn detach_append(&self, event: Map<String, Value>) -> Result<()> {
+        let _ = event;
+        Err(Error::Unsupported(
+            "this store cannot accept a write it is not awaited for".to_string(),
+        ))
+    }
+
     /// Events of `kinds` with `seq >= from_seq`, at most `limit`, in `seq`
     /// order and already upcasted.
     ///
@@ -261,12 +301,52 @@ pub trait EventStore: Send + Sync {
     /// were written, because the chain is Rust and the query is SQLite's. A
     /// caller reading across a schema change reads the versions it finds.
     ///
+    /// **The limit is yours, and so is knowing whether it cut.** There is no
+    /// `truncated` flag here because the `LIMIT` is in your text, not in a
+    /// parameter this store owns: ask for `n + 1` rows and compare, which is
+    /// the whole of what such a flag would tell you. Owning the limit instead
+    /// would mean wrapping your statement to attach one, and this call
+    /// deliberately never rewrites or parses what it is given — the read-only
+    /// check above is SQLite's answer about your text, not a reading of it.
+    ///
     /// The default refuses, because a store that is not a database has no
     /// answer to give.
     async fn query(&self, sql: &str, params: Vec<Value>) -> Result<Vec<Map<String, Value>>> {
         let _ = (sql, params);
         Err(Error::Unsupported(
             "this store is not a database and cannot answer SQL".to_string(),
+        ))
+    }
+
+    /// [`EventStore::query`] with a bound on how long the statement may run.
+    ///
+    /// **Not the same thing as `busy_timeout`.** That one bounds *waiting for
+    /// a lock*; this bounds a statement that took its lock immediately and is
+    /// simply expensive — a recursive CTE with a runaway bound, a join with no
+    /// usable index. Nothing else stops one, and a caller that hands SQL to
+    /// somebody else (a shell, a script, a user) cannot know in advance which
+    /// kind it is getting.
+    ///
+    /// A backend serving SQL from the same place it serves writes has the
+    /// stronger reason: one expensive statement there stalls every append
+    /// until it finishes.
+    ///
+    /// The deadline is reported as [`Error::Timeout`] — the caller's own bound
+    /// arriving, not the database failing — so retrying a narrower query is
+    /// the sensible next move.
+    ///
+    /// The default declines rather than falling back to [`EventStore::query`]:
+    /// running an unbounded statement for a caller who asked for a bound is
+    /// the one answer that is worse than none.
+    async fn query_timeout(
+        &self,
+        sql: &str,
+        params: Vec<Value>,
+        timeout: Duration,
+    ) -> Result<Vec<Map<String, Value>>> {
+        let _ = (sql, params, timeout);
+        Err(Error::Unsupported(
+            "this store cannot bound how long a statement runs".to_string(),
         ))
     }
 }

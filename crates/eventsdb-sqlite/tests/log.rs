@@ -99,6 +99,70 @@ async fn concurrent_writers_produce_positions_with_no_gap_and_no_repeat() {
     }
 }
 
+/// A group of streams read as one, in the log's order.
+///
+/// The thing a single-stream filter cannot do: answering "the streams of this
+/// session" with one read per stream and a merge in the caller throws away the
+/// position order, which is the property the global log exists to provide.
+#[tokio::test]
+async fn a_filter_can_name_a_set_of_streams() {
+    let log = SqliteEventLog::open_in_memory().await.unwrap();
+
+    // Interleaved, so a per-stream read followed by a merge would have to sort
+    // to get this back.
+    for round in 0..3 {
+        for name in ["a", "b", "c"] {
+            log.stream_handle(name)
+                .append(event(&format!("{name}{round}")))
+                .await
+                .unwrap();
+        }
+    }
+
+    let read = log
+        .read_all(
+            Position::BEGINNING,
+            &Filter::all().streams(["a", "c"]),
+            usize::MAX,
+        )
+        .await
+        .unwrap();
+
+    let seen: Vec<&str> = read.iter().map(|r| r.stream.as_str()).collect();
+    assert_eq!(seen, vec!["a", "c", "a", "c", "a", "c"], "in log order");
+    assert!(read.windows(2).all(|w| w[0].position < w[1].position));
+    assert!(!seen.contains(&"b"));
+
+    // The singular builder replaces rather than accumulates, as it says.
+    let one = log
+        .read_all(
+            Position::BEGINNING,
+            &Filter::all().stream("a").stream("b"),
+            usize::MAX,
+        )
+        .await
+        .unwrap();
+    assert!(one.iter().all(|r| r.stream == "b"));
+}
+
+/// An empty set is "include these" given none, exactly as an empty kind list
+/// is — and the backend skips the query rather than reading everything.
+#[tokio::test]
+async fn an_empty_stream_set_selects_nothing() {
+    let log = SqliteEventLog::open_in_memory().await.unwrap();
+    log.stream_handle("a").append(event("x")).await.unwrap();
+
+    let empty: [&str; 0] = [];
+    let filter = Filter::all().streams(empty);
+    assert!(filter.selects_nothing());
+
+    let read = log
+        .read_all(Position::BEGINNING, &filter, usize::MAX)
+        .await
+        .unwrap();
+    assert!(read.is_empty());
+}
+
 #[tokio::test]
 async fn read_all_is_exclusive_on_from_so_a_cursor_feeds_back_in() {
     let log = SqliteEventLog::open_in_memory().await.unwrap();

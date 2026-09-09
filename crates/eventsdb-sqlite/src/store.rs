@@ -9,7 +9,9 @@
 //! Reads and writes share one connection on one thread, so a stream's writes
 //! are serialized by construction rather than by a lock this code holds.
 
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use eventsdb_core::error::{Error, Result};
@@ -478,6 +480,28 @@ impl EventStore for SqliteEventStore {
         Ok(committed)
     }
 
+    /// Onto the isle's own queue, which is what keeps it ordered against every
+    /// other writer on this log. Spawning a task that later called `append`
+    /// would leave the queue and race them.
+    ///
+    /// The write's result is discarded here — see the trait's doc for why
+    /// there is nobody left to report it to. Subscribers are not woken for the
+    /// same reason; a follower reading the tail finds the event on its next
+    /// pass either way.
+    fn detach_append(&self, event: Map<String, Value>) -> Result<()> {
+        validate(&event)?;
+        let stream = self.stream.clone();
+
+        self.shared
+            .isle
+            .spawn_call(move |conn: &mut Connection| {
+                let _ = append_stamped_now(conn, &stream, event);
+                Ok(())
+            })
+            .detach();
+        Ok(())
+    }
+
     async fn read_kinds(
         &self,
         kinds: Option<&[&str]>,
@@ -561,9 +585,49 @@ impl EventStore for SqliteEventStore {
     /// scoped to this stream, because SQL over the log is a database-level
     /// question. Prefer the log's method; this one exists so the trait has an
     /// answer.
+    /// Under the authorizer, exactly as [`crate::SqliteEventLog::query`] is.
+    ///
+    /// The readonly check alone is not the same gate: `sqlite3_stmt_readonly`
+    /// answers *true* for `ATTACH`, which changes the connection's
+    /// configuration rather than any file's contents. Reader connections are
+    /// pooled and long-lived, so a database attached through one of them stays
+    /// there for whoever draws that connection next. This path used to call
+    /// `query_rows` directly and let exactly that through.
     async fn query(&self, sql: &str, params: Vec<Value>) -> Result<Vec<Map<String, Value>>> {
         let sql = sql.to_string();
-        self.read_job(move |conn: &mut Connection| Ok(crate::hatch::query_rows(conn, &sql, params)))
-            .await
+        self.read_job(move |conn: &mut Connection| {
+            Ok(crate::hatch::guarded(
+                conn,
+                Arc::new(AtomicBool::new(false)),
+                move |conn| crate::hatch::query_rows(conn, &sql, params),
+            ))
+        })
+        .await
+    }
+
+    /// [`EventStore::query`] with a deadline, on this store's own reader.
+    ///
+    /// The same bound [`crate::SqliteEventLog::query_timeout`] gives, reached
+    /// from a stream handle. `busy_timeout` covers waiting for a lock, which
+    /// is a different thing from a statement that is simply expensive.
+    async fn query_timeout(
+        &self,
+        sql: &str,
+        params: Vec<Value>,
+        timeout: Duration,
+    ) -> Result<Vec<Map<String, Value>>> {
+        let sql = sql.to_string();
+        let job = move |conn: &mut Connection| {
+            Ok(crate::hatch::guarded(
+                conn,
+                Arc::new(AtomicBool::new(false)),
+                move |conn| crate::hatch::query_rows(conn, &sql, params),
+            ))
+        };
+
+        match self.shared.reader().call_timeout(timeout, job).await {
+            Ok(inner) => inner,
+            Err(isle) => Err(map_isle(isle)),
+        }
     }
 }
