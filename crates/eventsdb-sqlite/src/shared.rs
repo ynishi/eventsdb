@@ -3,6 +3,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use eventsdb_core::error::Error;
 use eventsdb_core::position::Position;
 use eventsdb_core::upcast::UpcastChain;
@@ -24,6 +26,22 @@ pub(crate) fn backoff(attempt: u32) -> Duration {
 
 pub(crate) struct Shared {
     pub isle: AsyncIsle,
+    /// Read-only connections, for statements that do not need the write
+    /// transaction.
+    ///
+    /// Without these every read queues behind every write on the one thread,
+    /// which throws away the property WAL exists to provide. Measured before
+    /// they existed: a read that takes 73µs against an idle log took **8.2
+    /// seconds** while a write transaction was open, because it was not
+    /// waiting for the database — it was waiting for the queue.
+    ///
+    /// Empty for an in-memory log: each `:memory:` open is its own distinct
+    /// database, so a second connection would not see the first one's data at
+    /// all. Reads fall back to the writer there, which is correct and, with
+    /// nothing on disk, cheap.
+    pub readers: Vec<AsyncIsle>,
+    /// Round-robin cursor over `readers`.
+    pub next_reader: AtomicUsize,
     /// Identity of the database, not a path to take apart. Two handles are on
     /// the same database exactly when these compare equal.
     pub database: String,
@@ -37,6 +55,22 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
+    /// The isle a read should go to: the next reader, or the writer when there
+    /// are none.
+    ///
+    /// Reads that must see uncommitted work — anything inside a write
+    /// transaction, which is every projection fold and every decide-then-append
+    /// — must **not** come through here. A reader connection sees only what has
+    /// committed, which is the right answer for a standalone read and the wrong
+    /// one for a read the same transaction is about to write against.
+    pub fn reader(&self) -> &AsyncIsle {
+        if self.readers.is_empty() {
+            return &self.isle;
+        }
+        let next = self.next_reader.fetch_add(1, Ordering::Relaxed);
+        &self.readers[next % self.readers.len()]
+    }
+
     /// Announce a commit to in-process subscribers.
     ///
     /// The compare and the store happen under the channel's own lock. Reading

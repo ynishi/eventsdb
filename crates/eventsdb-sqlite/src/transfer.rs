@@ -35,7 +35,7 @@ impl SqliteEventLog {
         let filter = filter.clone();
 
         match shared
-            .isle
+            .reader()
             .call(move |conn: &mut Connection| {
                 Ok(select_stored(conn, from, &filter, limit).map(|rows| {
                     rows.into_iter()

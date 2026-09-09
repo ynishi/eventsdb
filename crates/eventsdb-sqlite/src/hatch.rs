@@ -308,9 +308,12 @@ impl SqliteEventLog {
             ))
         };
 
+        // A reader: `query` only reads, and running it on the writer is what
+        // let one expensive statement stall every append.
+        let isle = shared.reader();
         let outcome = match timeout {
-            Some(timeout) => shared.isle.call_timeout(timeout, job).await,
-            None => shared.isle.call(job).await,
+            Some(timeout) => isle.call_timeout(timeout, job).await,
+            None => isle.call(job).await,
         };
 
         match outcome {

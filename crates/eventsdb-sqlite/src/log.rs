@@ -35,6 +35,12 @@ pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Default wait for a contended lock before a call fails as busy.
 pub const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Default number of read-only connections beside the writer.
+///
+/// Two rather than one so a slow read does not queue behind another slow read,
+/// and not many more because each is a thread and reads are usually short.
+pub const DEFAULT_READERS: usize = 2;
+
 /// How many events a subscription reads per round.
 const SUBSCRIBE_BATCH: usize = 256;
 
@@ -51,6 +57,8 @@ pub struct SqliteEventLog {
     /// shared reference: a log behind an `Arc` cannot be consumed, and joining
     /// the thread is what makes detached appends land.
     driver: std::sync::Mutex<Option<AsyncIsleDriver>>,
+    /// The read-only connections' lifecycles, joined alongside the writer.
+    reader_drivers: std::sync::Mutex<Vec<AsyncIsleDriver>>,
 }
 
 /// Open options, so the two timings above can be set without a second
@@ -59,6 +67,17 @@ pub struct OpenOptions {
     pub busy_timeout: Duration,
     pub poll_interval: Duration,
     pub upcasters: UpcastChain,
+    /// How many read-only connections to open beside the writer.
+    ///
+    /// Reads are served from these, so a statement does not queue behind a
+    /// write. Under WAL a reader does not block on a writer, and without them
+    /// this store gave that away: a read measured at 73µs idle took 8.2
+    /// seconds while one write transaction was open — waiting for the thread,
+    /// not for the database.
+    ///
+    /// `0` puts everything back on the writer. Ignored for an in-memory log,
+    /// where a second connection would be a second, empty database.
+    pub readers: usize,
 }
 
 impl Default for OpenOptions {
@@ -67,6 +86,7 @@ impl Default for OpenOptions {
             busy_timeout: DEFAULT_BUSY_TIMEOUT,
             poll_interval: DEFAULT_POLL_INTERVAL,
             upcasters: UpcastChain::new(),
+            readers: DEFAULT_READERS,
         }
     }
 }
@@ -105,11 +125,34 @@ impl SqliteEventLog {
         // with the same string exactly when they are on the same database —
         // and `./a.db` next to `a.db` would otherwise read as two.
         let database = std::fs::canonicalize(&path)
-            .unwrap_or(path)
+            .unwrap_or_else(|_| path.clone())
             .display()
             .to_string();
 
-        Self::finish(isle, driver, database, options).await
+        // After the writer, so the WAL files it creates already exist — a
+        // read-only connection cannot create them.
+        let mut readers = Vec::with_capacity(options.readers);
+        let mut reader_drivers = Vec::with_capacity(options.readers);
+        for _ in 0..options.readers {
+            let (reader, reader_driver) = AsyncIsle::builder()
+                .open_flags(
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+                        | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+                )
+                .busy_timeout(busy_timeout)
+                .spawn(&path, move |conn| {
+                    // Belt to the open flag's braces: a statement that would
+                    // write is refused by SQLite rather than by us noticing.
+                    conn.execute_batch("PRAGMA query_only = 1;")
+                })
+                .await
+                .map_err(map_isle)?;
+            readers.push(reader);
+            reader_drivers.push(reader_driver);
+        }
+
+        Self::finish(isle, driver, readers, reader_drivers, database, options).await
     }
 
     /// A log with no file behind it. Durable in every other respect — the
@@ -126,12 +169,16 @@ impl SqliteEventLog {
                 .map_err(map_isle)?;
 
         let database = format!("memory:{}", MEMORY_COUNTER.fetch_add(1, Ordering::Relaxed));
-        Self::finish(isle, driver, database, options).await
+        // No readers: each `:memory:` open is a separate database, so a second
+        // connection would see an empty one.
+        Self::finish(isle, driver, Vec::new(), Vec::new(), database, options).await
     }
 
     async fn finish(
         isle: AsyncIsle,
         driver: AsyncIsleDriver,
+        readers: Vec<AsyncIsle>,
+        reader_drivers: Vec<AsyncIsleDriver>,
         database: String,
         options: OpenOptions,
     ) -> Result<Self> {
@@ -168,12 +215,15 @@ impl SqliteEventLog {
         Ok(SqliteEventLog {
             shared: Arc::new(Shared {
                 isle,
+                readers,
+                next_reader: std::sync::atomic::AtomicUsize::new(0),
                 database,
                 chain: options.upcasters,
                 notify,
                 poll_interval: options.poll_interval,
             }),
             driver: std::sync::Mutex::new(Some(driver)),
+            reader_drivers: std::sync::Mutex::new(reader_drivers),
         })
     }
 
@@ -195,6 +245,16 @@ impl SqliteEventLog {
     /// Idempotent. Handles issued by this log stay valid as values and fail as
     /// storage errors once the thread is gone.
     pub async fn shutdown(&self) -> Result<()> {
+        let readers = std::mem::take(
+            &mut *self
+                .reader_drivers
+                .lock()
+                .expect("the shutdown lock is never held across a panic"),
+        );
+        for reader in readers {
+            reader.shutdown().await.map_err(map_isle)?;
+        }
+
         let driver = self
             .driver
             .lock()
@@ -273,7 +333,10 @@ async fn read_all_shared(
         ))
     };
 
-    match shared.isle.call(job).await {
+    // A reader: this is a standalone read, so it must not queue behind a
+    // write. The projection runner does *not* come through here — its read is
+    // inside the transaction it is about to write.
+    match shared.reader().call(job).await {
         Ok(inner) => inner,
         Err(isle) => Err(map_isle(isle)),
     }
@@ -375,7 +438,7 @@ pub(crate) fn head_position_in(conn: &Connection) -> Result<Position> {
 /// The newest position, for a caller that holds only the shared handle.
 async fn head_shared(shared: &Arc<Shared>) -> Result<Position> {
     match shared
-        .isle
+        .reader()
         .call(|conn: &mut Connection| Ok(head_position_in(conn)))
         .await
     {
@@ -548,7 +611,7 @@ impl EventLog for SqliteEventLog {
         let consumer = consumer.to_string();
         match self
             .shared
-            .isle
+            .reader()
             .call(move |conn: &mut Connection| Ok(load_checkpoint(conn, &consumer)))
             .await
         {

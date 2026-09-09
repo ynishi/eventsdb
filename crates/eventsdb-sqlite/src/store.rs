@@ -55,10 +55,24 @@ impl SqliteEventStore {
         }
     }
 
-    /// Read on the isle. Reads are not retried: a contended read under WAL is
-    /// already waited out by `busy_timeout`, and a failure past that is worth
-    /// surfacing rather than papering over.
+    /// Read on a **reader** connection, so it does not queue behind a write.
+    ///
+    /// Not retried: a contended read under WAL is already waited out by
+    /// `busy_timeout`, and a failure past that is worth surfacing rather than
+    /// papering over.
     async fn read_job<T, Job>(&self, job: Job) -> Result<T>
+    where
+        T: Send + 'static,
+        Job: FnOnce(&mut Connection) -> rusqlite::Result<Result<T>> + Send + 'static,
+    {
+        match self.shared.reader().call(job).await {
+            Ok(inner) => inner,
+            Err(isle) => Err(map_isle(isle)),
+        }
+    }
+
+    /// Read on the **writer**, for a call that must also write there.
+    async fn writer_job<T, Job>(&self, job: Job) -> Result<T>
     where
         T: Send + 'static,
         Job: FnOnce(&mut Connection) -> rusqlite::Result<Result<T>> + Send + 'static,
@@ -346,7 +360,10 @@ impl EventStore for SqliteEventStore {
             })())
         };
 
-        let committed = self.read_job(job).await?;
+        // On the writer, not a reader: this reads *and* appends in one
+        // transaction, and a read-only connection could do neither the write
+        // nor see it.
+        let committed = self.writer_job(job).await?;
         if let Some(position) = committed.and_then(|c| c.position) {
             self.shared.publish(position);
         }

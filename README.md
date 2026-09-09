@@ -41,6 +41,21 @@ built on the envelope is not broken by a kind changing shape.
 `kind` is an opaque string here. Which kinds exist and what their `data` must
 contain belong to the layer above.
 
+## Reads do not queue behind writes
+
+One writer thread owns the connection that appends. Reads are served from
+their own read-only connections (two by default, `OpenOptions::readers`), so a
+statement does not wait for a write transaction to finish — which is the whole
+point of WAL, and was being given away when everything ran on one thread: a
+read measured at 73µs idle took **8.2 seconds** with one write open. It is now
+367µs [measured, `tests/readers.rs`].
+
+A reader sees committed data, which is the right answer for a standalone read
+and the wrong one inside a write transaction — so the reads a projection or a
+decide-then-append makes stay on the writer, where they can see the
+transaction's own work. An in-memory log has no readers, because each
+`:memory:` open is a separate database.
+
 ## Two things a networked event store cannot give you
 
 **Positions have no holes.** The backend allocates a global position inside
