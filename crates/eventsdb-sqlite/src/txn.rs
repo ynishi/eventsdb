@@ -144,35 +144,55 @@ impl<'t> TxnContext<'t> {
         self.append_at(stream, now_ms(), event)
     }
 
-    /// Append an event that happened at a known time.
+    /// The backfill counterpart to [`TxnContext::append`]: record an event
+    /// with a time it already has, instead of the wall clock of this call.
     ///
-    /// Identical to [`TxnContext::append`] in every other respect: the
-    /// envelope is validated, `seq` comes from the stream counter, `position`
-    /// from the rowid, `_schema_version` is stamped current. Only the wall
-    /// clock is the caller's.
+    /// Identical to `append` in every other respect — the envelope is
+    /// validated, `seq` comes from the stream counter, `position` from the
+    /// rowid, `_schema_version` is stamped current. The only difference is
+    /// which clock `epoch_ms` comes from.
     ///
-    /// # Why this is not "supply your own coordinates"
+    /// **Use `append` for ordinary writes, and reach for this only on
+    /// backfill paths**: bringing history in from a system that already has
+    /// its own notion of when, without discarding that timeline. For moving
+    /// an *eventsdb* log, use [`TxnContext::import`] instead — it preserves
+    /// the schema version too, which this cannot.
     ///
-    /// `seq` and `position` are **allocations**: the store enforces their
-    /// uniqueness and monotonicity, and two of its mechanisms exist purely to
-    /// defend them (`stream_seq` after a removal, `AUTOINCREMENT` against
-    /// rowid reuse). Handing those to a caller would give up what the store
-    /// guarantees.
+    /// # `epoch_ms` is a time coordinate, not an ordering key
     ///
-    /// `epoch_ms` is a **recorded observation**. Nothing orders by it — reads
-    /// order by `seq` or by `position` — and its only consumer is
-    /// [`crate::Plan::OlderThan`]. So supplying it surrenders no guarantee.
+    /// Every event carries a time coordinate (`epoch_ms`) and log positions
+    /// (`seq`, `position`). `append` sets the coordinate to now; this one lets
+    /// the caller substitute the moment the change happened where it came
+    /// from. Either way, **the positions order the log and the coordinate
+    /// never does.** Reads are `ORDER BY seq` or `ORDER BY position`; nothing
+    /// sorts by time.
     ///
-    /// # What it does change
+    /// That is also why supplying it surrenders nothing. `seq` and `position`
+    /// are **allocations** whose uniqueness and monotonicity the store
+    /// enforces — `stream_seq` and `AUTOINCREMENT` exist for no other reason —
+    /// and handing those over would give up what the store guarantees.
+    /// `epoch_ms` is a recorded observation with one consumer,
+    /// [`crate::Plan::OlderThan`].
     ///
-    /// `OlderThan` stops being a position prefix: imported history can be old
-    /// and sit at a high position. That is the shape [`crate::Plan::Streams`]
-    /// already produces, and which the retention watermark already handles —
-    /// not a new failure class.
+    /// # Non-monotonic time, and what it does to age
     ///
-    /// Use it for facts about the past: importing a log from elsewhere,
-    /// replaying an archive. For something happening now, use
-    /// [`TxnContext::append`] and let the store read the clock.
+    /// This does not enforce that the supplied time is at or after the
+    /// stream's current head: it may be earlier, equal or later, and nothing
+    /// detects it. A stream written only through `append` is non-decreasing by
+    /// construction, because the wall clock only moves forward.
+    ///
+    /// So `OlderThan` stops being a position prefix once backfilled history is
+    /// present — old events can sit at high positions.
+    /// [`crate::Plan::Streams`] already produces that shape and the retention
+    /// watermark already handles it, so it is not a new failure class, but it
+    /// is a different answer than the same call would give on an
+    /// `append`-only log.
+    ///
+    /// **Backfilling into an empty stream in chronological order keeps the
+    /// non-decreasing property by construction**, which is the usual migration
+    /// shape and the one to prefer. Mixing backfill into a stream that already
+    /// has appended events on a different clock is what leaves age queries
+    /// answering in ways that do not match intuition.
     pub fn append_at(
         &self,
         stream: &str,

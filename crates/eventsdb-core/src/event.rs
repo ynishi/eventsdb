@@ -35,6 +35,34 @@
 //!   in the same round as the kind whose shape it reads — a rule a reader can
 //!   follow, because the paths that need watching are all under one key.
 //!
+//! # `epoch_ms` is a time coordinate, not an ordering key
+//!
+//! Every event carries a time coordinate ([`FIELD_EPOCH_MS`]) and log
+//! positions (`seq`, and the backend's global position). **The positions order
+//! the log; the coordinate never does.** Every read is `ORDER BY seq` or
+//! `ORDER BY position`, and nothing anywhere sorts by time.
+//!
+//! Which moment the coordinate names depends on which call wrote the event,
+//! and there are exactly three:
+//!
+//! | written by | `epoch_ms` is |
+//! |------------|---------------|
+//! | an ordinary append | the wall clock of that write |
+//! | a backfill (`append_at`) | the moment the change happened where it came from |
+//! | a transfer (`import`) | whatever the source log recorded, unchanged |
+//!
+//! There is no fourth field saying which — the call you made says it. That is
+//! the same split `ai-store` draws between `append` and `import_event`, and it
+//! is drawn here for the same reason: a second field would have to be trusted
+//! to be accurate, and a verb cannot be wrong about itself.
+//!
+//! The consequence to know is that a log with backfilled or imported history
+//! has a coordinate that is not non-decreasing in position order, so an
+//! age-based question ([`crate::log::Filter`]'s consumers, and retention's
+//! `OlderThan`) answers differently than it would on an append-only log.
+//! Backfilling into an empty stream in chronological order keeps the
+//! non-decreasing property by construction, which is the shape to prefer.
+//!
 //! # The store does not interpret `kind`
 //!
 //! `kind` is an opaque string here. Which kinds exist, which of them a

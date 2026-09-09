@@ -67,6 +67,76 @@ async fn a_supplied_timestamp_does_not_reorder_anything() {
     assert_eq!(read[1].seq(), 2);
 }
 
+/// Backfilling into an empty stream in chronological order keeps the time
+/// coordinate non-decreasing in position order — the property an append-only
+/// log has for free, and the shape a migration should prefer.
+#[tokio::test]
+async fn a_chronological_backfill_keeps_time_non_decreasing() {
+    let log = SqliteEventLog::open_in_memory().await.unwrap();
+
+    log.with_transaction(|tx| {
+        for step in 0..10u64 {
+            tx.append_at("s", AN_OLD_TIME + step * 1_000, event("noted"))?;
+        }
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let read = log
+        .read_all(Position::BEGINNING, &Filter::all(), 20)
+        .await
+        .unwrap();
+    let times: Vec<u64> = read
+        .iter()
+        .map(|r| r.event["epoch_ms"].as_u64().unwrap())
+        .collect();
+    assert!(
+        times.windows(2).all(|w| w[0] <= w[1]),
+        "position order and time order agree: {times:?}"
+    );
+}
+
+/// And out of order, they do not — which the store permits and does not
+/// detect, so `OlderThan` removes a scattered set rather than a prefix.
+#[tokio::test]
+async fn an_out_of_order_backfill_makes_age_stop_being_a_prefix() {
+    let log = SqliteEventLog::open_in_memory().await.unwrap();
+
+    log.with_transaction(|tx| {
+        tx.append_at("s", A_NEWER_TIME, event("recent"))?; // position 1
+        tx.append_at("s", AN_OLD_TIME, event("ancient"))?; // position 2
+        tx.append_at("s", A_NEWER_TIME, event("recent"))?; // position 3
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let report = log
+        .retain(Plan::OlderThan(A_NEWER_TIME), Guard::Force)
+        .await
+        .unwrap();
+    assert_eq!(report.removed, 1);
+    assert_eq!(
+        report.highest_removed,
+        Some(Position::new(2)),
+        "the removal is in the middle, not a prefix"
+    );
+
+    let left: Vec<u64> = log
+        .read_all(Position::BEGINNING, &Filter::all(), 10)
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.position.get())
+        .collect();
+    assert_eq!(
+        left,
+        vec![1, 3],
+        "sparse, and safe — the watermark covers it"
+    );
+}
+
 /// The one thing a supplied timestamp does change: age-based retention sees
 /// the supplied time, so imported history can be old and sit at a high
 /// position. That is the shape `Plan::Streams` already produces.

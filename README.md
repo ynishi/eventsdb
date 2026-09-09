@@ -41,6 +41,32 @@ built on the envelope is not broken by a kind changing shape.
 `kind` is an opaque string here. Which kinds exist and what their `data` must
 contain belong to the layer above.
 
+## Time is a coordinate, not an order
+
+Every event carries a time coordinate (`epoch_ms`) and log positions (`seq`,
+`position`). **The positions order the log; the coordinate never does.** Every
+read is `ORDER BY seq` or `ORDER BY position` — nothing sorts by time.
+
+Which moment the coordinate names is decided by the call that wrote it, and
+there are three:
+
+| written by | `epoch_ms` is |
+|---|---|
+| `append` | the wall clock of that write |
+| `append_at` — backfill | the moment the change happened where it came from |
+| `import` — transfer | whatever the source log recorded, unchanged |
+
+There is no fourth field recording which: the verb says it. A field would have
+to be trusted to be accurate; a verb cannot be wrong about itself.
+
+The consequence worth knowing: a log holding backfilled or imported history has
+a coordinate that is not non-decreasing in position order, so `Plan::OlderThan`
+removes a scattered set rather than a prefix. That is safe — the watermark
+already handles scattered removals — but it is a different answer than the same
+call gives on an append-only log. Backfilling into an empty stream in
+chronological order keeps the non-decreasing property by construction, and is
+the shape to prefer.
+
 ## Reads do not queue behind writes
 
 One writer thread owns the connection that appends. Reads are served from

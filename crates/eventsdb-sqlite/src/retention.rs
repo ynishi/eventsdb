@@ -51,7 +51,19 @@ pub enum Plan {
     /// log read as one sequence.
     Before(Position),
 
-    /// Every event stamped before `epoch_ms`. The age shape.
+    /// Every event whose time coordinate is before `epoch_ms`. The age shape.
+    ///
+    /// **Which moment that coordinate names depends on how the event was
+    /// written** — the wall clock of an ordinary append, the source's time for
+    /// a backfill, the original for a transfer (see
+    /// [`eventsdb_core::event`]). On an append-only log the three coincide and
+    /// this is a position prefix. On a log with backfilled or imported
+    /// history it is not: old events can sit at high positions, so this
+    /// removes a scattered set, exactly as [`Plan::Streams`] does.
+    ///
+    /// That is safe — the watermark handles a scattered removal, and §
+    /// "Positions go sparse" above says why — but it is a different answer
+    /// than the same call gives on a log written only by `append`.
     OlderThan(u64),
 
     /// Every event of these streams. The shape that fits a log of many short
