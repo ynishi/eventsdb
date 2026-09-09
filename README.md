@@ -222,6 +222,12 @@ than merely the same events. It is true for an in-order import into an empty
 store, which is what a migration is, and false when merging into a store that
 already has history — stated rather than left to assume.
 
+Both calls are on the `EventLog` trait, so a migration is written once against
+the trait rather than once per backend. `ExportedEvent` is backend-neutral, and
+a log that cannot do this declines rather than offering a partial import: a
+transfer that stopped half way is worse than one that refused, because from the
+outside there is no way to tell how far it got.
+
 ## The escape hatch
 
 Without one, anyone needing a query the API does not have opens the database
@@ -265,6 +271,18 @@ Each refusal is an invariant something else already promised — appends get
 stamped and ordered by the store, removals leave a ledger, `stream_seq` keeps
 `seq` from rewinding after a removal, `user_version` belongs to the migration
 ladder, `journal_mode` to the concurrency story.
+
+**How far that reaches.** The authorizer is a property of this API: it is
+installed on the connection this store owns, for the length of a call, so it
+covers everything coming through the crate and nothing else. A `sqlite3`
+session on the same file never meets it.
+
+One half of append-only is stronger than that. A trigger in the schema —
+which every connection that opens the file gets — makes a stored event
+impossible to *rewrite*, whoever opened it. Removal is deliberately not
+covered: retention deletes as its whole purpose, so the same trigger would
+have to be switched off inside the one transaction allowed to delete, which
+is the code least worth leaving unguarded.
 
 ## Benchmarks
 

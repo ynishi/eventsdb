@@ -12,6 +12,7 @@ use eventsdb_core::event::now_ms;
 use eventsdb_core::log::{EventLog, Filter};
 use eventsdb_core::position::{Position, Recorded};
 use eventsdb_core::store::EventStore;
+use eventsdb_core::transfer::{ExportedEvent, ImportReport};
 use eventsdb_core::upcast::{apply_chain, Current, UpcastChain};
 use futures_core::stream::BoxStream;
 use rusqlite::Connection;
@@ -632,6 +633,23 @@ impl EventLog for SqliteEventLog {
             Ok(inner) => inner,
             Err(isle) => Err(map_isle(isle)),
         }
+    }
+
+    /// Off a reader connection, so an export does not queue behind the writer.
+    async fn export(
+        &self,
+        from: Position,
+        filter: &Filter,
+        limit: usize,
+    ) -> Result<Vec<ExportedEvent>> {
+        crate::transfer::export(self, from, filter, limit).await
+    }
+
+    /// One transaction for the whole batch, with the stream counter read and
+    /// written once per stream rather than once per event. A failed import
+    /// leaves nothing behind.
+    async fn import(&self, events: Vec<ExportedEvent>) -> Result<ImportReport> {
+        crate::transfer::import(self, events).await
     }
 }
 

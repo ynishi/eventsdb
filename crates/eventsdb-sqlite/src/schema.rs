@@ -21,7 +21,7 @@ use rusqlite::{Connection, TransactionBehavior};
 use crate::shared::classify;
 
 /// The version this build expects. Bumped with every appended step.
-pub const TARGET_USER_VERSION: i64 = 3;
+pub const TARGET_USER_VERSION: i64 = 4;
 
 /// Step 1: the log and the consumer checkpoints.
 ///
@@ -86,13 +86,6 @@ const STEP_2: &str = "
     CREATE INDEX events_epoch_ms ON events (epoch_ms);
 ";
 
-/// The ladder, in order. Index `i` moves `user_version` from `i` to `i + 1`.
-///
-/// A database that predates `position` would get its backfill as a step here:
-/// add the column, then number the existing rows by `(epoch_ms, stream, seq)`
-/// — wall clock first, because it approximates causal order across streams,
-/// with `seq` breaking ties deterministically within one. No such database
-/// exists yet, so no such step is written.
 /// Step 3: the per-stream sequence counter, so `seq` cannot rewind.
 ///
 /// `seq` used to be derived from `MAX(seq)` over the surviving rows, which is
@@ -121,7 +114,46 @@ const STEP_3: &str = "
         SELECT stream, MAX(seq) + 1 FROM events GROUP BY stream;
 ";
 
-const LADDER: &[&str] = &[STEP_1, STEP_2, STEP_3];
+/// Step 4: a stored event cannot be updated, by anyone holding the file.
+///
+/// The authorizer in [`crate::hatch`] already refuses an `UPDATE`, but it
+/// covers this crate's own connection and only while a hatch call is running.
+/// It is a property of *this API*. Anything else that opens the file is
+/// unaffected — `sqlite3 log.db "UPDATE events SET kind = ..."` included.
+///
+/// A trigger lives in the schema, so every connection that opens the file gets
+/// it, whoever opened it. That is the difference worth buying: append-only
+/// stops being something callers are asked to respect and becomes a property
+/// of the data.
+///
+/// **It needs no exception anywhere**, because nothing in this crate updates
+/// an `events` row on any path: appends and imports insert, retention deletes,
+/// and the per-stream counter is a different table — one that is upserted, so
+/// the same trigger could not have been put there.
+///
+/// Deletion is deliberately left out. Retention removes events as its whole
+/// purpose, so a `no_delete` trigger would have to be dropped and recreated
+/// inside the one transaction that is allowed to delete. That is safe as far
+/// as concurrency goes — SQLite rolls DDL back with the transaction, and the
+/// `IMMEDIATE` write lock keeps everyone else out meanwhile — but it would
+/// leave the guard switched off inside precisely the code most able to get
+/// removal wrong, which is not a guard worth a ladder step.
+const STEP_4: &str = "
+    CREATE TRIGGER trg_events_no_update
+    BEFORE UPDATE ON events
+    BEGIN
+        SELECT RAISE(ABORT, 'events is append-only: a stored event cannot be updated');
+    END;
+";
+
+/// The ladder, in order. Index `i` moves `user_version` from `i` to `i + 1`.
+///
+/// A database that predates `position` would get its backfill as a step here:
+/// add the column, then number the existing rows by `(epoch_ms, stream, seq)`
+/// — wall clock first, because it approximates causal order across streams,
+/// with `seq` breaking ties deterministically within one. No such database
+/// exists yet, so no such step is written.
+const LADDER: &[&str] = &[STEP_1, STEP_2, STEP_3, STEP_4];
 
 /// Bring `conn` up to [`TARGET_USER_VERSION`], one transaction per step.
 ///

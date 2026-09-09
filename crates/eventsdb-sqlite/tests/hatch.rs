@@ -163,6 +163,66 @@ async fn the_hatch_refuses_to_write_the_bookkeeping_tables() {
     assert!(matches!(error, Error::ConsumerBehind { .. }), "got {error}");
 }
 
+/// Where the authorizer stops, and what carries on past it.
+///
+/// The authorizer is installed on this crate's own connection, for the length
+/// of a hatch call. Somebody who opens the file themselves never meets it — a
+/// `sqlite3` shell, another program, a later build of this one. So the refusal
+/// above is a property of *this API*, and on its own it is not the same claim
+/// as "a stored event cannot be rewritten".
+///
+/// The trigger is in the schema, which is a property of the *file*. That is
+/// the one this checks: a connection with no authorizer, full write access,
+/// and nothing of this crate between it and the table.
+#[tokio::test]
+async fn a_connection_outside_this_crate_still_cannot_rewrite_an_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("events.db");
+
+    let log = SqliteEventLog::open(&path).await.unwrap();
+    log.stream_handle("s")
+        .append(event("placed"))
+        .await
+        .unwrap();
+    log.close().await.unwrap();
+
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let error = conn
+        .execute("UPDATE events SET kind = 'rewritten'", [])
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("append-only"),
+        "the trigger should have refused it, got {error}"
+    );
+
+    // Refused, not partially applied.
+    let kind: String = conn
+        .query_row("SELECT kind FROM events", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(kind, "placed");
+}
+
+/// The trigger guards the events, and nothing else — the counter is a table
+/// that has to be updated, and retention is still allowed to remove.
+#[tokio::test]
+async fn the_trigger_leaves_the_paths_that_must_still_work_alone() {
+    let log = SqliteEventLog::open_in_memory().await.unwrap();
+    let mut s = log.stream_handle("s");
+
+    // The stream counter is upserted on every append after the first.
+    s.append(event("a")).await.unwrap();
+    assert_eq!(s.append(event("b")).await.unwrap().seq, 2);
+
+    // And removal is what retention is for. `Before` is inclusive, so this
+    // takes the first event and leaves the second.
+    let report = log
+        .retain(Plan::Before(Position::new(1)), Guard::Force)
+        .await
+        .unwrap();
+    assert_eq!(report.removed, 1);
+    assert_eq!(s.len().await.unwrap(), 1);
+}
+
 #[tokio::test]
 async fn the_hatch_refuses_to_attach_a_database_or_set_a_pragma() {
     let log = seeded().await;

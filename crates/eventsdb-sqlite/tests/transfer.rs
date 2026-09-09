@@ -346,3 +346,43 @@ async fn an_export_taken_before_retention_outlives_it() {
     assert!(report.reproduced_coordinates);
     assert_eq!(export_all(&restored).await, archive);
 }
+
+/// Page a whole log from one place to another, naming no backend.
+///
+/// The bound is `EventLog` and nothing else. That this compiles is most of
+/// what the test is for: before `export` and `import` were on the trait, a
+/// migration could only be written against `SqliteEventLog`, which made being
+/// movable a property of one backend rather than of the crate.
+async fn move_log<L: EventLog>(from: &L, to: &L) -> (usize, bool) {
+    let mut moved = 0;
+    let mut faithful = true;
+    let mut cursor = Position::BEGINNING;
+
+    loop {
+        let batch = from.export(cursor, &Filter::all(), 2).await.unwrap();
+        let Some(last) = batch.last() else { break };
+        cursor = last.position;
+
+        let report = to.import(batch).await.unwrap();
+        moved += report.imported;
+        faithful &= report.reproduced_coordinates;
+    }
+
+    (moved, faithful)
+}
+
+#[tokio::test]
+async fn a_migration_can_be_written_against_the_trait_alone() {
+    let source = SqliteEventLog::open_in_memory().await.unwrap();
+    let mut s = source.stream_handle("orders");
+    for n in 0..5 {
+        s.append(event("placed", n)).await.unwrap();
+    }
+
+    let target = SqliteEventLog::open_in_memory().await.unwrap();
+    let (moved, faithful) = move_log(&source, &target).await;
+
+    assert_eq!(moved, 5);
+    assert!(faithful, "the same events, at the same coordinates");
+    assert_eq!(export_all(&target).await, export_all(&source).await);
+}

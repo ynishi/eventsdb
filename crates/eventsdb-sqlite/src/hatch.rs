@@ -29,9 +29,18 @@
 //! authorizer a property of the file.
 //!
 //! What *is* a property of the file is a trigger, which is how `ai-store`
-//! defends the same invariant. This crate does not have one yet; the gap is
-//! recorded rather than papered over, because a reader who took the paragraph
-//! above as covering the CLI would be trusting something that is not there.
+//! defends the same invariant. This crate now carries one for half of it:
+//! [`crate::schema`] step 4 installs `trg_events_no_update`, so **no
+//! connection anywhere can rewrite a stored event**, `sqlite3` included. That
+//! half was free, because nothing here updates an `events` row on any path.
+//!
+//! The other half is not covered, and saying so is the point of this
+//! paragraph: a `DELETE` from outside this crate still succeeds, leaving no
+//! ledger entry. A `no_delete` trigger would have to be dropped and recreated
+//! inside retention's own transaction — the guard would be switched off in
+//! exactly the code most able to get removal wrong — so the gap is recorded
+//! rather than closed badly. A reader who took this section as covering
+//! removal by the CLI would be trusting something that is not there.
 //!
 //! So the hatch is not a convenience. It is what makes "go through the store"
 //! a reasonable thing to ask of code that has a choice, because there is

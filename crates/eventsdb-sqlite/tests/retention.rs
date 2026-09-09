@@ -466,6 +466,7 @@ async fn an_existing_database_is_carried_up_the_ladder() {
             "DROP TABLE stream_seq; \
              DROP TABLE retention; \
              DROP INDEX events_epoch_ms; \
+             DROP TRIGGER trg_events_no_update; \
              PRAGMA user_version = 1;",
         )
         .unwrap();
@@ -475,7 +476,7 @@ async fn an_existing_database_is_carried_up_the_ladder() {
         assert_eq!(version, 1);
     }
 
-    // Reopening runs step 2 and nothing else.
+    // Reopening runs steps 2 through 4, and nothing before them.
     let log = SqliteEventLog::open(&path).await.unwrap();
     assert_eq!(log.removed_watermark().await.unwrap(), Position::BEGINNING);
 
@@ -503,6 +504,14 @@ async fn an_existing_database_is_carried_up_the_ladder() {
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
     assert_eq!(version, eventsdb_sqlite::TARGET_USER_VERSION);
+
+    // Including the step-4 guard, which is the half that matters for a file
+    // that already exists: an append-only claim a database only gets when it
+    // is created new is not one its owner can rely on.
+    let error = conn
+        .execute("UPDATE events SET kind = 'rewritten'", [])
+        .unwrap_err();
+    assert!(error.to_string().contains("append-only"), "got {error}");
 }
 
 #[tokio::test]
