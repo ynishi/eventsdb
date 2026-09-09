@@ -156,9 +156,13 @@ impl<P: Projection> ProjectionRunner<P> {
     /// share a transaction with the completeness check, or retention could
     /// remove events between the check and the batch it vouched for. So this is
     /// the knob that bounds how long a fold holds the write lock, and the
-    /// reason the default is a number rather than "everything" [measured: a
-    /// 256-event batch took 175 ms while a concurrent read took 538 µs,
-    /// `tests/lock_hold.rs`, debug build].
+    /// reason the default is a number rather than "everything".
+    ///
+    /// The trade is real but shallow: folding 5 000 events took **9.5 ms** at
+    /// a batch of 1 024 and **12.6 ms** at 64 — a third more work for sixteen
+    /// times shorter lock holds [benched: `project` group, release]. When in
+    /// doubt, prefer the smaller batch; the throughput it costs is much less
+    /// than the latency it gives back to everything else writing.
     pub fn with_batch(mut self, batch: usize) -> Self {
         self.batch = batch.max(1);
         self

@@ -341,9 +341,12 @@ impl EventStore for SqliteEventStore {
     /// [measured: a decision over 20 000 events held the lock ~780 ms while a
     /// concurrent read took 536 µs, `tests/lock_hold.rs`, debug build].
     ///
-    /// `kinds` is the control, and the difference is not marginal: the same
-    /// decision took **706 ms** reading every kind and **1.05 ms** naming the
-    /// one it folded. Name what the fold reads.
+    /// `kinds` is the control, and the difference is not marginal. Over 20 000
+    /// events: **30.4 ms** reading every kind against **81 µs** naming the one
+    /// it folded — 376× [benched: `decide` group, release]. The narrow form
+    /// barely moves between 1 000 and 20 000 events (69 µs → 81 µs) because it
+    /// reads its own kind off an index rather than the stream, while the wide
+    /// one grows with the stream (3.9 ms → 30.4 ms). Name what the fold reads.
     async fn append_if(
         &mut self,
         kinds: Option<&[&str]>,

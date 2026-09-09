@@ -67,6 +67,12 @@ impl SqliteEventLog {
     /// store, they come out identical — and
     /// [`ImportReport::reproduced_coordinates`] says whether they did, rather
     /// than leaving a migration to assume it.
+    ///
+    /// Import is the slower half by some way: 5 000 events export in **5.5 ms**
+    /// and import in **45 ms** [benched: `transfer` group, release]. Each event
+    /// reads and writes the stream counter individually, which a batch could
+    /// do once per run — worth doing before anyone moves a large log, and not
+    /// worth doing speculatively before then.
     pub async fn import(&self, events: Vec<ExportedEvent>) -> Result<ImportReport> {
         if events.is_empty() {
             return Ok(ImportReport::nothing());

@@ -20,6 +20,12 @@ serde_json.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 futures-util = "0.3"
-tempfile = "3"
+tempfile.workspace = true
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+# Criterion needs the default harness off so it can own `main`.
+[[bench]]
+name = "eventsdb"
+harness = false

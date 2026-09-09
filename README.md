@@ -216,6 +216,36 @@ stamped and ordered by the store, removals leave a ledger, `stream_seq` keeps
 `seq` from rewinding after a removal, `user_version` belongs to the migration
 ladder, `journal_mode` to the concurrency story.
 
+## Benchmarks
+
+    cargo bench -p eventsdb-sqlite                        # everything
+    cargo bench -p eventsdb-sqlite -- decide              # one group
+    cargo bench -p eventsdb-sqlite -- --save-baseline before
+    cargo bench -p eventsdb-sqlite -- --baseline before   # compare
+
+Groups: `append`, `read`, `decide`, `project`, `transfer`, `retention`. All of
+them run against a file-backed log in a temporary directory, because that is
+what production uses — an in-memory log has no reader connections and no WAL on
+disk, so its numbers would flatter every path that matters.
+
+**What is not benchmarked here, deliberately.** Criterion measures steady-state
+cost: how long an operation takes when nothing is fighting it. "Does a read
+wait behind a write" is a question about contention — it has one answer rather
+than a distribution, and a regression there is a defect, not a slower number.
+Those live as assertions instead:
+
+| question | where |
+|---|---|
+| how long does this operation take | `benches/eventsdb.rs` |
+| does a read wait behind a write | `tests/readers.rs` |
+| does a read see the write that just returned | `tests/readers.rs` |
+| what does holding the write lock during a read cost | `tests/lock_hold.rs` |
+| does a second log on one file still order correctly | `tests/two_logs.rs` |
+
+Numbers that should get better go in benches; properties that must not regress
+stay in tests, where a failure is a failure rather than a slower bar on a
+chart.
+
 ## Schema evolution
 
 Two axes, and they are not the same one:

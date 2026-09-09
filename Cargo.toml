@@ -28,3 +28,6 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"
 # documented promise instead of an enforced one.
 rusqlite = { version = "0.37", features = ["bundled", "serde_json", "hooks"] }
 rusqlite-isle = { version = "0.5", features = ["tokio"] }
+
+criterion = { version = "0.8", features = ["async_tokio"] }
+tempfile = "3"
