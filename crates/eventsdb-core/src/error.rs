@@ -11,7 +11,14 @@ use thiserror::Error;
 /// The result of every fallible store operation.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// `#[non_exhaustive]` because this list is not finished.
+///
+/// Several open questions end in "add a variant", and each of those is a
+/// breaking change to every caller that matches exhaustively — unless the
+/// attribute is there first. It costs a `_` arm today and buys the right to
+/// name a new failure later without a major version.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum Error {
     /// The event did not satisfy the envelope contract. The message names the
     /// offending key and says what belongs there instead, because a caller

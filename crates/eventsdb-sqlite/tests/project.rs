@@ -104,7 +104,7 @@ async fn a_projection_folds_the_log_and_advances_its_cursor() {
         s.append(scored(n)).await.unwrap();
     }
 
-    let mut runner = log.runner(Totals::new());
+    let mut runner = log.runner_now(Totals::new());
     runner.init().await.unwrap();
     assert_eq!(runner.catch_up().await.unwrap(), 3);
 
@@ -115,7 +115,7 @@ async fn a_projection_folds_the_log_and_advances_its_cursor() {
 #[tokio::test]
 async fn run_once_returns_zero_when_caught_up() {
     let log = SqliteEventLog::open_in_memory().await.unwrap();
-    let mut runner = log.runner(Totals::new());
+    let mut runner = log.runner_now(Totals::new());
     runner.init().await.unwrap();
     assert_eq!(runner.run_once().await.unwrap(), 0);
 
@@ -140,7 +140,7 @@ async fn a_failing_apply_rolls_back_the_batch_and_the_cursor() {
 
     // The table is created in its own committed transaction, so its existence
     // is not what the rollback below is being tested on.
-    let mut runner = log.runner(Totals::failing_at(3));
+    let mut runner = log.runner_now(Totals::failing_at(3));
     runner.init().await.unwrap();
 
     let error = runner.catch_up().await.unwrap_err();
@@ -159,7 +159,7 @@ async fn a_failing_apply_rolls_back_the_batch_and_the_cursor() {
     // with no dedupe table anywhere.
     let mut projection = runner.into_inner().unwrap();
     projection.fail_at = None;
-    let mut runner = log.runner(projection);
+    let mut runner = log.runner_now(projection);
     assert_eq!(runner.catch_up().await.unwrap(), 5);
     assert_eq!(totals_of(&log, "player-1").await, Some(15));
     assert_eq!(runner.position().await.unwrap(), Position::new(5));
@@ -173,7 +173,7 @@ async fn a_projection_only_sees_the_kinds_it_names() {
     s.append(scored(4)).await.unwrap();
     s.append(noise()).await.unwrap();
 
-    let mut runner = log.runner(Totals::new());
+    let mut runner = log.runner_now(Totals::new());
     runner.init().await.unwrap();
     assert_eq!(runner.catch_up().await.unwrap(), 1, "only the scored event");
     assert_eq!(totals_of(&log, "player-1").await, Some(4));
@@ -196,7 +196,7 @@ async fn a_caught_up_filtered_projection_does_not_block_retention() {
         s.append(noise()).await.unwrap();
     }
 
-    let mut runner = log.runner(Totals::new());
+    let mut runner = log.runner_now(Totals::new());
     runner.init().await.unwrap();
     assert_eq!(runner.catch_up().await.unwrap(), 1, "one scored event");
     assert_eq!(
@@ -224,7 +224,7 @@ async fn a_full_batch_leaves_the_cursor_on_the_last_applied_event() {
         s.append(scored(1)).await.unwrap();
     }
 
-    let mut runner = log.runner(Totals::new()).with_batch(2);
+    let mut runner = log.runner_now(Totals::new()).with_batch(2);
     runner.init().await.unwrap();
     assert_eq!(runner.run_once().await.unwrap(), 2);
     assert_eq!(runner.position().await.unwrap(), Position::new(2));
@@ -242,7 +242,7 @@ async fn a_batch_boundary_does_not_change_the_result() {
         s.append(scored(1)).await.unwrap();
     }
 
-    let mut runner = log.runner(Totals::new()).with_batch(3);
+    let mut runner = log.runner_now(Totals::new()).with_batch(3);
     runner.init().await.unwrap();
     assert_eq!(runner.catch_up().await.unwrap(), 10);
     assert_eq!(totals_of(&log, "player-1").await, Some(10));
@@ -256,7 +256,7 @@ async fn rebuild_empties_the_model_and_replays_from_the_start() {
         s.append(scored(n)).await.unwrap();
     }
 
-    let mut runner = log.runner(Totals::new());
+    let mut runner = log.runner_now(Totals::new());
     runner.init().await.unwrap();
     runner.catch_up().await.unwrap();
     assert_eq!(totals_of(&log, "player-1").await, Some(6));
@@ -277,7 +277,7 @@ async fn a_restart_resumes_from_the_stored_cursor_without_double_counting() {
         let mut s = log.stream_handle("player-1");
         s.append(scored(10)).await.unwrap();
 
-        let mut runner = log.runner(Totals::new());
+        let mut runner = log.runner_now(Totals::new());
         runner.init().await.unwrap();
         assert_eq!(runner.catch_up().await.unwrap(), 1);
         log.close().await.unwrap();
@@ -287,7 +287,7 @@ async fn a_restart_resumes_from_the_stored_cursor_without_double_counting() {
     let mut s = log.stream_handle("player-1");
     s.append(scored(5)).await.unwrap();
 
-    let mut runner = log.runner(Totals::new());
+    let mut runner = log.runner_now(Totals::new());
     runner.init().await.unwrap();
     assert_eq!(
         runner.catch_up().await.unwrap(),
@@ -334,12 +334,12 @@ async fn two_projections_keep_separate_cursors() {
     s.append(scored(1)).await.unwrap();
     s.append(scored(1)).await.unwrap();
 
-    let mut fast = log.runner(Counter { name: "fast" });
+    let mut fast = log.runner_now(Counter { name: "fast" });
     fast.init().await.unwrap();
     assert_eq!(fast.catch_up().await.unwrap(), 2);
 
     // A second consumer starts from the beginning: its cursor is its own.
-    let mut slow = log.runner(Counter { name: "slow" });
+    let mut slow = log.runner_now(Counter { name: "slow" });
     slow.init().await.unwrap();
     assert_eq!(slow.run_once().await.unwrap(), 2);
 

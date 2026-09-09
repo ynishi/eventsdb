@@ -265,7 +265,7 @@ async fn a_projection_cannot_write_the_logs_own_tables() {
         let mut s = log.stream_handle("s");
         s.append(event("real")).await.unwrap();
 
-        let mut runner = log.runner(Saboteur { statement });
+        let mut runner = log.runner_now(Saboteur { statement });
         runner.init().await.unwrap();
         let error = runner.catch_up().await.unwrap_err();
         assert!(
@@ -314,7 +314,7 @@ async fn a_projection_still_writes_its_own_tables_and_the_cursor_still_moves() {
         s.append(event("a")).await.unwrap();
     }
 
-    let mut runner = log.runner(Counter);
+    let mut runner = log.runner_now(Counter);
     runner.init().await.unwrap();
     assert_eq!(runner.catch_up().await.unwrap(), 3);
     assert_eq!(runner.position().await.unwrap(), Position::new(3));
@@ -434,6 +434,51 @@ async fn an_over_wide_filter_says_so_instead_of_failing_as_storage() {
         .unwrap_err();
     assert!(matches!(error, Error::Unsupported(_)), "got {error}");
     assert!(error.to_string().contains("batches"), "got {error}");
+}
+
+/// A projection's name is the primary key of its row in `checkpoints`, so two
+/// live runners answering the same name shared one cursor: each advanced it
+/// past events the other had not folded, and neither was exactly-once any
+/// more. Nothing checked, and nothing showed.
+#[tokio::test]
+async fn two_live_runners_cannot_share_a_projection_name() {
+    struct Named(&'static str);
+
+    impl Projection for Named {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn init(&mut self, tx: &Transaction<'_>) -> Result<()> {
+            tx.execute_batch("CREATE TABLE IF NOT EXISTS seen (n INTEGER)")
+                .map_err(sql_error)
+        }
+        fn reset(&mut self, tx: &Transaction<'_>) -> Result<()> {
+            tx.execute_batch("DELETE FROM seen").map_err(sql_error)
+        }
+        fn apply(&mut self, tx: &Transaction<'_>, _event: &Recorded) -> Result<()> {
+            tx.execute("INSERT INTO seen (n) VALUES (1)", [])
+                .map(|_| ())
+                .map_err(sql_error)
+        }
+    }
+
+    let log = SqliteEventLog::open_in_memory().await.unwrap();
+    let first = log.runner(Named("counter")).unwrap();
+
+    let error = match log.runner(Named("counter")) {
+        Ok(_) => panic!("a second runner for a live name should be refused"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, Error::Unsupported(_)), "got {error}");
+    assert!(error.to_string().contains("already live"), "got {error}");
+
+    // A different name is fine alongside it.
+    let _other = log.runner(Named("other")).unwrap();
+
+    // And the name comes back when the runner goes, so stopping and starting
+    // a projection is ordinary.
+    drop(first);
+    let _again = log.runner(Named("counter")).unwrap();
 }
 
 #[tokio::test]

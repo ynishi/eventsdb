@@ -151,7 +151,7 @@ async fn a_projection_holds_the_lock_for_a_batch_not_for_the_log() {
     let dir = tempfile::tempdir().unwrap();
     let log = seeded(&dir.path().join("events.db"), 20_000).await;
 
-    let mut runner = log.runner(Counter).with_batch(256);
+    let mut runner = log.runner_now(Counter).with_batch(256);
     runner.init().await.unwrap();
 
     // One batch, not the whole log.
@@ -166,10 +166,15 @@ async fn a_projection_holds_the_lock_for_a_batch_not_for_the_log() {
         "a single batch took {one_batch:?}"
     );
 
+    // Hand the name back before the second runner takes it. Two live runners
+    // called `counter` would share one checkpoint row, and the store refuses
+    // that — which is how this test was found to be doing it.
+    drop(runner);
+
     // And a read during the rest of the catch-up is still prompt.
     let catching = Arc::clone(&log);
     let work = tokio::spawn(async move {
-        let mut runner = catching.runner(Counter).with_batch(256);
+        let mut runner = catching.runner_now(Counter).with_batch(256);
         runner.catch_up().await
     });
     tokio::time::sleep(Duration::from_millis(5)).await;

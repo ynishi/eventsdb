@@ -136,15 +136,47 @@ pub struct ProjectionRunner<P: Projection> {
     /// projection could not be handed back — see [`ProjectionRunner::lost`].
     projection: Option<P>,
     batch: usize,
+    /// The name this runner holds for as long as it lives.
+    name: String,
+}
+
+/// Releases the name so a later runner can take it — a projection that is
+/// stopped and started again is ordinary, and only *concurrent* holders are
+/// the problem.
+impl<P: Projection> Drop for ProjectionRunner<P> {
+    fn drop(&mut self) {
+        if let Ok(mut live) = self.shared.live_runners.lock() {
+            live.remove(&self.name);
+        }
+    }
 }
 
 impl<P: Projection> ProjectionRunner<P> {
-    pub(crate) fn new(shared: Arc<Shared>, projection: P) -> Self {
-        ProjectionRunner {
+    pub(crate) fn new(shared: Arc<Shared>, projection: P) -> Result<Self> {
+        let name = projection.name().to_string();
+
+        {
+            let mut live = shared
+                .live_runners
+                .lock()
+                .map_err(|_| Error::storage("the runner registry was poisoned"))?;
+            if !live.insert(name.clone()) {
+                return Err(Error::Unsupported(format!(
+                    "a runner for `{name}` is already live on this log; \
+                     that name is the primary key of its checkpoint, so two of \
+                     them would share one cursor and neither would be \
+                     exactly-once. Give the second projection its own name, or \
+                     drop the first runner"
+                )));
+            }
+        }
+
+        Ok(ProjectionRunner {
             shared,
             projection: Some(projection),
             batch: DEFAULT_BATCH,
-        }
+            name,
+        })
     }
 
     /// How many events one transaction covers.

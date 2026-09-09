@@ -207,7 +207,7 @@ async fn a_projection_on_one_log_folds_events_written_through_the_other() {
         through_b.append(event("a")).await.unwrap();
     }
 
-    let mut runner = a.runner(Counter);
+    let mut runner = a.runner_now(Counter);
     runner.init().await.unwrap();
     assert_eq!(
         runner.catch_up().await.unwrap(),

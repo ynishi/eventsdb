@@ -298,7 +298,7 @@ async fn a_projection_behind_the_watermark_is_refused() {
     }
 
     // Fold the first two, then have retention take the first four.
-    let mut runner = log.runner(Counter::strict()).with_batch(2);
+    let mut runner = log.runner_now(Counter::strict()).with_batch(2);
     runner.init().await.unwrap();
     assert_eq!(runner.run_once().await.unwrap(), 2);
     log.retain(Plan::Before(Position::new(4)), Guard::Force)
@@ -325,7 +325,7 @@ async fn a_projection_past_the_watermark_keeps_going() {
         s.append(event("a")).await.unwrap();
     }
 
-    let mut runner = log.runner(Counter::strict());
+    let mut runner = log.runner_now(Counter::strict());
     runner.init().await.unwrap();
     assert_eq!(runner.catch_up().await.unwrap(), 5);
 
@@ -353,7 +353,7 @@ async fn a_tolerant_projection_proceeds_past_the_watermark() {
         .await
         .unwrap();
 
-    let mut runner = log.runner(Counter::tolerant());
+    let mut runner = log.runner_now(Counter::tolerant());
     runner.init().await.unwrap();
     assert_eq!(
         runner.catch_up().await.unwrap(),
@@ -370,7 +370,7 @@ async fn a_rebuild_on_a_truncated_log_is_refused_before_anything_is_emptied() {
         s.append(event("a")).await.unwrap();
     }
 
-    let mut runner = log.runner(Counter::strict());
+    let mut runner = log.runner_now(Counter::strict());
     runner.init().await.unwrap();
     assert_eq!(runner.catch_up().await.unwrap(), 5);
     assert_eq!(counted(&log).await, Some(5));

@@ -52,6 +52,14 @@ pub(crate) struct Shared {
     /// covers a writer in *another* process: SQLite has no cross-process
     /// notification, so the only way to see such a write is to look.
     pub poll_interval: Duration,
+    /// Projection names with a live runner on this log.
+    ///
+    /// A projection's name is the primary key of its row in `checkpoints`, so
+    /// two runners answering the same name share one cursor without either
+    /// knowing: each advances it past events the other has not folded, and
+    /// both quietly stop being exactly-once. Holding the names makes the
+    /// second one a refusal instead.
+    pub live_runners: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl Shared {

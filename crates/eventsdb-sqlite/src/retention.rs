@@ -45,7 +45,12 @@ use crate::log::SqliteEventLog;
 use crate::shared::{classify, map_isle};
 
 /// What to remove.
+///
+/// `#[non_exhaustive]` for the same reason as [`Error`]: the shapes worth
+/// removing by are not a closed set — an archive-then-remove plan is the
+/// obvious next one — and adding a variant should not be a breaking change.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum Plan {
     /// Every event at or below `position`. The prefix-truncation shape, for a
     /// log read as one sequence.

@@ -285,7 +285,7 @@ fn project(c: &mut Criterion) {
                     // A catch-up applies nothing the second time, so the log
                     // has to be new — and the seeding must not be timed.
                     let (dir, log) = seeded(EVENTS, "noted").await;
-                    let mut runner = log.runner(Counter).with_batch(batch);
+                    let mut runner = log.runner_now(Counter).with_batch(batch);
                     runner.init().await.expect("init");
 
                     let started = Instant::now();

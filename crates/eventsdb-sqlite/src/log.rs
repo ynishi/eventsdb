@@ -221,6 +221,7 @@ impl SqliteEventLog {
                 chain: options.upcasters,
                 notify,
                 poll_interval: options.poll_interval,
+                live_runners: std::sync::Mutex::new(std::collections::HashSet::new()),
             }),
             driver: std::sync::Mutex::new(Some(driver)),
             reader_drivers: std::sync::Mutex::new(reader_drivers),
@@ -643,8 +644,24 @@ impl SqliteEventLog {
 
     /// A runner for `projection`, reading this log and writing its read model
     /// through the same transactions.
-    pub fn runner<P: Projection>(&self, projection: P) -> ProjectionRunner<P> {
+    /// Fallible because a projection's name is the primary key of its
+    /// checkpoint: two live runners answering the same name would share one
+    /// cursor, each advancing it past events the other had not folded, and
+    /// neither would be exactly-once any more. A second one is refused rather
+    /// than allowed to do that quietly. Dropping a runner releases its name,
+    /// so stopping and restarting a projection is ordinary.
+    pub fn runner<P: Projection>(&self, projection: P) -> Result<ProjectionRunner<P>> {
         ProjectionRunner::new(Arc::clone(&self.shared), projection)
+    }
+
+    /// A runner whose name is known to be free, panicking if it is not.
+    ///
+    /// For a caller that owns the whole log and knows its own projections —
+    /// a test, a single-purpose binary — where threading a `Result` through
+    /// says nothing the caller did not already know.
+    pub fn runner_now<P: Projection>(&self, projection: P) -> ProjectionRunner<P> {
+        self.runner(projection)
+            .expect("a runner for a name that is not already live")
     }
 
     /// The shared handle, for the sibling modules that need the isle.
