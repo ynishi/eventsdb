@@ -9,8 +9,8 @@ bytes — and drops what needs a cluster.
 ## Status
 
 Early. The write path, the global order, cross-stream reads, subscriptions,
-consumer checkpoints and exactly-once projections are implemented and tested.
-Retention is not.
+consumer checkpoints, exactly-once projections and retention are implemented
+and tested.
 
 ## Crates
 
@@ -122,15 +122,49 @@ Two axes, and they are not the same one:
 Stored bytes are never rewritten. An upcaster moves the reader forward
 instead.
 
+## Retention
+
+Removal is the one operation that can make a correct-looking read wrong: a
+fold that starts before a deleted range comes back short, and nothing in the
+shape of the result says so. So it is not just a `DELETE`.
+
+    // Three shapes. Prefix, age, or whole streams.
+    log.retain(Plan::Before(Position::new(1000)), Guard::default()).await?;
+    log.retain(Plan::OlderThan(cutoff_ms), Guard::default()).await?;
+    log.retain(Plan::Streams(vec!["session-7".into()]), Guard::default()).await?;
+
+    log.reclaim().await?;   // give the freed pages back to the filesystem
+
+Two things keep it honest:
+
+- **The default guard refuses to overrun a consumer.** `Guard::RegisteredConsumers`
+  fails with `ConsumerBehind` if any stored checkpoint sits below what the plan
+  would remove. It can only see consumers that have saved a checkpoint, so have
+  yours check in before its first batch. `Guard::Force` removes anyway.
+- **What was removed outlives it.** Every application writes a row to a
+  retention ledger in the same transaction as the delete, and the highest
+  position removed is a watermark. A projection whose cursor sits below the
+  watermark is refused with `Truncated` rather than served a short answer, and
+  a rebuild on a truncated log is refused *before* the old model is emptied.
+  A projection that genuinely does not care — a "last 30 days" view — says so
+  with `tolerates_truncation`.
+
+Dropping whole streams leaves holes in the global order. That is safe:
+positions are never reused (`AUTOINCREMENT`), and nothing waits for a specific
+one — a subscription reads `position > cursor` and does not see what is gone.
+
 ## Limitations
 
 - **Cross-process subscriptions poll.** SQLite has no `LISTEN`/`NOTIFY`, so a
   write from another process is invisible until someone looks. In-process
   subscribers are woken directly.
 - **No clustering, replication or network protocol**, by design — see above.
-- **Retention is unspecified.** Positions are allocated with `AUTOINCREMENT`
-  so that deleting rows will be safe, but what may be deleted, and how a
-  consumer whose cursor points into a removed range is told, is not settled.
+- **Retention deletes; it does not archive.** Moving events to cold storage
+  before removing them is a policy that belongs above this, built on
+  `read_all` plus `retain`.
+- **`reclaim` needs a database created by this version.** It relies on
+  `auto_vacuum = INCREMENTAL`, which SQLite only accepts before the first
+  table exists. On an older file it does nothing.
 
 ## License
 

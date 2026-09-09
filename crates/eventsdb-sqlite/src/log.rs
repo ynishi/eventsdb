@@ -424,4 +424,9 @@ impl SqliteEventLog {
     pub fn runner<P: Projection>(&self, projection: P) -> ProjectionRunner<P> {
         ProjectionRunner::new(Arc::clone(&self.shared), projection)
     }
+
+    /// The shared handle, for the sibling modules that need the isle.
+    pub(crate) fn shared_handle(&self) -> Arc<Shared> {
+        Arc::clone(&self.shared)
+    }
 }

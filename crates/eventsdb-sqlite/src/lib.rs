@@ -30,6 +30,7 @@
 
 mod log;
 mod project;
+mod retention;
 mod row;
 mod schema;
 mod shared;
@@ -37,6 +38,7 @@ mod store;
 
 pub use log::{OpenOptions, SqliteEventLog, DEFAULT_BUSY_TIMEOUT, DEFAULT_POLL_INTERVAL};
 pub use project::{Projection, ProjectionRunner, DEFAULT_BATCH};
+pub use retention::{Completeness, Guard, Plan, Report};
 pub use schema::TARGET_USER_VERSION;
 pub use store::SqliteEventStore;
 

@@ -32,6 +32,7 @@ use eventsdb_core::position::{Position, Recorded};
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 use crate::log::{load_checkpoint, save_checkpoint, select_recorded};
+use crate::retention::require_complete_from;
 use crate::shared::{classify, map_isle, Shared};
 
 /// How many events a runner applies per transaction unless told otherwise.
@@ -68,6 +69,21 @@ pub trait Projection: Send + 'static {
 
     /// Fold one event into the read model.
     fn apply(&mut self, tx: &Transaction<'_>, event: &Recorded) -> Result<()>;
+
+    /// Whether this projection is still correct when part of the history it
+    /// would fold has been removed by retention.
+    ///
+    /// `false` by default, and that default is the important one: a total —
+    /// a balance, a count, a sum — computed over a log missing its front is
+    /// simply wrong, and nothing about the result says so. The runner refuses
+    /// rather than produce it (see [`crate::retention`]).
+    ///
+    /// Return `true` only for a projection whose answer does not depend on
+    /// the removed range: a "last 30 days" view, a latest-value-per-stream
+    /// table, anything that would overwrite rather than accumulate.
+    fn tolerates_truncation(&self) -> bool {
+        false
+    }
 }
 
 /// Drives a [`Projection`] over a log.
@@ -126,6 +142,11 @@ impl<P: Projection> ProjectionRunner<P> {
             };
 
             let cursor = load_checkpoint(tx, &name)?;
+            // Inside the same transaction as the read, so retention cannot
+            // land between the check and the batch it vouches for.
+            if !projection.tolerates_truncation() {
+                require_complete_from(tx, cursor)?;
+            }
             let events = select_recorded(tx, chain, cursor, &filter, batch)?;
             if events.is_empty() {
                 return Ok(0);
@@ -168,8 +189,15 @@ impl<P: Projection> ProjectionRunner<P> {
     /// that follows is batched, so a reader looking during a rebuild can see a
     /// partially rebuilt model — which is the price of not holding a write
     /// lock over the whole log.
+    /// A rebuild on a truncated log is refused before anything is emptied:
+    /// replaying what is left would silently produce a different model from
+    /// the one being replaced, and destroying the old one first would leave
+    /// nothing to compare against.
     pub async fn rebuild(&mut self) -> Result<usize> {
         self.in_transaction(|projection, tx, _| {
+            if !projection.tolerates_truncation() {
+                require_complete_from(tx, Position::BEGINNING)?;
+            }
             let name = projection.name().to_string();
             projection.reset(tx)?;
             projection.init(tx)?;

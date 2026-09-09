@@ -35,6 +35,30 @@ pub enum Error {
     /// database asked to answer SQL.
     #[error("unsupported by this backend: {0}")]
     Unsupported(String),
+
+    /// The history the caller asked for is partly gone: retention removed
+    /// events at or below `removed_up_to`, and a fold starting at `requested`
+    /// would be missing them.
+    ///
+    /// Loud on purpose. Retention is the one operation that can make a
+    /// correct-looking read wrong, so a consumer whose cursor sits behind the
+    /// watermark is told rather than handed a short answer it cannot tell
+    /// from a complete one.
+    #[error(
+        "history at or below position {removed_up_to} has been removed; \
+         reading from {requested} would be incomplete"
+    )]
+    Truncated { requested: u64, removed_up_to: u64 },
+
+    /// Retention would have removed events a registered consumer has not seen.
+    #[error(
+        "retention would remove up to position {up_to}, past consumer `{consumer}` at {cursor}"
+    )]
+    ConsumerBehind {
+        consumer: String,
+        cursor: u64,
+        up_to: u64,
+    },
 }
 
 impl Error {

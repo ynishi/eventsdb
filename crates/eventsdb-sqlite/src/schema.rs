@@ -21,7 +21,7 @@ use rusqlite::{Connection, TransactionBehavior};
 use crate::shared::classify;
 
 /// The version this build expects. Bumped with every appended step.
-pub const TARGET_USER_VERSION: i64 = 1;
+pub const TARGET_USER_VERSION: i64 = 2;
 
 /// Step 1: the log and the consumer checkpoints.
 ///
@@ -65,6 +65,27 @@ const STEP_1: &str = "
     );
 ";
 
+/// Step 2: the retention ledger.
+///
+/// Retention is the one operation that removes facts, so what it removed is
+/// itself recorded. `highest_removed` is the watermark a reader compares its
+/// cursor against: a consumer at or below it has lost events it never saw,
+/// and is told rather than handed a short answer (see
+/// [`eventsdb_core::Error::Truncated`]).
+///
+/// The ledger is append-only like the log, and deliberately survives the
+/// events it describes — it is the only remaining evidence that they existed.
+const STEP_2: &str = "
+    CREATE TABLE retention (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        applied_ms      INTEGER NOT NULL,
+        plan            TEXT    NOT NULL,
+        removed_count   INTEGER NOT NULL,
+        highest_removed INTEGER NOT NULL
+    );
+    CREATE INDEX events_epoch_ms ON events (epoch_ms);
+";
+
 /// The ladder, in order. Index `i` moves `user_version` from `i` to `i + 1`.
 ///
 /// A database that predates `position` would get its backfill as a step here:
@@ -72,7 +93,7 @@ const STEP_1: &str = "
 /// — wall clock first, because it approximates causal order across streams,
 /// with `seq` breaking ties deterministically within one. No such database
 /// exists yet, so no such step is written.
-const LADDER: &[&str] = &[STEP_1];
+const LADDER: &[&str] = &[STEP_1, STEP_2];
 
 /// Bring `conn` up to [`TARGET_USER_VERSION`], one transaction per step.
 ///
@@ -116,8 +137,20 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
 /// cannot corrupt the database. `busy_timeout` is what makes contention
 /// surface as a wait rather than an immediate failure — and it only covers a
 /// lock taken up front, which is why every write here uses `IMMEDIATE`.
+///
+/// `auto_vacuum = INCREMENTAL` is set here rather than in the ladder because
+/// SQLite only honours a change to it before the first table exists — after
+/// that it takes a full `VACUUM`, which rewrites the file under an exclusive
+/// lock. Setting it at creation is what makes
+/// [`crate::retention`]'s reclaim a bounded, incremental operation instead.
+/// On a database created before this line, the pragma is silently ignored and
+/// reclaim has nothing to do; that is a limitation, not a failure.
 pub fn apply_pragmas(conn: &Connection, busy_timeout: std::time::Duration) -> rusqlite::Result<()> {
-    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
+    conn.execute_batch(
+        "PRAGMA auto_vacuum = INCREMENTAL; \
+         PRAGMA journal_mode = WAL; \
+         PRAGMA synchronous = NORMAL;",
+    )?;
     conn.busy_timeout(busy_timeout)?;
     Ok(())
 }
