@@ -3,18 +3,26 @@
 //! # Why this has to exist
 //!
 //! Without it, anyone who needs a query the API does not have opens the
-//! database file themselves — and a second *writing* connection is exactly
-//! what this store cannot survive. The order positions become visible in is
-//! guaranteed by there being one writer allocating inside the committing
-//! transaction ([`eventsdb_core::Position`]); a second writer commits on its
-//! own schedule, and a subscriber can then pass a position that is still
-//! uncommitted and never come back for it. Deleting through a second
-//! connection is worse still: it removes events without a retention ledger
-//! entry, so nothing downstream is told that a fold is now missing its input.
+//! database file themselves — and what they then do to it is unbounded.
 //!
-//! So the hatch is not a convenience. It is the thing that makes "do not open
-//! the file yourself" a reasonable rule to state, because there is somewhere
-//! else to go.
+//! **The danger is not what an earlier draft of this comment claimed.** It
+//! said a second writing connection would break the global order. It does
+//! not: the position is allocated inside the transaction that commits it, and
+//! `IMMEDIATE` means that transaction holds the write lock from `BEGIN`, so
+//! allocation and commit order cannot diverge across connections either. That
+//! was measured, not reasoned — see `tests/two_logs.rs`.
+//!
+//! What a raw connection actually costs is everything the store does *around*
+//! the write. An `INSERT` straight into `events` skips validation, `seq`
+//! allocation and the schema stamp, so it reads back afterwards as a
+//! legitimate event that no rule ever governed. A `DELETE` removes history
+//! with no retention ledger entry, so nothing downstream is told that a fold
+//! is now missing its input — which is the one failure retention was built to
+//! make impossible. Those are what the authorizer refuses, and they are
+//! refused whether the connection is this one or another.
+//!
+//! So the hatch is not a convenience. It is what makes "go through the store"
+//! a reasonable thing to ask, because there is somewhere to go.
 //!
 //! # What it gives and what it refuses
 //!

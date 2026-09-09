@@ -44,9 +44,12 @@ contain belong to the layer above.
 ## Two things a networked event store cannot give you
 
 **Positions have no holes.** The backend allocates a global position inside
-the transaction that commits it, under a single writer, so a reader never sees
-`n + 1` while `n` is still uncommitted. Following the log is a range read —
-no gap detection, no grace window.
+the transaction that commits it, and `IMMEDIATE` means that transaction holds
+the write lock from `BEGIN` — so allocation order and commit order cannot
+diverge, and a reader never sees `n + 1` while `n` is still uncommitted.
+Following the log is a range read: no gap detection, no grace window. This
+holds across connections too, which is measured rather than assumed
+(`tests/two_logs.rs`).
 
 **A projection can be exactly-once.** When the read model lives in the same
 SQLite file as the log, applying an event and advancing the consumer's
@@ -199,9 +202,16 @@ one — a subscription reads `position > cursor` and does not see what is gone.
 
 ## Limitations
 
-- **Cross-process subscriptions poll.** SQLite has no `LISTEN`/`NOTIFY`, so a
-  write from another process is invisible until someone looks. In-process
-  subscribers are woken directly.
+- **Subscriptions outside the writing log poll.** SQLite has no
+  `LISTEN`/`NOTIFY`, so a write anywhere but the subscriber's own log is
+  invisible until someone looks — including a second log opened on the same
+  file in the same process, since the wake-up channel belongs to the log.
+  Nothing is lost, only delayed, by roughly three orders of magnitude
+  [measured: 552µs against 552ms on a 600ms poll].
+- **Open the file once per process.** It is safe not to — the order holds —
+  but two logs mean the polling latency above, and two logs opened with
+  different upcaster chains will read the same bytes differently with nothing
+  to detect it.
 - **No clustering, replication or network protocol**, by design — see above.
 - **Retention deletes; it does not archive.** Moving events to cold storage
   before removing them is a policy that belongs above this, built on

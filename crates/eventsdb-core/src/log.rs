@@ -84,9 +84,16 @@ pub trait EventLog: Send + Sync {
     /// see [`Position`] for why that holds without gap detection.
     ///
     /// How the live half learns of a write is the backend's business. The
-    /// SQLite backend wakes in-process subscribers directly and falls back to
-    /// polling for writers in another process, because SQLite has no
-    /// cross-process notification.
+    /// SQLite backend wakes subscribers on **the same log** directly, and
+    /// falls back to polling for anything else, because SQLite has no
+    /// notification a writer elsewhere could send.
+    ///
+    /// "Anything else" includes a second log opened on the same file in this
+    /// same process — the wake-up channel belongs to the log, not to the
+    /// database. Nothing is lost either way; the difference is latency, and it
+    /// is about three orders of magnitude [measured: 552µs woken directly
+    /// against 552ms on a 600ms poll, `tests/two_logs.rs`]. Open the file once
+    /// per process and share the log if that matters.
     fn subscribe(
         &self,
         from: Position,

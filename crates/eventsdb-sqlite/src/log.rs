@@ -77,6 +77,20 @@ impl SqliteEventLog {
         Self::open_with(path, OpenOptions::default()).await
     }
 
+    /// Opening the same file twice is safe but not free.
+    ///
+    /// The global order survives it — allocation happens inside the committing
+    /// transaction and `IMMEDIATE` serialises those across connections, and
+    /// `tests/two_logs.rs` measures 120 interleaved appends coming back as
+    /// exactly `1..=120`. Projections and the retention guard are unaffected
+    /// too: they work through tables, which are shared.
+    ///
+    /// Two things do not survive it. Subscribers are woken per **log**, so a
+    /// write through one log reaches the other's subscribers only on the poll
+    /// interval — measured at roughly a thousand times the latency. And the
+    /// upcaster chain is per log: two logs opened with different chains read
+    /// the same stored bytes differently, and nothing detects that. Open once
+    /// per process and share the handle where you can.
     pub async fn open_with(path: impl AsRef<Path>, options: OpenOptions) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let busy_timeout = options.busy_timeout;

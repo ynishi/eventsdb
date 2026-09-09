@@ -14,10 +14,21 @@ use crate::upcast::Current;
 /// A global coordinate: the order an event was committed in, across every
 /// stream of one database.
 ///
-/// Positions are dense and gap-free *as read*: the backend allocates inside
-/// the same transaction that commits, under a single writer, so a reader
-/// never observes `n + 1` while `n` is still uncommitted. A subscription is
-/// therefore a plain `position > cursor` range read with no grace window.
+/// Positions are dense and gap-free *as read*: a reader never observes
+/// `n + 1` while `n` is still uncommitted, so a subscription is a plain
+/// `position > cursor` range read with no grace window.
+///
+/// The mechanism is narrower than "one writer", and worth stating precisely
+/// because the narrower version is also stronger. The position is allocated
+/// **inside the transaction that commits it**, and that transaction holds
+/// SQLite's write lock from `BEGIN`, because every write the backend makes is
+/// `IMMEDIATE`. Allocation order and commit order therefore cannot diverge —
+/// and that argument does not depend on there being one connection. It holds
+/// for two processes on one file, and it is measured: 120 appends through two
+/// separately-opened logs come back as exactly `1..=120`, in order.
+///
+/// What a second connection *does* cost is the wake-up, not the order — see
+/// [`crate::log::EventLog::subscribe`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Position(u64);
 
