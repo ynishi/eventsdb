@@ -18,10 +18,11 @@
 //!
 //! # What it gives and what it refuses
 //!
-//! [`SqliteEventLog::with_transaction`] hands over a real
-//! [`rusqlite::Transaction`] on the log's own connection, inside the isle,
-//! under one `IMMEDIATE` transaction. Your tables, your SQL, your schema —
-//! and it commits or rolls back with everything else in that transaction.
+//! [`SqliteEventLog::with_transaction`] hands over a [`TxnContext`] on the
+//! log's own connection, inside the isle, under one `IMMEDIATE` transaction.
+//! It derefs to a real [`rusqlite::Transaction`] — your tables, your SQL, your
+//! schema — and carries the log's own stamped `append` as the only route to
+//! `events`. Everything in the closure commits or rolls back together.
 //!
 //! What it refuses, through SQLite's own authorizer rather than by inspecting
 //! the text: writing any table in [`RESERVED_TABLES`], **creating anything
@@ -44,13 +45,17 @@
 //! the uninstall would leave every later write refused as `not authorized`
 //! while reads carried on working.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use eventsdb_core::error::{Error, Result};
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
-use rusqlite::{Connection, Transaction, TransactionBehavior};
+use rusqlite::{Connection, TransactionBehavior};
 use serde_json::{Map, Value};
 
 use crate::log::SqliteEventLog;
 use crate::shared::{classify, map_isle};
+use crate::txn::TxnContext;
 
 /// Tables this crate owns. Reading them is fine; writing them is not.
 pub const RESERVED_TABLES: [&str; 5] = [
@@ -81,7 +86,15 @@ fn is_reserved(table: &str) -> bool {
 /// it: appends would land in the temp table, report a reused position, and
 /// the durable log would silently stop growing. The name is what has to be
 /// reserved, wherever it is being created.
-fn authorize(context: &AuthContext<'_>) -> Authorization {
+fn authorize(context: &AuthContext<'_>, trusted: bool) -> Authorization {
+    // The crate's own stamped statements run with the flag raised, for exactly
+    // as long as they take. It is set and cleared by a `Drop` guard in
+    // `TxnContext`, so an unwind between an append's two statements cannot
+    // leave the door open.
+    if trusted {
+        return Authorization::Allow;
+    }
+
     match context.action {
         // Writing, reshaping or dropping a reserved table.
         AuthAction::Insert { table_name }
@@ -238,7 +251,11 @@ impl SqliteEventLog {
         match shared
             .isle
             .call(move |conn: &mut Connection| {
-                Ok(guarded(conn, move |conn| query_rows(conn, &sql, params)))
+                Ok(guarded(
+                    conn,
+                    Arc::new(AtomicBool::new(false)),
+                    move |conn| query_rows(conn, &sql, params),
+                ))
             })
             .await
         {
@@ -247,51 +264,82 @@ impl SqliteEventLog {
         }
     }
 
-    /// Run your own SQL — reads and writes — in one `IMMEDIATE` transaction
-    /// on the log's connection.
+    /// Your writes and the log's own, in one `IMMEDIATE` transaction.
     ///
-    /// This is how a caller keeps its own tables in the same database without
-    /// opening a second connection to the file. Returning `Err` rolls the
-    /// whole transaction back.
+    /// The closure is handed a [`TxnContext`]: it derefs to the raw
+    /// [`rusqlite::Transaction`] for your tables, and carries `append` / `append_many` /
+    /// `read` / `head` as the only route to the log's. Returning `Err` rolls
+    /// back everything, appended events included.
     ///
-    /// Writes to the log's own tables are refused by SQLite's authorizer, not
-    /// by this crate reading your SQL — see the module docs for which, and
-    /// why each one. A denial surfaces as [`Error::Unsupported`].
+    /// This is how "record this fact **and** update that row, together or not
+    /// at all" is expressed — and how two streams are written atomically:
+    /// two `append` calls, no grouping rule, no ordering restriction.
+    ///
+    /// Raw writes to the log's tables are still refused by SQLite's
+    /// authorizer, so an append cannot skip validation, sequencing or
+    /// ordering. A denial surfaces as [`Error::Unsupported`].
+    ///
+    /// Subscribers are woken **after** the commit, never during: waking one at
+    /// a position a rollback then erases would walk it past a hole it can
+    /// never fill.
+    ///
+    /// Not retried on contention. The closure is `FnOnce` and is not pure —
+    /// re-running it would repeat whatever else it did. [`Error::Busy`]
+    /// surfaces and the caller decides.
     ///
     /// ```no_run
     /// # use eventsdb_core::Result;
     /// # use eventsdb_sqlite::SqliteEventLog;
+    /// # use serde_json::json;
     /// # async fn example(log: &SqliteEventLog) -> Result<()> {
     /// log.with_transaction(|tx| {
-    ///     tx.execute_batch("CREATE TABLE IF NOT EXISTS my_view (k TEXT PRIMARY KEY)")
-    ///         .map_err(|e| eventsdb_core::Error::storage(e.to_string()))
+    ///     let committed = tx.append(
+    ///         "order-1",
+    ///         json!({ "kind": "placed" }).as_object().unwrap().clone(),
+    ///     )?;
+    ///     tx.execute(
+    ///         "INSERT INTO my_index (position, stream) VALUES (?1, ?2)",
+    ///         rusqlite::params![committed.position.unwrap().get() as i64, "order-1"],
+    ///     )
+    ///     .map_err(|e| eventsdb_core::Error::storage(e.to_string()))?;
+    ///     Ok(())
     /// })
-    /// .await?;
-    /// # Ok(())
+    /// .await
     /// # }
     /// ```
     pub async fn with_transaction<T, F>(&self, body: F) -> Result<T>
     where
         T: Send + 'static,
-        F: FnOnce(&Transaction<'_>) -> Result<T> + Send + 'static,
+        F: for<'t> FnOnce(&TxnContext<'t>) -> Result<T> + Send + 'static,
     {
         let shared = self.shared_handle();
+        let chain = shared.chain.clone();
+        let trusted = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&trusted);
 
         let job = move |conn: &mut Connection| {
-            Ok(guarded(conn, move |conn| {
+            Ok(guarded(conn, trusted, move |conn| {
                 let tx = conn
                     .transaction_with_behavior(TransactionBehavior::Immediate)
                     .map_err(classify)?;
-                let value = body(&tx)?;
+                let context = TxnContext::new(&tx, chain, flag);
+                let value = body(&context)?;
+                // Collected before the commit, published after it.
+                let positions = context.into_published();
                 tx.commit().map_err(classify)?;
-                Ok(value)
+                Ok((value, positions))
             }))
         };
 
-        match shared.isle.call(job).await {
-            Ok(inner) => inner,
-            Err(isle) => Err(map_isle(isle)),
+        let (value, positions) = match shared.isle.call(job).await {
+            Ok(inner) => inner?,
+            Err(isle) => return Err(map_isle(isle)),
+        };
+
+        if let Some(highest) = positions.into_iter().max() {
+            shared.publish(highest);
         }
+        Ok(value)
     }
 }
 
@@ -306,15 +354,19 @@ impl SqliteEventLog {
 /// A log that looks alive and silently cannot be written to is the worst
 /// failure available here, so the unwind is caught and reported rather than
 /// allowed past this frame.
-fn guarded<T, F>(conn: &mut Connection, body: F) -> Result<T>
+fn guarded<T, F>(conn: &mut Connection, trusted: Arc<AtomicBool>, body: F) -> Result<T>
 where
     F: FnOnce(&mut Connection) -> Result<T>,
 {
-    conn.authorizer(Some(|context: AuthContext<'_>| authorize(&context)));
+    let flag = Arc::clone(&trusted);
+    conn.authorizer(Some(move |context: AuthContext<'_>| {
+        authorize(&context, flag.load(Ordering::SeqCst))
+    }));
 
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(conn)));
 
     conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+    trusted.store(false, Ordering::SeqCst);
 
     match outcome {
         Ok(Ok(value)) => Ok(value),

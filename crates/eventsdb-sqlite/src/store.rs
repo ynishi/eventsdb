@@ -83,7 +83,7 @@ impl SqliteEventStore {
 /// difference only shows up once something is removed: retention can empty a
 /// stream entirely, and a derived maximum would then restart at 1 and hand
 /// out a `seq` some earlier event already had. See `schema::STEP_3`.
-fn next_seq(tx: &Transaction<'_>, stream: &str) -> Result<u64> {
+pub(crate) fn next_seq(tx: &Transaction<'_>, stream: &str) -> Result<u64> {
     tx.query_row(
         "SELECT next_seq FROM stream_seq WHERE stream = ?1",
         [stream],
@@ -100,7 +100,7 @@ fn next_seq(tx: &Transaction<'_>, stream: &str) -> Result<u64> {
 ///
 /// In the same transaction as the appends it accounts for, so a rolled-back
 /// write does not consume a sequence number.
-fn set_next_seq(tx: &Transaction<'_>, stream: &str, next: u64) -> Result<()> {
+pub(crate) fn set_next_seq(tx: &Transaction<'_>, stream: &str, next: u64) -> Result<()> {
     tx.execute(
         "INSERT INTO stream_seq (stream, next_seq) VALUES (?1, ?2) \
          ON CONFLICT(stream) DO UPDATE SET next_seq = excluded.next_seq",
@@ -115,7 +115,7 @@ fn set_next_seq(tx: &Transaction<'_>, stream: &str, next: u64) -> Result<()> {
 /// The position is the rowid the insert assigned, read back with
 /// `last_insert_rowid` inside the same transaction — so it is allocated and
 /// committed together, which is what keeps the global order gap-free as read.
-fn insert_stamped(
+pub(crate) fn insert_stamped(
     tx: &Transaction<'_>,
     stream: &str,
     event: &Map<String, Value>,
@@ -146,7 +146,7 @@ fn insert_stamped(
 }
 
 /// Read a stream's events inside the caller's transaction, still as stored.
-fn select_stream(
+pub(crate) fn select_stream(
     tx: &Transaction<'_>,
     stream: &str,
     kinds: Option<&[String]>,
