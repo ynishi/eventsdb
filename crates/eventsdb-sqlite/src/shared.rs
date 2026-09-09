@@ -66,11 +66,15 @@ impl Shared {
 /// else is the database failing, and repeating it would only fail again.
 pub(crate) fn classify(error: rusqlite::Error) -> Error {
     if let rusqlite::Error::SqliteFailure(inner, _) = &error {
-        if matches!(
-            inner.code,
-            ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked
-        ) {
-            return Error::Busy(error.to_string());
+        match inner.code {
+            ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked => {
+                return Error::Busy(error.to_string())
+            }
+            // The isle interrupts a statement that passed its deadline, and
+            // SQLite reports that as `SQLITE_INTERRUPT`. It is the caller's own
+            // deadline arriving, not the database failing.
+            ErrorCode::OperationInterrupted => return Error::Timeout(error.to_string()),
+            _ => {}
         }
     }
     Error::Storage(error.to_string())
@@ -80,6 +84,7 @@ pub(crate) fn classify(error: rusqlite::Error) -> Error {
 pub(crate) fn map_isle(error: IsleError) -> Error {
     match error {
         IsleError::Sqlite(inner) => classify(inner),
+        IsleError::Timeout => Error::Timeout("the isle reported a deadline".to_string()),
         other if other_is_busy(&other) => Error::Busy(other.to_string()),
         IsleError::Closed => Error::Storage("store is closed".to_string()),
         other => Error::Storage(other.to_string()),

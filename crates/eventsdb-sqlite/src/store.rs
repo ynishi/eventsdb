@@ -192,6 +192,27 @@ pub(crate) fn select_stream(
     Ok(out)
 }
 
+/// One stamped append on an open connection, taking its own transaction.
+///
+/// The shared body of the ordinary append and the detached one — the latter
+/// has no caller to report to, so it needs the whole thing in one place rather
+/// than a retry loop around it.
+pub(crate) fn append_stamped_now(
+    conn: &mut Connection,
+    stream: &str,
+    event: Map<String, Value>,
+) -> Result<Committed> {
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(classify)?;
+    let seq = next_seq(&tx, stream)?;
+    let stamped = stamp(event, seq, now_ms())?;
+    let committed = insert_stamped(&tx, stream, &stamped)?;
+    set_next_seq(&tx, stream, seq + 1)?;
+    tx.commit().map_err(classify)?;
+    Ok(committed)
+}
+
 /// SQLite's `LIMIT` takes a signed 64-bit value; a negative one means "no
 /// limit". `usize::MAX` is the caller's way of saying the same thing, so it
 /// maps to -1 rather than overflowing into one.

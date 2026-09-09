@@ -139,9 +139,47 @@ impl<'t> TxnContext<'t> {
     /// slower mode. Here the transaction is already open, so a derived row
     /// written later in the same closure can be keyed on the actual position.
     pub fn append(&self, stream: &str, event: Map<String, Value>) -> Result<Committed> {
+        self.append_at(stream, now_ms(), event)
+    }
+
+    /// Append an event that happened at a known time.
+    ///
+    /// Identical to [`TxnContext::append`] in every other respect: the
+    /// envelope is validated, `seq` comes from the stream counter, `position`
+    /// from the rowid, `_schema_version` is stamped current. Only the wall
+    /// clock is the caller's.
+    ///
+    /// # Why this is not "supply your own coordinates"
+    ///
+    /// `seq` and `position` are **allocations**: the store enforces their
+    /// uniqueness and monotonicity, and two of its mechanisms exist purely to
+    /// defend them (`stream_seq` after a removal, `AUTOINCREMENT` against
+    /// rowid reuse). Handing those to a caller would give up what the store
+    /// guarantees.
+    ///
+    /// `epoch_ms` is a **recorded observation**. Nothing orders by it — reads
+    /// order by `seq` or by `position` — and its only consumer is
+    /// [`crate::Plan::OlderThan`]. So supplying it surrenders no guarantee.
+    ///
+    /// # What it does change
+    ///
+    /// `OlderThan` stops being a position prefix: imported history can be old
+    /// and sit at a high position. That is the shape [`crate::Plan::Streams`]
+    /// already produces, and which the retention watermark already handles —
+    /// not a new failure class.
+    ///
+    /// Use it for facts about the past: importing a log from elsewhere,
+    /// replaying an archive. For something happening now, use
+    /// [`TxnContext::append`] and let the store read the clock.
+    pub fn append_at(
+        &self,
+        stream: &str,
+        epoch_ms: u64,
+        event: Map<String, Value>,
+    ) -> Result<Committed> {
         validate(&event)?;
         let seq = next_seq(self.tx, stream)?;
-        let stamped = stamp(event, seq, now_ms())?;
+        let stamped = stamp(event, seq, epoch_ms)?;
 
         let committed = {
             let _trusted = Trusted::raise(&self.trusted);
@@ -167,7 +205,21 @@ impl<'t> TxnContext<'t> {
         stream: &str,
         events: Vec<Map<String, Value>>,
     ) -> Result<Vec<Committed>> {
-        for event in &events {
+        // One clock reading for the batch: these are records of one
+        // occurrence, and times differing by the cost of the loop would
+        // suggest an ordering that is not there.
+        let epoch_ms = now_ms();
+        self.append_many_at(stream, events.into_iter().map(|e| (epoch_ms, e)).collect())
+    }
+
+    /// The batch form of [`TxnContext::append_at`]: one run of sequence
+    /// numbers, each event keeping its own time.
+    pub fn append_many_at(
+        &self,
+        stream: &str,
+        events: Vec<(u64, Map<String, Value>)>,
+    ) -> Result<Vec<Committed>> {
+        for (_, event) in &events {
             validate(event)?;
         }
         if events.is_empty() {
@@ -175,12 +227,11 @@ impl<'t> TxnContext<'t> {
         }
 
         let base_seq = next_seq(self.tx, stream)?;
-        let epoch_ms = now_ms();
         let mut out = Vec::with_capacity(events.len());
 
         {
             let _trusted = Trusted::raise(&self.trusted);
-            for (offset, event) in events.into_iter().enumerate() {
+            for (offset, (epoch_ms, event)) in events.into_iter().enumerate() {
                 let stamped = stamp(event, base_seq + offset as u64, epoch_ms)?;
                 out.push(insert_stamped(self.tx, stream, &stamped)?);
             }

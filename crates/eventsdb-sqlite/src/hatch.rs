@@ -47,6 +47,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use eventsdb_core::error::{Error, Result};
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
@@ -259,19 +260,52 @@ impl SqliteEventLog {
     /// contents — so the readonly gate alone would let a caller attach a
     /// database to the long-lived connection and keep it there.
     pub async fn query(&self, sql: &str, params: Vec<Value>) -> Result<Vec<Map<String, Value>>> {
+        self.query_within(sql, params, None).await
+    }
+
+    /// [`SqliteEventLog::query`] with a deadline.
+    ///
+    /// `busy_timeout` bounds *waiting for a lock*, which is a different thing
+    /// from a statement that is simply expensive — a recursive CTE with a
+    /// runaway bound takes the lock immediately and then runs. Without this
+    /// there is nothing to interrupt it, and because SQL is served from the
+    /// single writer thread, one such statement stalls every append on the log
+    /// indefinitely.
+    ///
+    /// The deadline interrupts the statement through SQLite's own interrupt
+    /// handle and reports [`Error::Busy`], so a caller can decide whether a
+    /// narrower query is worth another go.
+    pub async fn query_timeout(
+        &self,
+        sql: &str,
+        params: Vec<Value>,
+        timeout: Duration,
+    ) -> Result<Vec<Map<String, Value>>> {
+        self.query_within(sql, params, Some(timeout)).await
+    }
+
+    async fn query_within(
+        &self,
+        sql: &str,
+        params: Vec<Value>,
+        timeout: Option<Duration>,
+    ) -> Result<Vec<Map<String, Value>>> {
         let shared = self.shared_handle();
         let sql = sql.to_string();
-        match shared
-            .isle
-            .call(move |conn: &mut Connection| {
-                Ok(guarded(
-                    conn,
-                    Arc::new(AtomicBool::new(false)),
-                    move |conn| query_rows(conn, &sql, params),
-                ))
-            })
-            .await
-        {
+        let job = move |conn: &mut Connection| {
+            Ok(guarded(
+                conn,
+                Arc::new(AtomicBool::new(false)),
+                move |conn| query_rows(conn, &sql, params),
+            ))
+        };
+
+        let outcome = match timeout {
+            Some(timeout) => shared.isle.call_timeout(timeout, job).await,
+            None => shared.isle.call(job).await,
+        };
+
+        match outcome {
             Ok(inner) => inner,
             Err(isle) => Err(map_isle(isle)),
         }

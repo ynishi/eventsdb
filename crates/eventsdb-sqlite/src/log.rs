@@ -16,14 +16,14 @@ use eventsdb_core::upcast::{apply_chain, Current, UpcastChain};
 use futures_core::stream::BoxStream;
 use rusqlite::Connection;
 use rusqlite_isle::{AsyncIsle, AsyncIsleDriver};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tokio::sync::watch;
 
 use crate::project::{Projection, ProjectionRunner};
 use crate::row;
 use crate::schema;
 use crate::shared::{classify, map_isle, Shared};
-use crate::store::{clamp_limit, SqliteEventStore};
+use crate::store::{self, clamp_limit, SqliteEventStore};
 
 /// Default wait before a subscriber looks again when nothing woke it.
 ///
@@ -46,7 +46,11 @@ pub struct SqliteEventLog {
     shared: Arc<Shared>,
     /// Owns the isle's lifecycle. Held so the SQLite thread outlives every
     /// handle this log hands out.
-    driver: Option<AsyncIsleDriver>,
+    ///
+    /// Behind a `Mutex` so [`SqliteEventLog::shutdown`] can take it through a
+    /// shared reference: a log behind an `Arc` cannot be consumed, and joining
+    /// the thread is what makes detached appends land.
+    driver: std::sync::Mutex<Option<AsyncIsleDriver>>,
 }
 
 /// Open options, so the two timings above can be set without a second
@@ -155,7 +159,7 @@ impl SqliteEventLog {
                 notify,
                 poll_interval: options.poll_interval,
             }),
-            driver: Some(driver),
+            driver: std::sync::Mutex::new(Some(driver)),
         })
     }
 
@@ -163,10 +167,59 @@ impl SqliteEventLog {
     ///
     /// Dropping the log does the same thing without waiting; this is for a
     /// caller that wants the join to have happened before it continues.
-    pub async fn close(mut self) -> Result<()> {
-        if let Some(driver) = self.driver.take() {
-            driver.shutdown().await.map_err(map_isle)?;
+    pub async fn close(self) -> Result<()> {
+        self.shutdown().await
+    }
+
+    /// Drain queued work and join the SQLite thread, without consuming the
+    /// log.
+    ///
+    /// [`SqliteEventLog::close`] takes `self`, which a log behind an `Arc`
+    /// with any live handle cannot satisfy — and joining is exactly what makes
+    /// queued [`SqliteEventLog::detach_append`] work land before a host exits.
+    ///
+    /// Idempotent. Handles issued by this log stay valid as values and fail as
+    /// storage errors once the thread is gone.
+    pub async fn shutdown(&self) -> Result<()> {
+        let driver = self
+            .driver
+            .lock()
+            .expect("the shutdown lock is never held across a panic")
+            .take();
+        match driver {
+            Some(driver) => driver.shutdown().await.map_err(map_isle),
+            None => Ok(()),
         }
+    }
+
+    /// Queue a stamped append and return without waiting for it.
+    ///
+    /// For a caller that must record a fact from somewhere it cannot await —
+    /// a `Drop` implementation closing a session, most of all, where blocking
+    /// is not allowed either.
+    ///
+    /// **Ordered.** The job goes onto the isle's own queue, so it lands before
+    /// anything submitted after it. Spawning a task that later calls `append`
+    /// would not: it would leave the queue and race everything on the log.
+    ///
+    /// The envelope is validated here, so a malformed event is refused
+    /// synchronously. Everything after that — the write itself — is
+    /// unreported: **a storage failure is dropped**, and subscribers are not
+    /// woken, because there is nobody left to tell. Use it for the boundary
+    /// record a normal path already wrote, not for a fact nothing else knows.
+    ///
+    /// Call [`SqliteEventLog::shutdown`] before exiting to be sure the queue
+    /// drained.
+    pub fn detach_append(&self, stream: &str, event: Map<String, Value>) -> Result<()> {
+        eventsdb_core::event::validate(&event)?;
+        let stream = stream.to_string();
+        self.shared
+            .isle
+            .spawn_call(move |conn: &mut Connection| {
+                let _ = store::append_stamped_now(conn, &stream, event);
+                Ok(())
+            })
+            .detach();
         Ok(())
     }
 

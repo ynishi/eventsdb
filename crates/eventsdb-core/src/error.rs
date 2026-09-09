@@ -24,6 +24,16 @@ pub enum Error {
     #[error("store busy: {0}")]
     Busy(String),
 
+    /// A deadline the caller set was reached, and the statement was
+    /// interrupted.
+    ///
+    /// Deliberately not [`Error::Busy`]. Busy means someone else holds the
+    /// lock, and the same call may well succeed next time; this means the work
+    /// itself was longer than the caller allowed, and repeating it unchanged
+    /// will take just as long. Nothing retries it automatically.
+    #[error("exceeded the deadline: {0}")]
+    Timeout(String),
+
     /// The database failed, or a stored row could not be decoded. A dropped
     /// row must never read as an empty stream — a fold over a truncated log
     /// produces a wrong state rather than an obvious failure.
@@ -63,8 +73,16 @@ pub enum Error {
 
 impl Error {
     /// Whether another attempt at the same call is worth making.
+    ///
+    /// Contention only. A [`Error::Timeout`] is not busy: the work was longer
+    /// than the caller allowed, and repeating it unchanged will be too.
     pub fn is_busy(&self) -> bool {
         matches!(self, Error::Busy(_))
+    }
+
+    /// Whether a deadline was reached.
+    pub fn is_timeout(&self) -> bool {
+        matches!(self, Error::Timeout(_))
     }
 
     /// Public so a backend crate builds the same refusals this one does.
