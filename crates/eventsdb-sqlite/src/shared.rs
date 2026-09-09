@@ -116,9 +116,22 @@ pub(crate) fn classify(error: rusqlite::Error) -> Error {
             // SQLite reports that as `SQLITE_INTERRUPT`. It is the caller's own
             // deadline arriving, not the database failing.
             ErrorCode::OperationInterrupted => return Error::Timeout(error.to_string()),
+            // The file itself failed its own integrity checks.
+            ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase => {
+                return Error::Corruption(error.to_string())
+            }
             _ => {}
         }
     }
+
+    // The read succeeded and the bytes did not convert — a stored JSON column
+    // that will not parse arrives here, via `row::read`. That is the same
+    // class as a corrupt page for a caller's purposes: reading it again gets
+    // the same bytes.
+    if matches!(error, rusqlite::Error::FromSqlConversionFailure(..)) {
+        return Error::Corruption(error.to_string());
+    }
+
     Error::Storage(error.to_string())
 }
 

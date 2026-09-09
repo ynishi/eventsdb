@@ -51,10 +51,16 @@
 //! | a backfill (`append_at`) | the moment the change happened where it came from |
 //! | a transfer (`import`) | whatever the source log recorded, unchanged |
 //!
-//! There is no fourth field saying which — the call you made says it. That is
-//! the same split `ai-store` draws between `append` and `import_event`, and it
-//! is drawn here for the same reason: a second field would have to be trusted
-//! to be accurate, and a verb cannot be wrong about itself.
+//! There is no fourth field saying which — the call you made says it. A second
+//! field would have to be trusted to be accurate, and a verb cannot be wrong
+//! about itself.
+//!
+//! `ai-store` draws the same line, and the pairing is worth stating exactly
+//! because it is easy to get off by one: its `import_event` is **this crate's
+//! `append_at`** — new content, a caller-supplied time, no source log. Its
+//! `append` is this crate's `append`. Its counterpart to this crate's
+//! `import` is *nothing*: moving whole stored records out of one log and into
+//! another, schema version and all, is a verb it does not have.
 //!
 //! The consequence to know is that a log with backfilled or imported history
 //! has a coordinate that is not non-decreasing in position order, so an

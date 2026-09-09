@@ -144,6 +144,34 @@ async fn a_backend_that_cannot_make_it_one_write_declines() {
     assert!(matches!(error, Error::Unsupported(_)), "got {error}");
 }
 
+/// `append_at` is a first-class writer, not something reachable only by
+/// entering the escape hatch — the README said it was one of three and it was
+/// not.
+#[tokio::test]
+async fn a_backfill_does_not_require_entering_the_hatch() {
+    const AN_OLD_TIME: u64 = 1_600_000_000_000;
+
+    let log = SqliteEventLog::open_in_memory().await.unwrap();
+    let mut s = log.stream_handle("s");
+
+    let committed = s.append_at(AN_OLD_TIME, event("noted")).await.unwrap();
+    assert_eq!(committed.epoch_ms, AN_OLD_TIME);
+    assert_eq!(committed.seq, 1);
+    assert_eq!(committed.position, Some(Position::new(1)));
+
+    // And it shares the counter with every other writer.
+    assert_eq!(s.append(event("now")).await.unwrap().seq, 2);
+}
+
+#[tokio::test]
+async fn a_backend_that_cannot_backfill_declines() {
+    use eventsdb_core::MemEventStore;
+
+    let mut store = MemEventStore::new("s");
+    let error = store.append_at(1, event("a")).await.unwrap_err();
+    assert!(matches!(error, Error::Unsupported(_)), "got {error}");
+}
+
 // --- author-owned schema version ---------------------------------------
 
 /// The store carries the number; it does not choose it.

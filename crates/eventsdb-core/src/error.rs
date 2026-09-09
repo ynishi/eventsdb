@@ -41,11 +41,35 @@ pub enum Error {
     #[error("exceeded the deadline: {0}")]
     Timeout(String),
 
-    /// The database failed, or a stored row could not be decoded. A dropped
-    /// row must never read as an empty stream — a fold over a truncated log
-    /// produces a wrong state rather than an obvious failure.
+    /// The database failed: it could not read, could not write, could not open.
+    ///
+    /// Retry-or-call-someone. Contrast [`Error::Corruption`], which is the
+    /// same call site's other outcome and wants the opposite response.
     #[error("storage failure: {0}")]
     Storage(String),
+
+    /// The read succeeded and the bytes do not mean what they should.
+    ///
+    /// Split from [`Error::Storage`] because this module's rule is that
+    /// variants divide by what a caller can *do*, and these two divide
+    /// cleanly: a failing disk is worth retrying and worth paging someone
+    /// about; bytes that do not decode are worth stopping for. Retrying reads
+    /// the same bytes again.
+    ///
+    /// Two things arrive here, and the second is the common one:
+    ///
+    /// - a stored `meta` or `data` column that will not parse as JSON — out-of-
+    ///   band tampering, an interrupted maintenance job, a version skew;
+    /// - an event that does not read as an event *after the upcaster chain
+    ///   ran*. That is almost always a bug in the chain rather than in the
+    ///   file: a step dropped a field the next one needs. It was reported as a
+    ///   storage failure before, which sent readers to look at the disk.
+    ///
+    /// Either way a dropped row must never read as an empty stream — a fold
+    /// over a silently truncated log produces a wrong state rather than an
+    /// obvious failure.
+    #[error("stored data does not decode: {0}")]
+    Corruption(String),
 
     /// The request is well-formed and this backend cannot serve it: an
     /// in-memory store asked to write a second stream, a store that is not a
@@ -116,5 +140,15 @@ impl Error {
     /// Public for the same reason as [`Error::validation`].
     pub fn storage(message: impl Into<String>) -> Self {
         Error::Storage(message.into())
+    }
+
+    /// Public for the same reason as [`Error::validation`].
+    pub fn corruption(message: impl Into<String>) -> Self {
+        Error::Corruption(message.into())
+    }
+
+    /// Whether the bytes read back are the problem, rather than the reading.
+    pub fn is_corruption(&self) -> bool {
+        matches!(self, Error::Corruption(_))
     }
 }

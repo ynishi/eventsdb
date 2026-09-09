@@ -89,19 +89,19 @@ impl Current {
     /// state instead of an obvious failure.
     pub fn from_upcasted(event: Value) -> Result<Self> {
         let Value::Object(object) = event else {
-            return Err(Error::storage("stored event is not a JSON object"));
+            return Err(Error::corruption("stored event is not a JSON object"));
         };
         if !object
             .get(FIELD_KIND)
             .map(Value::is_string)
             .unwrap_or(false)
         {
-            return Err(Error::storage(format!(
+            return Err(Error::corruption(format!(
                 "stored event has no string `{FIELD_KIND}` after upcasting"
             )));
         }
         if !object.get(FIELD_SEQ).map(Value::is_u64).unwrap_or(false) {
-            return Err(Error::storage(format!(
+            return Err(Error::corruption(format!(
                 "stored event has no `{FIELD_SEQ}` after upcasting"
             )));
         }
@@ -114,7 +114,7 @@ impl Current {
             .map(Value::is_u64)
             .unwrap_or(false)
         {
-            return Err(Error::storage(format!(
+            return Err(Error::corruption(format!(
                 "stored event has no `{FIELD_SCHEMA_VERSION}` after upcasting; \
                  a step removed it, and the next step has nothing to select on"
             )));
@@ -197,24 +197,33 @@ mod tests {
     }
 
     #[test]
-    fn an_event_without_a_kind_after_upcasting_is_a_storage_failure() {
+    fn an_event_without_a_kind_after_upcasting_is_corruption() {
         let error = Current::from_upcasted(json!({ "seq": 1 })).unwrap_err();
-        assert!(matches!(error, Error::Storage(_)));
+        assert!(
+            error.is_corruption(),
+            "a chain bug is not a failing disk: {error}"
+        );
     }
 
     #[test]
-    fn an_event_without_a_seq_after_upcasting_is_a_storage_failure() {
+    fn an_event_without_a_seq_after_upcasting_is_corruption() {
         let error =
             Current::from_upcasted(json!({ "kind": "noted", "_schema_version": 1 })).unwrap_err();
-        assert!(matches!(error, Error::Storage(_)));
+        assert!(
+            error.is_corruption(),
+            "a chain bug is not a failing disk: {error}"
+        );
     }
 
     /// A step that dropped the version took the thing the next step selects
     /// on, and nothing downstream would have noticed.
     #[test]
-    fn an_event_without_a_schema_version_after_upcasting_is_a_storage_failure() {
+    fn an_event_without_a_schema_version_after_upcasting_is_corruption() {
         let error = Current::from_upcasted(json!({ "kind": "noted", "seq": 1 })).unwrap_err();
-        assert!(matches!(error, Error::Storage(_)));
+        assert!(
+            error.is_corruption(),
+            "a chain bug is not a failing disk: {error}"
+        );
         assert!(error.to_string().contains("select on"), "{error}");
     }
 }

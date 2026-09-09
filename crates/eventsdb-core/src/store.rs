@@ -20,12 +20,31 @@
 //! append is never refused for an out-of-date view of the head: that would be
 //! asking a fact to prove it knew the future.
 //!
-//! A *command* with an invariant — "reserve n only if the balance covers it"
-//! — is the other case, and it is [`EventStore::append_if`]: the backend
-//! reads the stream, calls the caller's decision and appends what it returns,
-//! all inside the same serialized write. The check therefore runs against the
-//! stream as it is at that instant, not against a head someone cached
-//! earlier, which a compare-and-swap could only detect afterwards.
+//! A *command* with an invariant is the other case, and it comes in two
+//! shapes. **Which one you want depends on where the decision was made, not
+//! on whether the check is atomic** — both check inside the write.
+//!
+//! - The decision runs **at** the write: [`EventStore::append_if`]. The
+//!   backend reads the stream, calls the caller's decision and appends what it
+//!   returns, all inside the same serialized write, so "reserve n only if the
+//!   balance covers it" is checked against the stream as it is at that
+//!   instant. Prefer this wherever it fits: it folds rather than comparing, so
+//!   it raises no false conflicts; a decision with nothing to do returns
+//!   `None` and is idempotent for free; and there is no retry loop because
+//!   there is nothing to retry.
+//! - The decision was made **before** the call, somewhere this process cannot
+//!   reach — an HTTP client holding an `ETag`, a form somebody filled in, a
+//!   message that sat in a queue. `Decision` is a `FnOnce` running under the
+//!   lock, so it cannot represent that. [`EventStore::append_expecting`] can:
+//!   it compares one number, which is exactly as much as a caller who left the
+//!   process still knows.
+//!
+//! An earlier version of this paragraph said a compare-and-swap "could only
+//! detect afterwards". That is wrong and worth correcting rather than quietly
+//! deleting: a CAS whose head read is in the same transaction as its insert
+//! detects at the same instant `append_if`'s decision does. What it cannot do
+//! is *fold*. The version that really does detect too late is the one whose
+//! lookup sits outside the transaction, which is not what this offers.
 
 use async_trait::async_trait;
 use serde_json::{Map, Value};
@@ -111,6 +130,33 @@ pub trait EventStore: Send + Sync {
         kinds: Option<&[&str]>,
         decide: Decision,
     ) -> Result<Option<Committed>>;
+
+    /// Record an event with a time it already has, rather than the wall clock
+    /// of this call.
+    ///
+    /// The backfill counterpart to [`EventStore::append`]: history from a
+    /// system that has its own notion of when, brought in without discarding
+    /// that timeline. Identical to `append` in every other respect — the
+    /// envelope is validated, `seq` and the position are this store's, the
+    /// schema version is the author's.
+    ///
+    /// **Use `append` for ordinary writes.** For moving an *eventsdb* log,
+    /// neither this nor `append` is the verb — `import` is, because it also
+    /// carries the schema version each event was written under, which this
+    /// cannot.
+    ///
+    /// See [`crate::event`] for what the time coordinate means and why the
+    /// verb rather than a field is what says which moment it is. In short:
+    /// positions order the log, the coordinate never does, and this call does
+    /// not enforce that the time it is given is at or after the stream's head.
+    /// Backfilling into an empty stream in chronological order keeps that
+    /// property by construction.
+    async fn append_at(&mut self, epoch_ms: u64, event: Map<String, Value>) -> Result<Committed> {
+        let _ = (epoch_ms, event);
+        Err(Error::Unsupported(
+            "this store cannot record an event at a time other than now".to_string(),
+        ))
+    }
 
     /// Append `event` only if the stream's head is `expected`, refusing with
     /// [`Error::HeadMismatch`] if it is not.

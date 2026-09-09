@@ -389,6 +389,36 @@ impl EventStore for SqliteEventStore {
         Ok(committed)
     }
 
+    async fn append_at(&mut self, epoch_ms: u64, event: Map<String, Value>) -> Result<Committed> {
+        validate(&event)?;
+        let stream = self.stream.clone();
+
+        let committed = self
+            .write_retrying(move || {
+                let stream = stream.clone();
+                let event = event.clone();
+                move |conn: &mut Connection| {
+                    Ok((|| {
+                        let tx = conn
+                            .transaction_with_behavior(TransactionBehavior::Immediate)
+                            .map_err(classify)?;
+                        let seq = next_seq(&tx, &stream)?;
+                        let stamped = stamp(event, seq, epoch_ms)?;
+                        let committed = insert_stamped(&tx, &stream, &stamped)?;
+                        set_next_seq(&tx, &stream, seq + 1)?;
+                        tx.commit().map_err(classify)?;
+                        Ok(committed)
+                    })())
+                }
+            })
+            .await?;
+
+        if let Some(position) = committed.position {
+            self.shared.publish(position);
+        }
+        Ok(committed)
+    }
+
     /// The head is read from the **stored counter**, not from `MAX(seq)`.
     ///
     /// That difference only shows once retention has run, and it is the whole

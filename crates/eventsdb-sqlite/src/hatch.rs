@@ -18,11 +18,24 @@
 //! legitimate event that no rule ever governed. A `DELETE` removes history
 //! with no retention ledger entry, so nothing downstream is told that a fold
 //! is now missing its input — which is the one failure retention was built to
-//! make impossible. Those are what the authorizer refuses, and they are
-//! refused whether the connection is this one or another.
+//! make impossible.
+//!
+//! **How far the guard actually reaches.** It is installed for the duration of
+//! a call, on the connection this store owns, at the three sites that hand a
+//! connection to caller code. So it covers everything that comes *through*
+//! this crate — the hatch, `query`, a projection's `apply` — and it covers
+//! nothing else. A `sqlite3` session on the same file, or any other program
+//! that opens it, is not refused anything: SQLite has no way to make an
+//! authorizer a property of the file.
+//!
+//! What *is* a property of the file is a trigger, which is how `ai-store`
+//! defends the same invariant. This crate does not have one yet; the gap is
+//! recorded rather than papered over, because a reader who took the paragraph
+//! above as covering the CLI would be trusting something that is not there.
 //!
 //! So the hatch is not a convenience. It is what makes "go through the store"
-//! a reasonable thing to ask, because there is somewhere to go.
+//! a reasonable thing to ask of code that has a choice, because there is
+//! somewhere to go.
 //!
 //! # What it gives and what it refuses
 //!
