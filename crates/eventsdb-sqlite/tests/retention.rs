@@ -441,6 +441,65 @@ async fn reclaim_runs_on_a_freshly_created_database() {
     log.close().await.unwrap();
 }
 
+/// The ladder's *upgrade* path, which a freshly created database never
+/// exercises: it runs every step at once and so proves only that the steps
+/// compose from nothing.
+///
+/// Rewinds a real database to `user_version = 1` — the shape the previous
+/// release wrote — and reopens it, which is what an existing file will do
+/// once this version ships.
+#[tokio::test]
+async fn an_existing_database_is_carried_up_the_ladder() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("events.db");
+
+    {
+        let log = SqliteEventLog::open(&path).await.unwrap();
+        let mut s = log.stream_handle("s");
+        s.append(event("kept")).await.unwrap();
+        log.close().await.unwrap();
+    }
+
+    // Put the file back to what step 1 alone leaves behind.
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "DROP TABLE retention; \
+             DROP INDEX events_epoch_ms; \
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 1);
+    }
+
+    // Reopening runs step 2 and nothing else.
+    let log = SqliteEventLog::open(&path).await.unwrap();
+    assert_eq!(log.removed_watermark().await.unwrap(), Position::BEGINNING);
+
+    let survived = log
+        .read_all(Position::BEGINNING, &Filter::all(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(survived.len(), 1, "the events were not touched by the step");
+    assert_eq!(survived[0].kind(), "kept");
+
+    // And the facilities step 2 adds are there.
+    log.retain(Plan::Before(Position::new(1)), Guard::default())
+        .await
+        .unwrap();
+    assert_eq!(log.removed_watermark().await.unwrap(), Position::new(1));
+    log.close().await.unwrap();
+
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let version: i64 = conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, eventsdb_sqlite::TARGET_USER_VERSION);
+}
+
 #[tokio::test]
 async fn retention_survives_a_reopen() {
     let dir = tempfile::tempdir().unwrap();
