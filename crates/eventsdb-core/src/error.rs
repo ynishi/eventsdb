@@ -67,6 +67,22 @@ pub enum Error {
     )]
     Truncated { requested: u64, removed_up_to: u64 },
 
+    /// The stream had moved on: the head the caller expected is not the head
+    /// the write found, so nothing was appended.
+    ///
+    /// Both coordinates are given because the caller's next move needs both —
+    /// `expected` is where it left off and `actual` is what to read up to, so
+    /// it can fold only what it missed rather than the stream from the start.
+    ///
+    /// Deliberately not [`Error::Busy`]: nothing is contended, and repeating
+    /// the same call unchanged will fail the same way. The caller has to
+    /// decide again against a state it has not seen.
+    #[error("stream head is {actual:?}, not the expected {expected:?}")]
+    HeadMismatch {
+        expected: crate::store::Expected,
+        actual: crate::store::Expected,
+    },
+
     /// Retention would have removed events a registered consumer has not seen.
     #[error(
         "retention would remove up to position {up_to}, past consumer `{consumer}` at {cursor}"

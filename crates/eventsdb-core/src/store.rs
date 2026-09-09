@@ -42,6 +42,34 @@ use crate::upcast::Current;
 /// which is the class that says another *call* is worth making.
 pub type Decision = Box<dyn FnOnce(&[Current]) -> Option<Map<String, Value>> + Send>;
 
+/// What a caller believes a stream's head to be, as of when it last looked.
+///
+/// A named type rather than an `Option<u64>` or a zero sentinel. The two cases
+/// are not "some head" and "no head" — they are two different claims, and the
+/// empty one is the one everybody gets wrong. Rails Event Store spells it
+/// `-1`, others spell it `0`, and both produce off-by-one bug reports;
+/// Equinox hides the number entirely rather than let it into domain code.
+/// Naming the empty case is the mitigation available to a store that has to
+/// expose it at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Expected {
+    /// Nothing has ever been appended to this stream.
+    ///
+    /// **Not the same as "the stream reads empty".** Retention can empty a
+    /// stream whose counter stands at 50, and a caller that meant "this is a
+    /// new order" must not be told yes about an order that was archived. The
+    /// check is against what the stream's counter records, not against the
+    /// rows that survive.
+    Unwritten,
+
+    /// The last event appended to this stream has this `seq`.
+    ///
+    /// A `seq`, not a [`crate::position::Position`]: the claim is about one
+    /// stream, and the two coordinates have different scopes.
+    Seq(u64),
+}
+
 #[async_trait]
 pub trait EventStore: Send + Sync {
     /// Which stream this handle is.
@@ -83,6 +111,41 @@ pub trait EventStore: Send + Sync {
         kinds: Option<&[&str]>,
         decide: Decision,
     ) -> Result<Option<Committed>>;
+
+    /// Append `event` only if the stream's head is `expected`, refusing with
+    /// [`Error::HeadMismatch`] if it is not.
+    ///
+    /// For a decision taken **before** this call, somewhere this process
+    /// cannot reach: an HTTP client holding an `ETag`, a form somebody filled
+    /// in, a message that sat in a queue. The caller read the stream at some
+    /// head, went away, and is now saying "apply this only if nothing moved".
+    ///
+    /// [`EventStore::append_if`] is the other case and the better one wherever
+    /// it applies — a decision folded from the stream *at* the write, which
+    /// this cannot express because it compares one number and never looks at
+    /// the events. Reach for this only when the decision could not have run
+    /// under the lock.
+    ///
+    /// **The comparison happens inside the write.** The head is read in the
+    /// same transaction that inserts, so a writer arriving between them
+    /// serializes behind the write lock rather than slipping past the check. A
+    /// refused append leaves no trace and consumes no sequence number, exactly
+    /// as a rejected [`EventStore::append`] does.
+    ///
+    /// The default declines. A backend that cannot make the read and the
+    /// insert one write has no honest answer here, and an imitation that
+    /// checked separately would be worse than none — that gap between lookup
+    /// and save is the documented weakness of the version-only form elsewhere.
+    async fn append_expecting(
+        &mut self,
+        expected: Expected,
+        event: Map<String, Value>,
+    ) -> Result<Committed> {
+        let _ = (expected, event);
+        Err(Error::Unsupported(
+            "this store cannot make a head check and an append one write".to_string(),
+        ))
+    }
 
     /// Events of `kinds` with `seq >= from_seq`, at most `limit`, in `seq`
     /// order and already upcasted.

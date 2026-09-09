@@ -12,10 +12,10 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use eventsdb_core::error::Result;
+use eventsdb_core::error::{Error, Result};
 use eventsdb_core::event::{now_ms, stamp, validate};
 use eventsdb_core::position::{Committed, Position};
-use eventsdb_core::store::{Decision, EventStore};
+use eventsdb_core::store::{Decision, EventStore, Expected};
 use eventsdb_core::upcast::{apply_chain, Current, UpcastChain};
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 use serde_json::{Map, Value};
@@ -384,6 +384,65 @@ impl EventStore for SqliteEventStore {
         // nor see it.
         let committed = self.writer_job(job).await?;
         if let Some(position) = committed.and_then(|c| c.position) {
+            self.shared.publish(position);
+        }
+        Ok(committed)
+    }
+
+    /// The head is read from the **stored counter**, not from `MAX(seq)`.
+    ///
+    /// That difference only shows once retention has run, and it is the whole
+    /// safety of this call. After a whole stream is removed, `MAX(seq)` is
+    /// `NULL` while the counter stands at, say, 51 — so a check against the
+    /// maximum would let [`Expected::Unwritten`] pass on a stream that held 50
+    /// events. A caller meaning "this is a new order" would be told yes about
+    /// an order that was archived.
+    ///
+    /// So this deliberately disagrees with [`EventStore::head`] on a truncated
+    /// stream, and the disagreement is correct: `head` answers "what is the
+    /// newest event I can read", a question about the rows; this answers "what
+    /// has happened here", a question about the stream.
+    async fn append_expecting(
+        &mut self,
+        expected: Expected,
+        event: Map<String, Value>,
+    ) -> Result<Committed> {
+        validate(&event)?;
+        let stream = self.stream.clone();
+
+        let committed = self
+            .write_retrying(move || {
+                let stream = stream.clone();
+                let event = event.clone();
+                move |conn: &mut Connection| {
+                    Ok((|| {
+                        let tx = conn
+                            .transaction_with_behavior(TransactionBehavior::Immediate)
+                            .map_err(classify)?;
+
+                        // Inside the write, so a writer arriving between the
+                        // check and the insert serializes behind the lock
+                        // rather than slipping past it.
+                        let next = next_seq(&tx, &stream)?;
+                        let actual = match next {
+                            1 => Expected::Unwritten,
+                            next => Expected::Seq(next - 1),
+                        };
+                        if actual != expected {
+                            return Err(Error::HeadMismatch { expected, actual });
+                        }
+
+                        let stamped = stamp(event, next, now_ms())?;
+                        let committed = insert_stamped(&tx, &stream, &stamped)?;
+                        set_next_seq(&tx, &stream, next + 1)?;
+                        tx.commit().map_err(classify)?;
+                        Ok(committed)
+                    })())
+                }
+            })
+            .await?;
+
+        if let Some(position) = committed.position {
             self.shared.publish(position);
         }
         Ok(committed)

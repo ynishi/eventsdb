@@ -22,13 +22,38 @@ use std::sync::Arc;
 use serde_json::{Map, Value};
 
 use crate::error::{Error, Result};
-use crate::event::{FIELD_KIND, FIELD_SEQ};
+use crate::event::{FIELD_KIND, FIELD_SCHEMA_VERSION, FIELD_SEQ};
 
 /// One `n -> n+1` step.
 ///
 /// Applied to every event read, in registration order, whatever version the
 /// event carries: a step is responsible for recognising the shapes it applies
 /// to and leaving everything else alone.
+///
+/// # Select on `(kind, version)`, never on the version alone
+///
+/// [`crate::event::FIELD_SCHEMA_VERSION`] belongs to whoever owns the `kind`,
+/// so the number means nothing without the kind beside it. A step that matched
+/// on the version alone would move every author's events whenever any one of
+/// them bumped:
+///
+/// ```ignore
+/// if event["kind"] == json!("order_placed") && event["_schema_version"] == json!(1) {
+///     // ... rewrite, then set the version to 2
+/// }
+/// ```
+///
+/// A step must also **leave the version it did not handle alone**, and set the
+/// new one when it does. Otherwise a later reader cannot tell a shape that was
+/// moved forward from one that was never touched.
+///
+/// # Order is yours, and nothing checks it
+///
+/// The chain runs in registration order and every step sees every event, so a
+/// `1 -> 2` registered after a `2 -> 3` silently leaves version-1 events at 2.
+/// Axon has the same property and the reported failure is real: a 40-step
+/// chain where a copy-pasted step kept the wrong constants, and code review
+/// missed it. A test that walks the chain is worth writing before it is long.
 pub trait Upcaster: Send + Sync {
     fn upcast(&self, event: Value) -> Value;
 }
@@ -78,6 +103,20 @@ impl Current {
         if !object.get(FIELD_SEQ).map(Value::is_u64).unwrap_or(false) {
             return Err(Error::storage(format!(
                 "stored event has no `{FIELD_SEQ}` after upcasting"
+            )));
+        }
+        // The seam an ancestor of this crate checked here and the extraction
+        // dropped. A chain that leaves an event without a version has taken
+        // the one thing a later step selects on, and the symptom would be a
+        // step silently not matching rather than anything failing.
+        if !object
+            .get(FIELD_SCHEMA_VERSION)
+            .map(Value::is_u64)
+            .unwrap_or(false)
+        {
+            return Err(Error::storage(format!(
+                "stored event has no `{FIELD_SCHEMA_VERSION}` after upcasting; \
+                 a step removed it, and the next step has nothing to select on"
             )));
         }
         Ok(Current(object))
@@ -165,7 +204,17 @@ mod tests {
 
     #[test]
     fn an_event_without_a_seq_after_upcasting_is_a_storage_failure() {
-        let error = Current::from_upcasted(json!({ "kind": "noted" })).unwrap_err();
+        let error =
+            Current::from_upcasted(json!({ "kind": "noted", "_schema_version": 1 })).unwrap_err();
         assert!(matches!(error, Error::Storage(_)));
+    }
+
+    /// A step that dropped the version took the thing the next step selects
+    /// on, and nothing downstream would have noticed.
+    #[test]
+    fn an_event_without_a_schema_version_after_upcasting_is_a_storage_failure() {
+        let error = Current::from_upcasted(json!({ "kind": "noted", "seq": 1 })).unwrap_err();
+        assert!(matches!(error, Error::Storage(_)));
+        assert!(error.to_string().contains("select on"), "{error}");
     }
 }

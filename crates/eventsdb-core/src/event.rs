@@ -91,13 +91,43 @@ pub const FIELD_EPOCH_MS: &str = "epoch_ms";
 pub const FIELD_SCHEMA_VERSION: &str = "_schema_version";
 
 /// The keys a caller may set. Anything else at the top level is refused.
-const CALLER_FIELDS: [&str; 3] = [FIELD_KIND, FIELD_META, FIELD_DATA];
+const CALLER_FIELDS: [&str; 4] = [FIELD_KIND, FIELD_META, FIELD_DATA, FIELD_SCHEMA_VERSION];
 
-/// The version every new event is stamped with.
+/// What an event is stamped with when its author did not say.
 ///
-/// Bumped in the same round as any change to the shape of a stored event,
-/// together with an upcaster for the `n -> n+1` step. See [`crate::upcast`].
-pub const CURRENT_SCHEMA_VERSION: u64 = 1;
+/// # The version belongs to whoever declares the shape
+///
+/// The store carries this number in a column and hands it to the reader; it
+/// does not choose it. Whoever owns a `kind` owns what that kind's `data`
+/// looks like, so they own the number that says which shape it is in — the
+/// store cannot know, and a number defined by *this crate's* release history
+/// would be meaningless to a consumer and to anyone reading an export.
+///
+/// This is Axon's arrangement: the revision is declared by the event's author,
+/// persisted in a column beside the type, and absent is a legal value that the
+/// first upcaster selects on. No surveyed event store has one where the store
+/// picks the number.
+///
+/// # Select on `(kind, version)`, never on the version alone
+///
+/// One number shared by every kind would mean one consumer's bump silently
+/// bumped everyone else's. An upcaster should ask "is this *my* kind, at the
+/// version I know how to move" — see [`crate::upcast`].
+///
+/// # The envelope has a version too, and it is not this one
+///
+/// The `kind`/`meta`/`data` split, and the columns it becomes, can change as
+/// well — but an upcaster transforms JSON and cannot add a column, so an
+/// envelope change is a storage migration. That number is the backend's
+/// migration ladder (`PRAGMA user_version` in the SQLite backend), which runs
+/// once at open, before any handle is issued. A database is therefore
+/// homogeneous in envelope shape by the time anything reads it, and a
+/// per-event envelope version would have nothing to disambiguate.
+pub const DEFAULT_SCHEMA_VERSION: u64 = 1;
+
+/// Kept as the old name for the default. Prefer [`DEFAULT_SCHEMA_VERSION`],
+/// which says what it now is: a fallback, not the store's opinion.
+pub const CURRENT_SCHEMA_VERSION: u64 = DEFAULT_SCHEMA_VERSION;
 
 /// Check that `event` satisfies the envelope contract.
 ///
@@ -132,6 +162,12 @@ pub fn validate(event: &Map<String, Value>) -> Result<()> {
             FIELD_DATA if !value.is_object() => {
                 return Err(Error::validation(format!(
                     "`{FIELD_DATA}` must be an object, found {}",
+                    type_name(value)
+                )))
+            }
+            FIELD_SCHEMA_VERSION if !value.is_u64() => {
+                return Err(Error::validation(format!(
+                    "`{FIELD_SCHEMA_VERSION}` must be a non-negative integer, found {}",
                     type_name(value)
                 )))
             }
@@ -182,10 +218,11 @@ pub fn stamp(mut event: Map<String, Value>, seq: u64, epoch_ms: u64) -> Result<M
         .or_insert_with(|| Value::Object(Map::new()));
     event.insert(FIELD_SEQ.to_string(), Value::from(seq));
     event.insert(FIELD_EPOCH_MS.to_string(), Value::from(epoch_ms));
-    event.insert(
-        FIELD_SCHEMA_VERSION.to_string(),
-        Value::from(CURRENT_SCHEMA_VERSION),
-    );
+    // `or_insert`, not `insert`: the version is the author's to choose, and
+    // this is only the value for an author who did not.
+    event
+        .entry(FIELD_SCHEMA_VERSION.to_string())
+        .or_insert_with(|| Value::from(DEFAULT_SCHEMA_VERSION));
     Ok(event)
 }
 

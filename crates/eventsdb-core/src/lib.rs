@@ -49,6 +49,6 @@ pub use event::{validate, CURRENT_SCHEMA_VERSION};
 pub use log::{EventLog, Filter};
 pub use mem::MemEventStore;
 pub use position::{Committed, Position, Recorded};
-pub use store::{Decision, EventStore};
+pub use store::{Decision, EventStore, Expected};
 pub use transfer::{ExportedEvent, ImportReport};
 pub use upcast::{Current, UpcastChain, Upcaster};

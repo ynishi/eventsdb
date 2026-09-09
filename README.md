@@ -133,14 +133,38 @@ store forfeits both, which is why this one does not distribute.
 
 ### A command with an invariant
 
-`append_if` reads the stream, calls your decision and appends its answer
-inside one transaction, so the check runs against the stream as it is at that
-instant rather than a head you cached:
+Two shapes, and which one you want depends on **where the decision was made**,
+not on whether the check is atomic — both check inside the write.
+
+**The decision runs at the write** — `append_if` reads the stream, calls your
+decision and appends its answer inside one transaction, so the check runs
+against the stream as it is at that instant rather than a head you cached:
 
     ledger.append_if(Some(&["granted", "spent"]), Box::new(|seen| {
         let balance = fold_balance(seen);
         (balance >= 4).then(|| spend(4))
     })).await?;
+
+Prefer this wherever it fits. It folds the stream rather than comparing one
+number, so it produces no false conflicts; a decision that finds nothing to do
+returns `None` and is idempotent for free; and there is no retry loop, because
+there is nothing to retry.
+
+**The decision was made before the call, somewhere this process cannot reach** —
+an HTTP client holding an `ETag`, a form somebody filled in, a message that sat
+in a queue. Then it is expected-version:
+
+    orders.append_expecting(Expected::Seq(4), cancelled()).await?;
+    // Err(HeadMismatch { expected: Seq(4), actual: Seq(6) })  → HTTP 412
+
+The error carries both coordinates, so the caller folds only what it missed
+rather than the stream from the start. It is **not** `Busy`: nothing is
+contended, and repeating it unchanged fails the same way.
+
+`Expected::Unwritten` means *nothing has ever been appended here* — which is
+not the same as "the stream reads empty". Retention can empty a stream whose
+counter stands at 50, and the check is against the counter, so a caller meaning
+"this is a new order" is not told yes about an order that was archived.
 
 ### A projection
 
@@ -276,13 +300,30 @@ chart.
 
 Two axes, and they are not the same one:
 
-| axis | subject | mechanism | marker |
-|------|---------|-----------|--------|
-| event shape | `data`, `meta`, the meaning of a kind | upcaster chain, applied on read | `_schema_version` |
-| table shape | columns, indices, constraints | migration ladder, applied at open | `PRAGMA user_version` |
+| axis | subject | who owns the number | mechanism | marker |
+|------|---------|---------------------|-----------|--------|
+| event shape | `data`, `meta`, the meaning of a kind | **the author of the kind** | upcaster chain, applied on read | `_schema_version` |
+| table shape | columns, indices, constraints | this crate | migration ladder, applied at open | `PRAGMA user_version` |
 
 Stored bytes are never rewritten. An upcaster moves the reader forward
 instead.
+
+**The store carries `_schema_version`; it does not choose it.** Whoever owns a
+`kind` owns what its `data` looks like, so they own the number that says which
+shape it is in — a number defined by *this crate's* release history would mean
+nothing to a consumer or to anyone reading an export. Set it on the event, or
+leave it out and get `DEFAULT_SCHEMA_VERSION`. This is Axon's arrangement: the
+revision is declared by the author, persisted in a column beside the type, and
+absent is a legal value the first upcaster selects on.
+
+**Select on `(kind, version)`, never on the version alone** — one shared number
+would mean one author's bump silently bumped everyone else's.
+
+The envelope has a shape too, and that one *is* the crate's: an upcaster
+transforms JSON and cannot add a column, so an envelope change is a ladder
+step. The ladder runs at open before any handle is issued, so a database is
+homogeneous in envelope shape by the time anything reads it — which is why
+there is no second per-event number.
 
 ## Retention
 
