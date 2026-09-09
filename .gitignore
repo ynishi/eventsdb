@@ -3,3 +3,8 @@
 *.db
 *.db-shm
 *.db-wal
+
+# Working notes and task scratch. Kept out of the history on purpose: it is
+# where drafts, measurements and half-finished reasoning go, and none of that
+# is the crate.
+workspace

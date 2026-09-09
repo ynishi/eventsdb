@@ -128,7 +128,7 @@ impl<'t> TxnContext<'t> {
 
     /// Validate, stamp and insert one event, returning where it landed.
     ///
-    /// The same rules as [`crate::SqliteEventStore::append`] — a rejected
+    /// The same rules as [`eventsdb_core::EventStore::append`] — a rejected
     /// event leaves no trace and consumes no sequence number — with one
     /// difference: it lands when the enclosing transaction commits, not
     /// before. Return `Err` from the closure and it is as if it never
@@ -216,8 +216,9 @@ impl<'t> TxnContext<'t> {
         Ok(committed)
     }
 
-    /// Append several events to one stream, as [`crate::SqliteEventStore::append_many`]
-    /// does: one clock reading for the batch, contiguous sequence numbers.
+    /// Append several events to one stream, as
+    /// [`eventsdb_core::EventStore::append_many`] does: one clock reading for
+    /// the batch, contiguous sequence numbers.
     ///
     /// Appending to *different* streams is just two calls — there is no
     /// grouping rule and no ordering restriction, because each call takes its

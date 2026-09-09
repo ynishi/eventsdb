@@ -119,7 +119,8 @@ pub trait Projection: Send + 'static {
     /// `false` by default, and that default is the important one: a total —
     /// a balance, a count, a sum — computed over a log missing its front is
     /// simply wrong, and nothing about the result says so. The runner refuses
-    /// rather than produce it (see [`crate::retention`]).
+    /// rather than produce it — see [`crate::Report`] and [`crate::Plan`] for
+    /// what removed the front and what it recorded about doing so.
     ///
     /// Return `true` only for a projection whose answer does not depend on
     /// the removed range: a "last 30 days" view, a latest-value-per-stream
