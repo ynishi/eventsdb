@@ -186,6 +186,61 @@ async fn a_record_round_trips_through_json() {
     assert_eq!(export_all(&target).await, exported);
 }
 
+/// The batched import tracks a counter per stream as it walks the run, so an
+/// export whose streams interleave imports as it was exported — the shape a
+/// real log has, since positions are global and writers take turns.
+#[tokio::test]
+async fn an_interleaved_export_imports_in_the_order_it_was_exported() {
+    let source = SqliteEventLog::open_in_memory().await.unwrap();
+    let mut a = source.stream_handle("a");
+    let mut b = source.stream_handle("b");
+    // a b a b b a — no grouping, and `a` and `b` end on different counts.
+    a.append(event("noted", 1)).await.unwrap();
+    b.append(event("noted", 2)).await.unwrap();
+    a.append(event("noted", 3)).await.unwrap();
+    b.append(event("noted", 4)).await.unwrap();
+    b.append(event("noted", 5)).await.unwrap();
+    a.append(event("noted", 6)).await.unwrap();
+
+    let exported = export_all(&source).await;
+    let target = SqliteEventLog::open_in_memory().await.unwrap();
+    let report = target.import(exported.clone()).await.unwrap();
+    assert!(report.reproduced_coordinates);
+    assert_eq!(export_all(&target).await, exported);
+
+    // Each stream's counter continued from its own last event, not from a
+    // shared one.
+    let read = target
+        .read_all(Position::BEGINNING, &Filter::all(), 10)
+        .await
+        .unwrap();
+    let seen: Vec<(&str, u64)> = read.iter().map(|r| (r.stream.as_str(), r.seq())).collect();
+    assert_eq!(
+        seen,
+        vec![("a", 1), ("b", 1), ("a", 2), ("b", 2), ("b", 3), ("a", 3)]
+    );
+
+    // And an append after the import continues from where each left off.
+    assert_eq!(
+        target
+            .stream_handle("a")
+            .append(event("after", 0))
+            .await
+            .unwrap()
+            .seq,
+        4
+    );
+    assert_eq!(
+        target
+            .stream_handle("b")
+            .append(event("after", 0))
+            .await
+            .unwrap()
+            .seq,
+        4
+    );
+}
+
 /// Merging into a store that already has history renumbers, and the report
 /// says so rather than letting a caller assume a faithful copy.
 #[tokio::test]

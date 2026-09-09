@@ -68,37 +68,28 @@ impl SqliteEventLog {
     /// [`ImportReport::reproduced_coordinates`] says whether they did, rather
     /// than leaving a migration to assume it.
     ///
-    /// Import is the slower half by some way: 5 000 events export in **5.5 ms**
-    /// and import in **45 ms** [benched: `transfer` group, release]. Each event
-    /// reads and writes the stream counter individually, which a batch could
-    /// do once per run — worth doing before anyone moves a large log, and not
-    /// worth doing speculatively before then.
+    /// The whole batch is one call into [`crate::TxnContext::import_many`], so
+    /// the stream counter is read and written once per stream rather than once
+    /// per event. Page a large log through this rather than calling it per
+    /// event: one transaction of *n* costs far less than *n* transactions, and
+    /// the counter work does not grow with the run.
     pub async fn import(&self, events: Vec<ExportedEvent>) -> Result<ImportReport> {
         if events.is_empty() {
             return Ok(ImportReport::nothing());
         }
 
         self.with_transaction(move |tx| {
-            let mut first = None;
-            let mut last = None;
-            let mut reproduced = true;
+            let committed = tx.import_many(&events)?;
 
-            for exported in &events {
-                let committed = tx.import(exported)?;
-                let landed = committed.position;
-                if first.is_none() {
-                    first = landed;
-                }
-                last = landed;
-                if landed != Some(exported.position) {
-                    reproduced = false;
-                }
-            }
+            let reproduced = committed
+                .iter()
+                .zip(&events)
+                .all(|(landed, exported)| landed.position == Some(exported.position));
 
             Ok(ImportReport {
-                imported: events.len(),
-                first,
-                last,
+                imported: committed.len(),
+                first: committed.first().and_then(|c| c.position),
+                last: committed.last().and_then(|c| c.position),
                 reproduced_coordinates: reproduced,
             })
         })

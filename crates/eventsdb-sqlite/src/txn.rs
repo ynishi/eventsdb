@@ -39,6 +39,7 @@
 //! the mistake would not correct itself.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -257,20 +258,55 @@ impl<'t> TxnContext<'t> {
     /// Returns where it landed, so a caller importing into an empty store can
     /// check that against the position the event carried.
     pub fn import(&self, exported: &ExportedEvent) -> Result<Committed> {
-        let seq = next_seq(self.tx, &exported.stream)?;
-        let restamped = restamp(exported.event.clone(), seq)?;
+        Ok(self
+            .import_many(std::slice::from_ref(exported))?
+            .pop()
+            .expect("one event in, one out"))
+    }
 
-        let committed = {
-            let _trusted = Trusted::raise(&self.trusted);
-            let committed = insert_stamped(self.tx, &exported.stream, &restamped)?;
-            set_next_seq(self.tx, &exported.stream, seq + 1)?;
-            committed
-        };
-
-        if let Some(position) = committed.position {
-            self.published.borrow_mut().push(position);
+    /// Import a run of events, in the order given.
+    ///
+    /// The stream counter is read once per stream and written once per stream,
+    /// rather than once per event. That is the whole of the difference, and it
+    /// is most of the cost: importing 5 000 events one at a time took 45 ms
+    /// against a 5.5 ms export, because each one did its own counter read and
+    /// write [benched: `transfer` group, release].
+    ///
+    /// Events may name any streams, in any order — the counters are tracked
+    /// per stream as the run is walked, so an interleaved export imports as it
+    /// was exported.
+    pub fn import_many(&self, exported: &[ExportedEvent]) -> Result<Vec<Committed>> {
+        if exported.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(committed)
+
+        // The next sequence for each stream this run touches, read on first
+        // sight and kept in step from there.
+        let mut next: HashMap<&str, u64> = HashMap::new();
+        let mut out = Vec::with_capacity(exported.len());
+
+        {
+            let _trusted = Trusted::raise(&self.trusted);
+            for event in exported {
+                let stream = event.stream.as_str();
+                let seq = match next.get(stream) {
+                    Some(seq) => *seq,
+                    None => next_seq(self.tx, stream)?,
+                };
+                let restamped = restamp(event.event.clone(), seq)?;
+                out.push(insert_stamped(self.tx, stream, &restamped)?);
+                next.insert(stream, seq + 1);
+            }
+            // Once per stream, at the end.
+            for (stream, seq) in &next {
+                set_next_seq(self.tx, stream, *seq)?;
+            }
+        }
+
+        self.published
+            .borrow_mut()
+            .extend(out.iter().filter_map(|c| c.position));
+        Ok(out)
     }
 
     /// Read a stream as it stands *inside this transaction* — including what
