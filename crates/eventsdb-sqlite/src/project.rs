@@ -149,8 +149,16 @@ impl<P: Projection> ProjectionRunner<P> {
 
     /// How many events one transaction covers.
     ///
-    /// Larger batches mean fewer commits and a longer write lock; smaller
-    /// ones mean the opposite. Nothing about correctness changes.
+    /// Larger batches mean fewer commits and a longer write lock; smaller ones
+    /// mean the opposite. Nothing about correctness changes.
+    ///
+    /// The lock matters because the batch read stays on the writer — it has to
+    /// share a transaction with the completeness check, or retention could
+    /// remove events between the check and the batch it vouched for. So this is
+    /// the knob that bounds how long a fold holds the write lock, and the
+    /// reason the default is a number rather than "everything" [measured: a
+    /// 256-event batch took 175 ms while a concurrent read took 538 µs,
+    /// `tests/lock_hold.rs`, debug build].
     pub fn with_batch(mut self, batch: usize) -> Self {
         self.batch = batch.max(1);
         self

@@ -51,10 +51,23 @@ read measured at 73µs idle took **8.2 seconds** with one write open. It is now
 367µs [measured, `tests/readers.rs`].
 
 A reader sees committed data, which is the right answer for a standalone read
-and the wrong one inside a write transaction — so the reads a projection or a
-decide-then-append makes stay on the writer, where they can see the
-transaction's own work. An in-memory log has no readers, because each
-`:memory:` open is a separate database.
+and the wrong one inside a write transaction — so three read paths stay on the
+writer, each because a reader would break it:
+
+| path | why it cannot move |
+|------|--------------------|
+| `append_if`'s decision | must see the stream under the lock, or it is the compare-and-swap it exists to avoid |
+| `TxnContext::read` | must see what the same closure already appended, which is uncommitted |
+| a projection's batch | must share a transaction with the completeness check, or retention lands between them |
+
+They hold the write lock while they read, so **other writes wait for them** —
+other reads do not. A decision over 20 000 events held the lock ~780ms while a
+concurrent read took 536µs. `kinds` is the control and the difference is not
+marginal: the same decision was **706ms** reading every kind and **1.05ms**
+naming the one it folded. For projections the knob is `with_batch`.
+
+An in-memory log has no readers, because each `:memory:` open is a separate
+database.
 
 ## Two things a networked event store cannot give you
 

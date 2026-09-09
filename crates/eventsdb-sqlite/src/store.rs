@@ -328,6 +328,22 @@ impl EventStore for SqliteEventStore {
     /// Not retried on contention: the decision is `FnOnce`. Contention
     /// surfaces as [`Error::Busy`], and the caller decides whether to build a
     /// fresh decision and call again.
+    ///
+    /// # This read stays on the writer, and holds the lock
+    ///
+    /// It cannot move to a reader connection: a reader sees only committed
+    /// data, so the decision would be made against a stream another writer may
+    /// already have moved past — which is the compare-and-swap this call exists
+    /// to avoid.
+    ///
+    /// The price is that the write lock is held for the whole read, so **other
+    /// writes wait for it**. Other *reads* do not: they are served elsewhere
+    /// [measured: a decision over 20 000 events held the lock ~780 ms while a
+    /// concurrent read took 536 µs, `tests/lock_hold.rs`, debug build].
+    ///
+    /// `kinds` is the control, and the difference is not marginal: the same
+    /// decision took **706 ms** reading every kind and **1.05 ms** naming the
+    /// one it folded. Name what the fold reads.
     async fn append_if(
         &mut self,
         kinds: Option<&[&str]>,
