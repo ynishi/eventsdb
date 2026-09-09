@@ -21,7 +21,7 @@ use rusqlite::{Connection, TransactionBehavior};
 use crate::shared::classify;
 
 /// The version this build expects. Bumped with every appended step.
-pub const TARGET_USER_VERSION: i64 = 2;
+pub const TARGET_USER_VERSION: i64 = 3;
 
 /// Step 1: the log and the consumer checkpoints.
 ///
@@ -93,7 +93,35 @@ const STEP_2: &str = "
 /// — wall clock first, because it approximates causal order across streams,
 /// with `seq` breaking ties deterministically within one. No such database
 /// exists yet, so no such step is written.
-const LADDER: &[&str] = &[STEP_1, STEP_2];
+/// Step 3: the per-stream sequence counter, so `seq` cannot rewind.
+///
+/// `seq` used to be derived from `MAX(seq)` over the surviving rows, which is
+/// correct only while nothing is ever removed. Retention broke it: dropping a
+/// stream — or ageing out the whole of one — leaves no rows to take the
+/// maximum from, so the next append to that stream name was stamped `seq = 1`
+/// again. `UNIQUE(stream, seq)` does not catch it, because the rows that
+/// would have collided are gone.
+///
+/// That is the same reuse the `position` column's `AUTOINCREMENT` exists to
+/// prevent, and the argument was simply never carried across to `seq`. A
+/// downstream table keyed `(stream, seq)` would end up with two different
+/// events under one key and no error anywhere.
+///
+/// So the counter is stored, and **retention does not touch this table**: it
+/// outlives the events it counted, exactly as the retention ledger does.
+///
+/// The backfill takes each stream's current maximum, which is the right
+/// starting point for every database written before this step.
+const STEP_3: &str = "
+    CREATE TABLE stream_seq (
+        stream   TEXT PRIMARY KEY,
+        next_seq INTEGER NOT NULL
+    );
+    INSERT INTO stream_seq (stream, next_seq)
+        SELECT stream, MAX(seq) + 1 FROM events GROUP BY stream;
+";
+
+const LADDER: &[&str] = &[STEP_1, STEP_2, STEP_3];
 
 /// Bring `conn` up to [`TARGET_USER_VERSION`], one transaction per step.
 ///

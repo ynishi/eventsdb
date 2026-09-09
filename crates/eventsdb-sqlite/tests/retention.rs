@@ -458,11 +458,13 @@ async fn an_existing_database_is_carried_up_the_ladder() {
         log.close().await.unwrap();
     }
 
-    // Put the file back to what step 1 alone leaves behind.
+    // Put the file back to what step 1 alone leaves behind: everything the
+    // later steps create has to go, or re-running them hits its own objects.
     {
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute_batch(
-            "DROP TABLE retention; \
+            "DROP TABLE stream_seq; \
+             DROP TABLE retention; \
              DROP INDEX events_epoch_ms; \
              PRAGMA user_version = 1;",
         )
@@ -484,7 +486,12 @@ async fn an_existing_database_is_carried_up_the_ladder() {
     assert_eq!(survived.len(), 1, "the events were not touched by the step");
     assert_eq!(survived[0].kind(), "kept");
 
-    // And the facilities step 2 adds are there.
+    // And the facilities the later steps add are there. The step-3 backfill
+    // takes each stream's current maximum, so the counter continues from the
+    // events that were already in the file rather than restarting.
+    let mut s = log.stream_handle("s");
+    assert_eq!(s.append(event("later")).await.unwrap().seq, 2);
+
     log.retain(Plan::Before(Position::new(1)), Guard::default())
         .await
         .unwrap();

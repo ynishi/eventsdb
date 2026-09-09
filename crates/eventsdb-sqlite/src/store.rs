@@ -78,13 +78,35 @@ impl SqliteEventStore {
 }
 
 /// The next sequence number for `stream`, read inside the caller's transaction.
+///
+/// From a stored counter, not from `MAX(seq)` over the surviving rows. The
+/// difference only shows up once something is removed: retention can empty a
+/// stream entirely, and a derived maximum would then restart at 1 and hand
+/// out a `seq` some earlier event already had. See `schema::STEP_3`.
 fn next_seq(tx: &Transaction<'_>, stream: &str) -> Result<u64> {
     tx.query_row(
-        "SELECT COALESCE(MAX(seq), 0) + 1 FROM events WHERE stream = ?1",
+        "SELECT next_seq FROM stream_seq WHERE stream = ?1",
         [stream],
         |row| row.get::<_, i64>(0),
     )
     .map(|seq| seq as u64)
+    .or_else(|error| match error {
+        rusqlite::Error::QueryReturnedNoRows => Ok(1),
+        other => Err(classify(other)),
+    })
+}
+
+/// Record where `stream` will carry on from.
+///
+/// In the same transaction as the appends it accounts for, so a rolled-back
+/// write does not consume a sequence number.
+fn set_next_seq(tx: &Transaction<'_>, stream: &str, next: u64) -> Result<()> {
+    tx.execute(
+        "INSERT INTO stream_seq (stream, next_seq) VALUES (?1, ?2) \
+         ON CONFLICT(stream) DO UPDATE SET next_seq = excluded.next_seq",
+        rusqlite::params![stream, next as i64],
+    )
+    .map(|_| ())
     .map_err(classify)
 }
 
@@ -205,6 +227,7 @@ impl EventStore for SqliteEventStore {
                         let seq = next_seq(&tx, &stream)?;
                         let stamped = stamp(event, seq, now_ms())?;
                         let committed = insert_stamped(&tx, &stream, &stamped)?;
+                        set_next_seq(&tx, &stream, seq + 1)?;
                         tx.commit().map_err(classify)?;
                         Ok(committed)
                     })())
@@ -249,6 +272,7 @@ impl EventStore for SqliteEventStore {
                             let stamped = stamp(event, base_seq + offset as u64, epoch_ms)?;
                             out.push(insert_stamped(&tx, &stream, &stamped)?);
                         }
+                        set_next_seq(&tx, &stream, base_seq + out.len() as u64)?;
                         tx.commit().map_err(classify)?;
                         Ok(out)
                     })())
@@ -295,6 +319,7 @@ impl EventStore for SqliteEventStore {
                 let seq = next_seq(&tx, &stream)?;
                 let stamped = stamp(event, seq, now_ms())?;
                 let committed = insert_stamped(&tx, &stream, &stamped)?;
+                set_next_seq(&tx, &stream, seq + 1)?;
                 tx.commit().map_err(classify)?;
                 Ok(Some(committed))
             })())

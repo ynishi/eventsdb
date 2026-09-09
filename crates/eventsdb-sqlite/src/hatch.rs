@@ -24,16 +24,25 @@
 //! and it commits or rolls back with everything else in that transaction.
 //!
 //! What it refuses, through SQLite's own authorizer rather than by inspecting
-//! the text: writing to the log's tables (`events`, `checkpoints`,
-//! `retention`, `sqlite_sequence`), attaching another database, and setting
-//! pragmas. Reading those tables is allowed and often the point.
+//! the text: writing any table in [`RESERVED_TABLES`], **creating anything
+//! that shares one of those names in any schema** (a `TEMP TABLE events`
+//! shadows the real one for every unqualified statement on the connection),
+//! attaching another database, and setting pragmas. Reading those tables is
+//! allowed and often the point, and so is adding your own index to `events`.
 //!
 //! The refusals are not paternalism about your data. Each one is an invariant
 //! something else in this crate already promised: appends go through
 //! [`crate::SqliteEventStore`] so they are stamped and ordered; removals go
-//! through [`crate::retention`] so they leave a ledger; `user_version` is the
-//! migration ladder's, and `journal_mode` is what the concurrency story rests
-//! on.
+//! through [`crate::retention`] so they leave a ledger; `stream_seq` is what
+//! keeps `seq` from rewinding after a removal; `user_version` is the migration
+//! ladder's, and `journal_mode` is what the concurrency story rests on.
+//!
+//! The guard is installed for the duration of one call and taken off again
+//! whatever the body does — a panic included, which is why the body runs under
+//! `catch_unwind`. It sits on a connection that outlives the call, and the
+//! isle keeps that connection alive after a caught panic, so an unwind past
+//! the uninstall would leave every later write refused as `not authorized`
+//! while reads carried on working.
 
 use eventsdb_core::error::{Error, Result};
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
@@ -44,7 +53,13 @@ use crate::log::SqliteEventLog;
 use crate::shared::{classify, map_isle};
 
 /// Tables this crate owns. Reading them is fine; writing them is not.
-pub const RESERVED_TABLES: [&str; 4] = ["events", "checkpoints", "retention", "sqlite_sequence"];
+pub const RESERVED_TABLES: [&str; 5] = [
+    "events",
+    "stream_seq",
+    "checkpoints",
+    "retention",
+    "sqlite_sequence",
+];
 
 fn is_reserved(table: &str) -> bool {
     RESERVED_TABLES
@@ -52,31 +67,55 @@ fn is_reserved(table: &str) -> bool {
         .any(|reserved| reserved.eq_ignore_ascii_case(table))
 }
 
-/// Whether an attempted action is allowed inside the hatch.
+/// Whether an attempted action is allowed.
 ///
-/// Reads fall through to `Allow`: the log is meant to be queryable, and a
-/// projection that joins its read model against `events` is a good use of
-/// this.
+/// Reads fall through to `Allow`: the log is meant to be queryable, and
+/// joining a read model against `events` is a good use of this.
+///
+/// # A reserved name is refused in *any* schema, not just `main`
+///
+/// SQLite resolves an unqualified table name in `temp` before `main`, so a
+/// `TEMP TABLE events` shadows the log for every statement on the
+/// connection — including the store's own. Guarding only `main` therefore
+/// left the log capturable through the one API documented as unable to touch
+/// it: appends would land in the temp table, report a reused position, and
+/// the durable log would silently stop growing. The name is what has to be
+/// reserved, wherever it is being created.
 fn authorize(context: &AuthContext<'_>) -> Authorization {
-    // Only guard the main database. A write to an attached file is not ours
-    // to police — and attaching is refused below anyway.
-    let main = matches!(context.database_name, None | Some("main") | Some(""));
-
     match context.action {
+        // Writing, reshaping or dropping a reserved table.
         AuthAction::Insert { table_name }
         | AuthAction::Delete { table_name }
         | AuthAction::Update { table_name, .. }
         | AuthAction::DropTable { table_name }
+        | AuthAction::DropTempTable { table_name }
         | AuthAction::AlterTable { table_name, .. }
         | AuthAction::CreateTrigger { table_name, .. }
+        | AuthAction::CreateTempTrigger { table_name, .. }
         | AuthAction::DropTrigger { table_name, .. }
+        | AuthAction::DropTempTrigger { table_name, .. }
         | AuthAction::DropIndex { table_name, .. }
-            if main && is_reserved(table_name) =>
+        | AuthAction::DropTempIndex { table_name, .. }
+            if is_reserved(table_name) =>
         {
             Authorization::Deny
         }
 
-        // Attaching would put tables outside the guard's reach and outside
+        // Creating something *named* like a reserved table. In `main` these
+        // would fail on the existing object anyway; in `temp` they are the
+        // shadowing attack, and a view is as good a shadow as a table.
+        AuthAction::CreateTable { table_name } | AuthAction::CreateTempTable { table_name }
+            if is_reserved(table_name) =>
+        {
+            Authorization::Deny
+        }
+        AuthAction::CreateView { view_name } | AuthAction::CreateTempView { view_name }
+            if is_reserved(view_name) =>
+        {
+            Authorization::Deny
+        }
+
+        // Attaching would put tables outside this guard's reach and outside
         // the isle's single-writer discipline.
         AuthAction::Attach { .. } | AuthAction::Detach { .. } => Authorization::Deny,
 
@@ -85,6 +124,10 @@ fn authorize(context: &AuthContext<'_>) -> Authorization {
         // concurrency and reclaim stories.
         AuthAction::Pragma { pragma_value, .. } if pragma_value.is_some() => Authorization::Deny,
 
+        // Adding an index to `events` is deliberately *allowed*: it changes no
+        // data, and a caller that filters on something the shipped indices do
+        // not cover — a correlation value under `meta` — has no other way to
+        // make that read cheap. Dropping the shipped ones is refused above.
         _ => Authorization::Allow,
     }
 }
@@ -184,12 +227,19 @@ impl SqliteEventLog {
     /// chain; SQL runs against the bytes as they were written, because the
     /// chain is Rust and the query is SQLite's. A statement reading across a
     /// schema change reads the versions it finds.
+    /// The authorizer runs here too, and not only as belt-and-braces:
+    /// `sqlite3_stmt_readonly` reports `ATTACH` and `DETACH` as read-only —
+    /// they change the connection's configuration rather than any file's
+    /// contents — so the readonly gate alone would let a caller attach a
+    /// database to the long-lived connection and keep it there.
     pub async fn query(&self, sql: &str, params: Vec<Value>) -> Result<Vec<Map<String, Value>>> {
         let shared = self.shared_handle();
         let sql = sql.to_string();
         match shared
             .isle
-            .call(move |conn: &mut Connection| Ok(query_rows(conn, &sql, params)))
+            .call(move |conn: &mut Connection| {
+                Ok(guarded(conn, move |conn| query_rows(conn, &sql, params)))
+            })
             .await
         {
             Ok(inner) => inner,
@@ -228,26 +278,13 @@ impl SqliteEventLog {
         let shared = self.shared_handle();
 
         let job = move |conn: &mut Connection| {
-            conn.authorizer(Some(|context: AuthContext<'_>| authorize(&context)));
-
-            let outcome = (|| {
+            Ok(guarded(conn, move |conn| {
                 let tx = conn
                     .transaction_with_behavior(TransactionBehavior::Immediate)
                     .map_err(classify)?;
                 let value = body(&tx)?;
                 tx.commit().map_err(classify)?;
                 Ok(value)
-            })();
-
-            // Off again whatever happened: the authorizer is installed on the
-            // connection, and the connection outlives this call.
-            conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
-
-            Ok(outcome.map_err(|error| match &error {
-                // SQLite reports every denial the same way, so the useful
-                // message has to be built here.
-                Error::Storage(message) if message.contains("not authorized") => denied(),
-                _ => error,
             }))
         };
 
@@ -255,5 +292,49 @@ impl SqliteEventLog {
             Ok(inner) => inner,
             Err(isle) => Err(map_isle(isle)),
         }
+    }
+}
+
+/// Run `body` with the authorizer installed, and take it off again — whatever
+/// `body` does.
+///
+/// **Including panicking.** The authorizer sits on a connection that outlives
+/// this call, and the isle catches a panicking job and keeps serving on the
+/// same connection, so an unwind past the uninstall does not crash anything:
+/// it leaves the guard permanently installed, and every subsequent write the
+/// store itself makes is refused as `not authorized` while reads keep working.
+/// A log that looks alive and silently cannot be written to is the worst
+/// failure available here, so the unwind is caught and reported rather than
+/// allowed past this frame.
+fn guarded<T, F>(conn: &mut Connection, body: F) -> Result<T>
+where
+    F: FnOnce(&mut Connection) -> Result<T>,
+{
+    conn.authorizer(Some(|context: AuthContext<'_>| authorize(&context)));
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(conn)));
+
+    conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+
+    match outcome {
+        Ok(Ok(value)) => Ok(value),
+        // SQLite reports every denial the same way, so the useful message has
+        // to be built here.
+        Ok(Err(Error::Storage(message))) if message.contains("not authorized") => Err(denied()),
+        Ok(Err(error)) => Err(error),
+        Err(panic) => Err(Error::storage(format!(
+            "the statement panicked: {}",
+            panic_message(&panic)
+        ))),
+    }
+}
+
+fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = panic.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = panic.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown".to_string()
     }
 }

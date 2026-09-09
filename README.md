@@ -141,12 +141,18 @@ else in that transaction. Inside a projection you already have this — `apply`
 is handed the same kind of transaction.
 
 What the hatch refuses, through SQLite's authorizer rather than by reading
-your SQL: writing `events`, `checkpoints`, `retention` or `sqlite_sequence`;
-attaching another database; setting a pragma. Reading any of them is allowed
-and often the point. Each refusal is an invariant something else already
-promised — appends get stamped and ordered by the store, removals leave a
-ledger, `user_version` belongs to the migration ladder, `journal_mode` to the
-concurrency story.
+your SQL: writing `events`, `stream_seq`, `checkpoints`, `retention` or
+`sqlite_sequence`; creating anything that *shares* one of those names in any
+schema, `TEMP` included, since a temp table shadows the real one for every
+unqualified statement on the connection; attaching another database; setting a
+pragma. Reading any of them is allowed and often the point, and so is adding
+your own index to `events` — that changes no data, and it is the only way to
+make a read cheap when the shipped indices do not cover what you filter on.
+
+Each refusal is an invariant something else already promised — appends get
+stamped and ordered by the store, removals leave a ledger, `stream_seq` keeps
+`seq` from rewinding after a removal, `user_version` belongs to the migration
+ladder, `journal_mode` to the concurrency story.
 
 ## Schema evolution
 
