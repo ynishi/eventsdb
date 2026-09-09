@@ -36,6 +36,7 @@ mod row;
 mod schema;
 mod shared;
 mod store;
+mod transfer;
 mod txn;
 
 pub use hatch::RESERVED_TABLES;

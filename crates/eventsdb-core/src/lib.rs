@@ -41,6 +41,7 @@ pub mod log;
 pub mod mem;
 pub mod position;
 pub mod store;
+pub mod transfer;
 pub mod upcast;
 
 pub use error::{Error, Result};
@@ -49,4 +50,5 @@ pub use log::{EventLog, Filter};
 pub use mem::MemEventStore;
 pub use position::{Committed, Position, Recorded};
 pub use store::{Decision, EventStore};
+pub use transfer::{ExportedEvent, ImportReport};
 pub use upcast::{Current, UpcastChain, Upcaster};

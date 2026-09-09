@@ -161,6 +161,80 @@ pub fn stamp(mut event: Map<String, Value>, seq: u64, epoch_ms: u64) -> Result<M
     Ok(event)
 }
 
+/// Check an event that already carries the store-written fields.
+///
+/// [`validate`] refuses them, because a caller writing a new event must not
+/// choose its own coordinates. An event coming back from another store is the
+/// other case: it *has* them, and the point of moving it is that what it
+/// carries survives.
+pub fn validate_stored(event: &Map<String, Value>) -> Result<()> {
+    for (key, value) in event {
+        let known = CALLER_FIELDS.contains(&key.as_str())
+            || matches!(
+                key.as_str(),
+                FIELD_SEQ | FIELD_EPOCH_MS | FIELD_SCHEMA_VERSION
+            );
+        if !known {
+            return Err(Error::validation(format!(
+                "unknown top-level key `{key}` in a stored event"
+            )));
+        }
+        match key.as_str() {
+            FIELD_META => validate_meta(value)?,
+            FIELD_DATA if !value.is_object() => {
+                return Err(Error::validation(format!(
+                    "`{FIELD_DATA}` must be an object, found {}",
+                    type_name(value)
+                )))
+            }
+            FIELD_EPOCH_MS | FIELD_SCHEMA_VERSION | FIELD_SEQ if !value.is_u64() => {
+                return Err(Error::validation(format!(
+                    "`{key}` must be a non-negative integer, found {}",
+                    type_name(value)
+                )))
+            }
+            _ => {}
+        }
+    }
+
+    match event.get(FIELD_KIND) {
+        Some(Value::String(kind)) if !kind.is_empty() => {}
+        _ => return Err(Error::validation(format!("`{FIELD_KIND}` is required"))),
+    }
+    for required in [FIELD_EPOCH_MS, FIELD_SCHEMA_VERSION] {
+        if !event.get(required).map(Value::is_u64).unwrap_or(false) {
+            return Err(Error::validation(format!(
+                "a stored event must carry `{required}`"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Take an event that already has its own time and schema version, and give it
+/// a sequence number in its new home.
+///
+/// The counterpart of [`stamp`] for a transfer. `seq` is reassigned because it
+/// is an allocation the receiving store owns; `epoch_ms` and
+/// `_schema_version` are kept exactly, because they are what the event *is*.
+///
+/// Keeping `_schema_version` is not a nicety. Re-stamping an old event as
+/// current would take it out of reach of the upcaster written for it, and it
+/// would then be read as though it had a shape it never had — the one failure
+/// an append-only store exists to prevent, arriving through the door marked
+/// "migration".
+pub fn restamp(mut stored: Map<String, Value>, seq: u64) -> Result<Map<String, Value>> {
+    validate_stored(&stored)?;
+    stored
+        .entry(FIELD_META.to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    stored
+        .entry(FIELD_DATA.to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    stored.insert(FIELD_SEQ.to_string(), Value::from(seq));
+    Ok(stored)
+}
+
 /// Wall clock in milliseconds. Saturates rather than panicking on a clock set
 /// before the epoch: a wrong timestamp is recoverable, a panic inside a write
 /// is not.

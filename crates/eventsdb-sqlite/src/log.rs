@@ -291,6 +291,38 @@ pub(crate) fn select_recorded(
     filter: &Filter,
     limit: usize,
 ) -> Result<Vec<Recorded>> {
+    let stored = select_stored(conn, from, filter, limit)?;
+
+    // Upcast in one pass, then re-attach the coordinates the chain does not
+    // see: the chain's business is the event, not where it sits.
+    let coordinates: Vec<(u64, String)> = stored
+        .iter()
+        .map(|s| (s.position, s.stream.clone()))
+        .collect();
+    let events: Vec<Value> = stored.into_iter().map(|s| s.event).collect();
+    let upcasted = apply_chain(chain, events);
+
+    let mut out = Vec::with_capacity(upcasted.len());
+    for ((position, stream), event) in coordinates.into_iter().zip(upcasted) {
+        out.push(Recorded {
+            position: Position::new(position),
+            stream,
+            event: Current::from_upcasted(event)?,
+        });
+    }
+    Ok(out)
+}
+
+/// The same read, stopping before the upcaster chain.
+///
+/// What an export wants: the bytes as stored, so the receiving store holds
+/// what this one held and runs its own chain over them.
+pub(crate) fn select_stored(
+    conn: &Connection,
+    from: Position,
+    filter: &Filter,
+    limit: usize,
+) -> Result<Vec<row::StoredRow>> {
     if filter.selects_nothing() || limit == 0 {
         return Ok(Vec::new());
     }
@@ -328,25 +360,7 @@ pub(crate) fn select_recorded(
     for item in rows {
         stored.push(item.map_err(classify)?);
     }
-
-    // Upcast in one pass, then re-attach the coordinates the chain does not
-    // see: the chain's business is the event, not where it sits.
-    let coordinates: Vec<(u64, String)> = stored
-        .iter()
-        .map(|s| (s.position, s.stream.clone()))
-        .collect();
-    let events: Vec<Value> = stored.into_iter().map(|s| s.event).collect();
-    let upcasted = apply_chain(chain, events);
-
-    let mut out = Vec::with_capacity(upcasted.len());
-    for ((position, stream), event) in coordinates.into_iter().zip(upcasted) {
-        out.push(Recorded {
-            position: Position::new(position),
-            stream,
-            event: Current::from_upcasted(event)?,
-        });
-    }
-    Ok(out)
+    Ok(stored)
 }
 
 /// The newest position in the log, against an open connection.

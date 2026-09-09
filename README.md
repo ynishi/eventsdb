@@ -113,6 +113,37 @@ If `apply` fails part-way through a batch, neither the read model nor the
 cursor moves — so the retry neither double-counts nor skips. Writing the read
 model anywhere other than that transaction gives the guarantee up.
 
+## Moving a log
+
+A log that cannot be moved is a log its owner cannot leave, and any system
+that already has one has to be able to bring it. Export and import are part of
+the store, not an afterthought:
+
+    // Page it out. Feed the last position back in for the next batch.
+    let batch = log.export(Position::BEGINNING, &Filter::all(), 1000).await?;
+
+    // And back in, in one transaction.
+    let report = target.import(batch).await?;
+    assert!(report.reproduced_coordinates);
+
+Each record is one JSON object (`ExportedEvent::to_json` / `from_json`), so a
+file of them is JSON Lines and needs no format of its own.
+
+**What travels**: `kind`, `meta`, `data`, `epoch_ms` and `_schema_version` —
+the whole stored object. **What is reassigned**: `seq` and `position`, because
+those are allocations of the receiving store.
+
+Keeping `_schema_version` is the half that matters. An old event re-stamped as
+current falls out of reach of the upcaster written for it, and is then read as
+a shape it never had — a migration that looks like it worked and did not. The
+export is also **not upcasted**, for the same reason: it gives you the bytes,
+so the receiving store holds what this one held and runs its own chain.
+
+`reproduced_coordinates` is the check that the copy is the *same log* rather
+than merely the same events. It is true for an in-order import into an empty
+store, which is what a migration is, and false when merging into a store that
+already has history — stated rather than left to assume.
+
 ## The escape hatch
 
 Without one, anyone needing a query the API does not have opens the database
@@ -213,9 +244,9 @@ one — a subscription reads `position > cursor` and does not see what is gone.
   different upcaster chains will read the same bytes differently with nothing
   to detect it.
 - **No clustering, replication or network protocol**, by design — see above.
-- **Retention deletes; it does not archive.** Moving events to cold storage
-  before removing them is a policy that belongs above this, built on
-  `read_all` plus `retain`.
+- **Retention deletes; it does not archive.** Taking an `export` before a
+  `retain` is what preserves the history — the pieces are here, the policy
+  that decides when to do it is not.
 - **`reclaim` needs a database created by this version.** It relies on
   `auto_vacuum = INCREMENTAL`, which SQLite only accepts before the first
   table exists. On an older file it does nothing.

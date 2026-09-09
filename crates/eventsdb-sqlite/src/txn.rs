@@ -43,8 +43,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use eventsdb_core::error::Result;
-use eventsdb_core::event::{now_ms, stamp, validate};
+use eventsdb_core::event::{now_ms, restamp, stamp, validate};
 use eventsdb_core::position::{Committed, Position};
+use eventsdb_core::transfer::ExportedEvent;
 use eventsdb_core::upcast::{apply_chain, Current, UpcastChain};
 use rusqlite::Transaction;
 use serde_json::{Map, Value};
@@ -242,6 +243,34 @@ impl<'t> TxnContext<'t> {
             .borrow_mut()
             .extend(out.iter().filter_map(|c| c.position));
         Ok(out)
+    }
+
+    /// Take an event from another log, keeping everything it carries except
+    /// its coordinates.
+    ///
+    /// `epoch_ms` **and `_schema_version`** survive; `seq` and `position` are
+    /// reassigned by this store. The schema version is the important half:
+    /// re-stamping an old event as current would put it out of reach of the
+    /// upcaster written for it, and the imported log would then read as
+    /// something it never was.
+    ///
+    /// Returns where it landed, so a caller importing into an empty store can
+    /// check that against the position the event carried.
+    pub fn import(&self, exported: &ExportedEvent) -> Result<Committed> {
+        let seq = next_seq(self.tx, &exported.stream)?;
+        let restamped = restamp(exported.event.clone(), seq)?;
+
+        let committed = {
+            let _trusted = Trusted::raise(&self.trusted);
+            let committed = insert_stamped(self.tx, &exported.stream, &restamped)?;
+            set_next_seq(self.tx, &exported.stream, seq + 1)?;
+            committed
+        };
+
+        if let Some(position) = committed.position {
+            self.published.borrow_mut().push(position);
+        }
+        Ok(committed)
     }
 
     /// Read a stream as it stands *inside this transaction* — including what
