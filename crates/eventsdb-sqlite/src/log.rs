@@ -273,6 +273,27 @@ pub(crate) fn select_recorded(
     Ok(out)
 }
 
+/// The newest position in the log, against an open connection.
+pub(crate) fn head_position_in(conn: &Connection) -> Result<Position> {
+    conn.query_row("SELECT COALESCE(MAX(position), 0) FROM events", [], |row| {
+        row.get::<_, i64>(0)
+    })
+    .map(|head| Position::new(head as u64))
+    .map_err(classify)
+}
+
+/// The newest position, for a caller that holds only the shared handle.
+async fn head_shared(shared: &Arc<Shared>) -> Result<Position> {
+    match shared
+        .isle
+        .call(|conn: &mut Connection| Ok(head_position_in(conn)))
+        .await
+    {
+        Ok(inner) => inner,
+        Err(isle) => Err(map_isle(isle)),
+    }
+}
+
 /// Read a consumer's cursor against an open connection.
 pub(crate) fn load_checkpoint(conn: &Connection, consumer: &str) -> Result<Position> {
     conn.query_row(
@@ -355,6 +376,16 @@ impl EventLog for SqliteEventLog {
 
         let stream = async_stream::stream! {
             loop {
+                // Before the batch, so advancing to it below cannot skip an
+                // event that landed in between.
+                let head = match head_shared(&shared).await {
+                    Ok(head) => head,
+                    Err(error) => {
+                        yield Err(error);
+                        return;
+                    }
+                };
+
                 let batch = read_all_shared(&shared, cursor, &filter, SUBSCRIBE_BATCH).await;
                 let batch = match batch {
                     Ok(batch) => batch,
@@ -374,6 +405,12 @@ impl EventLog for SqliteEventLog {
                     // Still behind. Read again rather than wait.
                     continue;
                 }
+
+                // The filtered range is exhausted, so everything up to `head`
+                // has been looked at. Without this a narrow filter would leave
+                // the cursor at the last match and re-scan the same prefix on
+                // every poll, for ever.
+                cursor = cursor.max(head);
 
                 // Caught up. Wake on an in-process commit, or look again
                 // after the interval — which is what covers a writer in

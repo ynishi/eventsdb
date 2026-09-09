@@ -31,7 +31,7 @@ use eventsdb_core::log::Filter;
 use eventsdb_core::position::{Position, Recorded};
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 
-use crate::log::{load_checkpoint, save_checkpoint, select_recorded};
+use crate::log::{head_position_in, load_checkpoint, save_checkpoint, select_recorded};
 use crate::retention::require_complete_from;
 use crate::shared::{classify, map_isle, Shared};
 
@@ -147,20 +147,39 @@ impl<P: Projection> ProjectionRunner<P> {
             if !projection.tolerates_truncation() {
                 require_complete_from(tx, cursor)?;
             }
+
+            // Read before the batch, so "the batch was short, therefore
+            // everything up to here was scanned" stays true whatever else the
+            // database does.
+            let head = head_position_in(tx)?;
             let events = select_recorded(tx, chain, cursor, &filter, batch)?;
-            if events.is_empty() {
-                return Ok(0);
-            }
+            let full = events.len() == batch;
+            let applied = events.len();
 
             let mut last = cursor;
             for event in &events {
                 projection.apply(tx, event)?;
                 last = event.position;
             }
-            // Same transaction as the applies above. This is the exactly-once
-            // claim, and it is one line.
-            save_checkpoint(tx, &name, last)?;
-            Ok(events.len())
+
+            // How far the projection has *seen*, which is not how far it has
+            // applied. A projection that names its kinds declines everything
+            // else, and a cursor that only moved on matches would park at the
+            // last match for ever: it would report itself behind when it is
+            // not, block retention through `Guard::RegisteredConsumers`, and
+            // re-scan the same prefix on every poll.
+            //
+            // A short batch means the filtered range is exhausted, so
+            // everything up to `head` has been offered and declined. A full
+            // one says nothing about what lies beyond it, so the cursor stops
+            // at the last applied event.
+            let seen_through = if full { last } else { last.max(head) };
+            if seen_through > cursor {
+                // Same transaction as the applies above. This is the
+                // exactly-once claim, and it is one line.
+                save_checkpoint(tx, &name, seen_through)?;
+            }
+            Ok(applied)
         })
         .await
     }

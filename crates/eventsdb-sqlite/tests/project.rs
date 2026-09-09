@@ -6,7 +6,7 @@
 
 use eventsdb_core::error::{Error, Result};
 use eventsdb_core::position::Recorded;
-use eventsdb_core::{EventStore, Position};
+use eventsdb_core::{EventLog, EventStore, Position};
 use eventsdb_sqlite::{Projection, SqliteEventLog, Transaction};
 use serde_json::{json, Map, Value};
 
@@ -178,9 +178,60 @@ async fn a_projection_only_sees_the_kinds_it_names() {
     assert_eq!(runner.catch_up().await.unwrap(), 1, "only the scored event");
     assert_eq!(totals_of(&log, "player-1").await, Some(4));
 
-    // The cursor sits on the event that was applied, not on the log's head:
-    // the two `noise` events are simply never offered.
+    // The cursor tracks what the projection has *seen*, not what it applied.
+    // The two `noise` events were offered and declined, so it is caught up at
+    // the log's head rather than parked on the last match — otherwise it would
+    // report itself behind for ever and block retention.
+    assert_eq!(runner.position().await.unwrap(), Position::new(3));
+}
+
+/// A projection that has declined everything since its last match is caught
+/// up, and must not hold retention hostage.
+#[tokio::test]
+async fn a_caught_up_filtered_projection_does_not_block_retention() {
+    let log = SqliteEventLog::open_in_memory().await.unwrap();
+    let mut s = log.stream_handle("s");
+    s.append(scored(1)).await.unwrap();
+    for _ in 0..20 {
+        s.append(noise()).await.unwrap();
+    }
+
+    let mut runner = log.runner(Totals::new());
+    runner.init().await.unwrap();
+    assert_eq!(runner.catch_up().await.unwrap(), 1, "one scored event");
+    assert_eq!(
+        runner.position().await.unwrap(),
+        log.head_position().await.unwrap(),
+        "caught up means caught up with the log, not with its own matches"
+    );
+
+    log.retain(
+        eventsdb_sqlite::Plan::Before(Position::new(10)),
+        eventsdb_sqlite::Guard::RegisteredConsumers,
+    )
+    .await
+    .expect("the default guard lets retention through");
+}
+
+/// The cursor only runs ahead when the batch is exhausted. A full batch says
+/// nothing about what lies beyond it, so it must stop at the last event it
+/// actually applied.
+#[tokio::test]
+async fn a_full_batch_leaves_the_cursor_on_the_last_applied_event() {
+    let log = SqliteEventLog::open_in_memory().await.unwrap();
+    let mut s = log.stream_handle("s");
+    for _ in 0..5 {
+        s.append(scored(1)).await.unwrap();
+    }
+
+    let mut runner = log.runner(Totals::new()).with_batch(2);
+    runner.init().await.unwrap();
+    assert_eq!(runner.run_once().await.unwrap(), 2);
     assert_eq!(runner.position().await.unwrap(), Position::new(2));
+
+    assert_eq!(runner.catch_up().await.unwrap(), 3);
+    assert_eq!(runner.position().await.unwrap(), Position::new(5));
+    assert_eq!(totals_of(&log, "s").await, Some(5));
 }
 
 #[tokio::test]
