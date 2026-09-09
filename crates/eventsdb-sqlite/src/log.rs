@@ -19,6 +19,7 @@ use rusqlite_isle::{AsyncIsle, AsyncIsleDriver};
 use serde_json::Value;
 use tokio::sync::watch;
 
+use crate::project::{Projection, ProjectionRunner};
 use crate::row;
 use crate::schema;
 use crate::shared::{classify, map_isle, Shared};
@@ -188,66 +189,118 @@ async fn read_all_shared(
     let from = from.get();
 
     let job = move |conn: &mut Connection| {
-        Ok((|| {
-            let mut sql = format!("SELECT {} FROM events WHERE position > ?1", row::COLUMNS);
-            let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(from as i64)];
-
-            if let Some(stream) = &filter.stream {
-                params.push(Box::new(stream.clone()));
-                sql.push_str(&format!(" AND stream = ?{}", params.len()));
-            }
-            if let Some(kinds) = &filter.kinds {
-                let first = params.len() + 1;
-                let holes: Vec<String> = (0..kinds.len())
-                    .map(|i| format!("?{}", first + i))
-                    .collect();
-                sql.push_str(&format!(" AND kind IN ({})", holes.join(", ")));
-                for kind in kinds {
-                    params.push(Box::new(kind.clone()));
-                }
-            }
-            params.push(Box::new(clamp_limit(limit)));
-            sql.push_str(&format!(" ORDER BY position LIMIT ?{}", params.len()));
-
-            let mut stmt = conn.prepare(&sql).map_err(classify)?;
-            let rows = stmt
-                .query_map(
-                    rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())),
-                    row::read,
-                )
-                .map_err(classify)?;
-
-            let mut stored = Vec::new();
-            for item in rows {
-                stored.push(item.map_err(classify)?);
-            }
-
-            // Upcast in one pass, then re-attach the coordinates the chain
-            // does not see: the chain's business is the event, not where it
-            // sits.
-            let positions: Vec<(u64, String)> = stored
-                .iter()
-                .map(|s| (s.position, s.stream.clone()))
-                .collect();
-            let events: Vec<Value> = stored.into_iter().map(|s| s.event).collect();
-            let upcasted = apply_chain(&chain, events);
-
-            let mut out = Vec::with_capacity(upcasted.len());
-            for ((position, stream), event) in positions.into_iter().zip(upcasted) {
-                out.push(Recorded {
-                    position: Position::new(position),
-                    stream,
-                    event: Current::from_upcasted(event)?,
-                });
-            }
-            Ok(out)
-        })())
+        Ok(select_recorded(
+            conn,
+            &chain,
+            Position::new(from),
+            &filter,
+            limit,
+        ))
     };
 
     match shared.isle.call(job).await {
         Ok(inner) => inner,
         Err(isle) => Err(map_isle(isle)),
     }
+}
+
+/// The cross-stream read against an open connection.
+///
+/// Takes `&Connection` rather than owning the call, so it serves both the
+/// standalone read above and a projection runner that needs the read to be
+/// inside the *same* transaction as the work it feeds.
+pub(crate) fn select_recorded(
+    conn: &Connection,
+    chain: &UpcastChain,
+    from: Position,
+    filter: &Filter,
+    limit: usize,
+) -> Result<Vec<Recorded>> {
+    if filter.selects_nothing() || limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut sql = format!("SELECT {} FROM events WHERE position > ?1", row::COLUMNS);
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(from.get() as i64)];
+
+    if let Some(stream) = &filter.stream {
+        params.push(Box::new(stream.clone()));
+        sql.push_str(&format!(" AND stream = ?{}", params.len()));
+    }
+    if let Some(kinds) = &filter.kinds {
+        let first = params.len() + 1;
+        let holes: Vec<String> = (0..kinds.len())
+            .map(|i| format!("?{}", first + i))
+            .collect();
+        sql.push_str(&format!(" AND kind IN ({})", holes.join(", ")));
+        for kind in kinds {
+            params.push(Box::new(kind.clone()));
+        }
+    }
+    params.push(Box::new(clamp_limit(limit)));
+    sql.push_str(&format!(" ORDER BY position LIMIT ?{}", params.len()));
+
+    let mut stmt = conn.prepare(&sql).map_err(classify)?;
+    let rows = stmt
+        .query_map(
+            rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())),
+            row::read,
+        )
+        .map_err(classify)?;
+
+    let mut stored = Vec::new();
+    for item in rows {
+        stored.push(item.map_err(classify)?);
+    }
+
+    // Upcast in one pass, then re-attach the coordinates the chain does not
+    // see: the chain's business is the event, not where it sits.
+    let coordinates: Vec<(u64, String)> = stored
+        .iter()
+        .map(|s| (s.position, s.stream.clone()))
+        .collect();
+    let events: Vec<Value> = stored.into_iter().map(|s| s.event).collect();
+    let upcasted = apply_chain(chain, events);
+
+    let mut out = Vec::with_capacity(upcasted.len());
+    for ((position, stream), event) in coordinates.into_iter().zip(upcasted) {
+        out.push(Recorded {
+            position: Position::new(position),
+            stream,
+            event: Current::from_upcasted(event)?,
+        });
+    }
+    Ok(out)
+}
+
+/// Read a consumer's cursor against an open connection.
+pub(crate) fn load_checkpoint(conn: &Connection, consumer: &str) -> Result<Position> {
+    conn.query_row(
+        "SELECT position FROM checkpoints WHERE consumer = ?1",
+        [consumer],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|position| Position::new(position as u64))
+    .or_else(|error| match error {
+        rusqlite::Error::QueryReturnedNoRows => Ok(Position::BEGINNING),
+        other => Err(classify(other)),
+    })
+}
+
+/// Write a consumer's cursor against an open connection.
+///
+/// When that connection is a transaction the projection is also writing
+/// through, the cursor and the work it accounts for move together — which is
+/// the whole of the exactly-once claim.
+pub(crate) fn save_checkpoint(conn: &Connection, consumer: &str, at: Position) -> Result<()> {
+    conn.execute(
+        "INSERT INTO checkpoints (consumer, position, updated_ms) VALUES (?1, ?2, ?3) \
+         ON CONFLICT(consumer) DO UPDATE SET \
+           position = excluded.position, updated_ms = excluded.updated_ms",
+        rusqlite::params![consumer, at.get() as i64, now_ms() as i64],
+    )
+    .map(|_| ())
+    .map_err(classify)
 }
 
 #[async_trait]
@@ -337,19 +390,7 @@ impl EventLog for SqliteEventLog {
         match self
             .shared
             .isle
-            .call(move |conn: &mut Connection| {
-                Ok(conn
-                    .query_row(
-                        "SELECT position FROM checkpoints WHERE consumer = ?1",
-                        [consumer],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .map(|position| Position::new(position as u64))
-                    .or_else(|error| match error {
-                        rusqlite::Error::QueryReturnedNoRows => Ok(Position::BEGINNING),
-                        other => Err(classify(other)),
-                    }))
-            })
+            .call(move |conn: &mut Connection| Ok(load_checkpoint(conn, &consumer)))
             .await
         {
             Ok(inner) => inner,
@@ -359,23 +400,10 @@ impl EventLog for SqliteEventLog {
 
     async fn checkpoint_save(&self, consumer: &str, at: Position) -> Result<()> {
         let consumer = consumer.to_string();
-        let at = at.get() as i64;
-        let updated = now_ms() as i64;
         match self
             .shared
             .isle
-            .call(move |conn: &mut Connection| {
-                Ok(conn
-                    .execute(
-                        "INSERT INTO checkpoints (consumer, position, updated_ms) \
-                         VALUES (?1, ?2, ?3) \
-                         ON CONFLICT(consumer) DO UPDATE SET \
-                           position = excluded.position, updated_ms = excluded.updated_ms",
-                        rusqlite::params![consumer, at, updated],
-                    )
-                    .map(|_| ())
-                    .map_err(classify))
-            })
+            .call(move |conn: &mut Connection| Ok(save_checkpoint(conn, &consumer, at)))
             .await
         {
             Ok(inner) => inner,
@@ -389,5 +417,11 @@ impl SqliteEventLog {
     /// reports from [`EventStore::database`].
     pub fn database(&self) -> &str {
         &self.shared.database
+    }
+
+    /// A runner for `projection`, reading this log and writing its read model
+    /// through the same transactions.
+    pub fn runner<P: Projection>(&self, projection: P) -> ProjectionRunner<P> {
+        ProjectionRunner::new(Arc::clone(&self.shared), projection)
     }
 }

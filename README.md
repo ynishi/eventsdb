@@ -8,15 +8,16 @@ bytes — and drops what needs a cluster.
 
 ## Status
 
-Early. The write path, the global order, cross-stream reads, subscriptions and
-consumer checkpoints are implemented and tested. Projections are next.
+Early. The write path, the global order, cross-stream reads, subscriptions,
+consumer checkpoints and exactly-once projections are implemented and tested.
+Retention is not.
 
 ## Crates
 
 | crate | what it is |
 |-------|-----------|
 | `eventsdb-core` | the envelope contract, schema versioning, the two traits, and an in-memory backend |
-| `eventsdb-sqlite` | the durable backend: one file, one writer thread, WAL |
+| `eventsdb-sqlite` | the durable backend: one file, one writer thread, WAL — plus projections, which need the same connection to be exactly-once |
 
 ## The shape of an event
 
@@ -83,6 +84,31 @@ instant rather than a head you cached:
         let balance = fold_balance(seen);
         (balance >= 4).then(|| spend(4))
     })).await?;
+
+### A projection
+
+A projection's `apply` is handed the transaction the log is being read on, so
+the fold and the cursor move together:
+
+    impl Projection for Totals {
+        fn name(&self) -> &str { "totals" }
+        fn kinds(&self) -> Option<Vec<String>> { Some(vec!["scored".into()]) }
+
+        fn init(&mut self, tx: &Transaction<'_>) -> Result<()> { /* CREATE TABLE */ }
+        fn reset(&mut self, tx: &Transaction<'_>) -> Result<()> { /* DROP TABLE */ }
+
+        fn apply(&mut self, tx: &Transaction<'_>, event: &Recorded) -> Result<()> {
+            // write the read model through `tx`
+        }
+    }
+
+    let mut runner = log.runner(Totals::new());
+    runner.init().await?;
+    runner.catch_up().await?;   // or run_once(), or rebuild()
+
+If `apply` fails part-way through a batch, neither the read model nor the
+cursor moves — so the retry neither double-counts nor skips. Writing the read
+model anywhere other than that transaction gives the guarantee up.
 
 ## Schema evolution
 
