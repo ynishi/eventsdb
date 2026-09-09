@@ -32,6 +32,18 @@ impl Position {
     pub const fn get(self) -> u64 {
         self.0
     }
+
+    /// The value as SQLite stores it, or `None` when it does not fit.
+    ///
+    /// A position is a rowid, so every position the store ever assigns is in
+    /// range. [`Position::new`] is public, though, and a `u64` above
+    /// `i64::MAX` would bind as a negative number: `position > -1` reads the
+    /// whole log rather than nothing, and a checkpoint written from one would
+    /// silently replay everything through the exactly-once path. Callers that
+    /// bind a position use this and refuse rather than wrap.
+    pub fn as_stored(self) -> Option<i64> {
+        i64::try_from(self.0).ok()
+    }
 }
 
 impl std::fmt::Display for Position {

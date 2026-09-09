@@ -334,6 +334,108 @@ async fn a_projection_still_writes_its_own_tables_and_the_cursor_still_moves() {
     assert_eq!(rows[0]["n"], serde_json::json!(3));
 }
 
+/// The ladder used to read `user_version` once, outside the step
+/// transactions. Two connections opening the same fresh file both saw 0, and
+/// the loser ran `CREATE TABLE` against a schema that already had it — failing
+/// with "table events already exists", which reads like corruption and is not
+/// classified `Busy`, so nothing retried it.
+#[tokio::test]
+async fn concurrent_first_opens_of_one_file_do_not_race_the_ladder() {
+    let dir = tempfile::tempdir().unwrap();
+
+    for round in 0..25 {
+        let path = dir.path().join(format!("events-{round}.db"));
+        let (a, b) = tokio::join!(SqliteEventLog::open(&path), SqliteEventLog::open(&path),);
+        let a = a.unwrap_or_else(|e| panic!("round {round}, first open: {e}"));
+        let b = b.unwrap_or_else(|e| panic!("round {round}, second open: {e}"));
+
+        // Both are usable, and both see one schema.
+        let mut s = a.stream_handle("s");
+        s.append(event("a")).await.unwrap();
+        assert_eq!(
+            b.read_all(Position::BEGINNING, &Filter::all(), 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        a.close().await.unwrap();
+        b.close().await.unwrap();
+    }
+}
+
+/// `Position::new` is public, and a `u64` above `i64::MAX` used to bind as a
+/// negative number — so `position > -1` read the whole log instead of nothing.
+#[tokio::test]
+async fn a_position_beyond_sqlites_range_is_refused_rather_than_wrapped() {
+    let log = SqliteEventLog::open_in_memory().await.unwrap();
+    let mut s = log.stream_handle("s");
+    s.append(event("a")).await.unwrap();
+
+    let error = log
+        .read_all(Position::new(u64::MAX), &Filter::all(), 10)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Validation(_)), "got {error}");
+
+    let error = log
+        .checkpoint_save("c", Position::new(u64::MAX))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Validation(_)), "got {error}");
+}
+
+/// `OlderThan(u64::MAX)` bound as -1, matched nothing, and reported success —
+/// telling a caller who asked to remove everything that there was nothing to
+/// remove.
+#[tokio::test]
+async fn an_out_of_range_retention_cutoff_is_refused_rather_than_a_silent_no_op() {
+    let log = SqliteEventLog::open_in_memory().await.unwrap();
+    let mut s = log.stream_handle("s");
+    s.append(event("a")).await.unwrap();
+
+    let error = log
+        .retain(Plan::OlderThan(u64::MAX), Guard::Force)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Validation(_)), "got {error}");
+
+    // The events are still there, which is what the refusal promised.
+    assert_eq!(s.len().await.unwrap(), 1);
+}
+
+/// Two handles are on the same database exactly when `database()` matches, so
+/// the same file reached by two spellings must not read as two databases.
+#[tokio::test]
+async fn the_database_identity_does_not_depend_on_how_the_path_was_spelled() {
+    let dir = tempfile::tempdir().unwrap();
+    let direct = dir.path().join("events.db");
+    let indirect = dir.path().join(".").join("events.db");
+
+    let a = SqliteEventLog::open(&direct).await.unwrap();
+    let b = SqliteEventLog::open(&indirect).await.unwrap();
+    assert_eq!(a.database(), b.database());
+
+    a.close().await.unwrap();
+    b.close().await.unwrap();
+}
+
+/// A filter longer than SQLite's bound-parameter ceiling is a caller mistake,
+/// and used to arrive as a storage error about variable numbers — which reads
+/// like the database broke.
+#[tokio::test]
+async fn an_over_wide_filter_says_so_instead_of_failing_as_storage() {
+    let log = SqliteEventLog::open_in_memory().await.unwrap();
+    let kinds: Vec<String> = (0..40_000).map(|i| format!("k{i}")).collect();
+
+    let error = log
+        .read_all(Position::BEGINNING, &Filter::kinds(kinds), 10)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Unsupported(_)), "got {error}");
+    assert!(error.to_string().contains("batches"), "got {error}");
+}
+
 #[tokio::test]
 async fn the_stream_counter_table_is_reserved_from_the_hatch() {
     let log = SqliteEventLog::open_in_memory().await.unwrap();

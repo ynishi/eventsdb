@@ -39,13 +39,24 @@ pub(crate) struct Shared {
 impl Shared {
     /// Announce a commit to in-process subscribers.
     ///
-    /// `send_replace` rather than `send`: the value must land even when no
-    /// subscriber exists yet, so one that arrives later starts from the right
-    /// place instead of waiting for the next write.
+    /// The compare and the store happen under the channel's own lock. Reading
+    /// with `borrow()` and then calling `send_replace` is two steps, and two
+    /// concurrent appends can interleave so the smaller value lands last,
+    /// walking the published value backwards. Nothing reads it today —
+    /// subscribers wait on `changed()` and re-query — but a value that can go
+    /// backwards is a trap for whoever reads it next.
+    ///
+    /// It sends even with no subscribers attached, so one arriving later
+    /// starts from the right place rather than waiting for the next write.
     pub fn publish(self: &Arc<Self>, position: Position) {
-        if position > *self.notify.borrow() {
-            let _ = self.notify.send_replace(position);
-        }
+        self.notify.send_if_modified(|current| {
+            if position > *current {
+                *current = position;
+                true
+            } else {
+                false
+            }
+        });
     }
 }
 

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use eventsdb_core::error::Result;
+use eventsdb_core::error::{Error, Result};
 use eventsdb_core::event::now_ms;
 use eventsdb_core::log::{EventLog, Filter};
 use eventsdb_core::position::{Position, Recorded};
@@ -75,13 +75,21 @@ impl SqliteEventLog {
 
     pub async fn open_with(path: impl AsRef<Path>, options: OpenOptions) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let database = path.display().to_string();
         let busy_timeout = options.busy_timeout;
 
         let (isle, driver) =
             AsyncIsle::spawn(&path, move |conn| schema::apply_pragmas(conn, busy_timeout))
                 .await
                 .map_err(map_isle)?;
+
+        // Canonicalised *after* the open, because the file may not have
+        // existed before it. `database` is an identity — two handles answer
+        // with the same string exactly when they are on the same database —
+        // and `./a.db` next to `a.db` would otherwise read as two.
+        let database = std::fs::canonicalize(&path)
+            .unwrap_or(path)
+            .display()
+            .to_string();
 
         Self::finish(isle, driver, database, options).await
     }
@@ -221,13 +229,14 @@ pub(crate) fn select_recorded(
     }
 
     let mut sql = format!("SELECT {} FROM events WHERE position > ?1", row::COLUMNS);
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(from.get() as i64)];
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(stored_position(from)?)];
 
     if let Some(stream) = &filter.stream {
         params.push(Box::new(stream.clone()));
         sql.push_str(&format!(" AND stream = ?{}", params.len()));
     }
     if let Some(kinds) = &filter.kinds {
+        check_placeholders(kinds.len(), "kinds")?;
         let first = params.len() + 1;
         let holes: Vec<String> = (0..kinds.len())
             .map(|i| format!("?{}", first + i))
@@ -318,10 +327,42 @@ pub(crate) fn save_checkpoint(conn: &Connection, consumer: &str, at: Position) -
         "INSERT INTO checkpoints (consumer, position, updated_ms) VALUES (?1, ?2, ?3) \
          ON CONFLICT(consumer) DO UPDATE SET \
            position = excluded.position, updated_ms = excluded.updated_ms",
-        rusqlite::params![consumer, at.get() as i64, now_ms() as i64],
+        rusqlite::params![consumer, stored_position(at)?, now_ms() as i64],
     )
     .map(|_| ())
     .map_err(classify)
+}
+
+/// SQLite's ceiling on bound parameters in one statement.
+///
+/// `SQLITE_MAX_VARIABLE_NUMBER`, 32766 since 3.32. A list longer than this is
+/// a caller mistake with a confusing symptom — the failure otherwise arrives
+/// as a storage error about variable numbers, which reads like the database
+/// broke rather than like the filter was too wide.
+const MAX_PLACEHOLDERS: usize = 32_766;
+
+pub(crate) fn check_placeholders(count: usize, what: &str) -> Result<()> {
+    if count > MAX_PLACEHOLDERS {
+        return Err(Error::Unsupported(format!(
+            "{count} {what} in one statement, over SQLite's limit of {MAX_PLACEHOLDERS}; \
+             narrow the filter, or run it in batches"
+        )));
+    }
+    Ok(())
+}
+
+/// A position as SQLite stores it, refusing rather than wrapping.
+///
+/// Every position the store assigns is a rowid and fits. This exists because
+/// [`Position::new`] is public: a value above `i64::MAX` would bind as a
+/// negative number, turning "read after the end" into "read everything".
+pub(crate) fn stored_position(position: Position) -> Result<i64> {
+    position.as_stored().ok_or_else(|| {
+        Error::validation(format!(
+            "position {position} is beyond the range SQLite stores; \
+             a position assigned by this store is always in range"
+        ))
+    })
 }
 
 #[async_trait]

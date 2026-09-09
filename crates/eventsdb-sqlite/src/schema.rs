@@ -130,25 +130,38 @@ const LADDER: &[&str] = &[STEP_1, STEP_2, STEP_3];
 /// refused rather than used: this build does not know what the extra steps
 /// did, and writing under that assumption is how a log gets corrupted.
 pub fn migrate(conn: &mut Connection) -> Result<()> {
-    let current: i64 = conn
-        .pragma_query_value(None, "user_version", |row| row.get(0))
-        .map_err(classify)?;
-
-    if current > TARGET_USER_VERSION {
-        return Err(Error::storage(format!(
-            "database is at user_version {current}, newer than this build's \
-             {TARGET_USER_VERSION}; refusing to write to a schema this build does not know"
-        )));
-    }
-
     for (index, step) in LADDER.iter().enumerate() {
         let from = index as i64;
-        if from < current {
-            continue;
-        }
+
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(classify)?;
+
+        // Read the version *inside* the step's own transaction. Reading it
+        // once up front and then opening a transaction per step leaves a
+        // window: two connections opening the same fresh file both see 0, and
+        // the loser runs `CREATE TABLE` against a schema that already has it,
+        // failing with "table events already exists" — an error that reads
+        // like corruption and is not classified `Busy`, so nothing retries it.
+        // Under `IMMEDIATE` only one of them holds the write lock here, and
+        // the other sees the version the winner committed.
+        let current: i64 = tx
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .map_err(classify)?;
+
+        if current > TARGET_USER_VERSION {
+            return Err(Error::storage(format!(
+                "database is at user_version {current}, newer than this build's \
+                 {TARGET_USER_VERSION}; refusing to write to a schema this build does not know"
+            )));
+        }
+        if current != from {
+            // Already applied, by an earlier run or by another connection that
+            // got here first. Dropping the transaction rolls back a read that
+            // changed nothing.
+            continue;
+        }
+
         tx.execute_batch(step).map_err(classify)?;
         tx.pragma_update(None, "user_version", from + 1)
             .map_err(classify)?;

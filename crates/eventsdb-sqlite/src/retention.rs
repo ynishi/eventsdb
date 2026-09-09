@@ -62,28 +62,39 @@ pub enum Plan {
 
 impl Plan {
     /// The `WHERE` fragment and its parameters.
-    fn predicate(&self) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
+    ///
+    /// Fallible because both numeric plans bind a `u64` into a column SQLite
+    /// stores as `i64`. Wrapping would make `OlderThan(u64::MAX)` — "remove
+    /// everything older than the far future" — match `epoch_ms < -1`, remove
+    /// nothing, and report success. A wrong answer with no error is worse than
+    /// a refusal.
+    fn predicate(&self) -> Result<(String, Vec<Box<dyn rusqlite::ToSql>>)> {
         match self {
-            Plan::Before(position) => (
+            Plan::Before(position) => Ok((
                 "position <= ?1".to_string(),
-                vec![Box::new(position.get() as i64)],
-            ),
-            Plan::OlderThan(epoch_ms) => (
-                "epoch_ms < ?1".to_string(),
-                vec![Box::new(*epoch_ms as i64)],
-            ),
+                vec![Box::new(crate::log::stored_position(*position)?)],
+            )),
+            Plan::OlderThan(epoch_ms) => {
+                let cutoff = i64::try_from(*epoch_ms).map_err(|_| {
+                    Error::validation(format!(
+                        "cutoff {epoch_ms} is beyond the range SQLite stores as a timestamp"
+                    ))
+                })?;
+                Ok(("epoch_ms < ?1".to_string(), vec![Box::new(cutoff)]))
+            }
             Plan::Streams(streams) => {
                 if streams.is_empty() {
                     // Selects nothing, rather than everything — the reading a
                     // caller that passed an empty list meant.
-                    return ("0".to_string(), Vec::new());
+                    return Ok(("0".to_string(), Vec::new()));
                 }
+                crate::log::check_placeholders(streams.len(), "streams")?;
                 let holes: Vec<String> = (1..=streams.len()).map(|i| format!("?{i}")).collect();
                 let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(streams.len());
                 for stream in streams {
                     params.push(Box::new(stream.clone()));
                 }
-                (format!("stream IN ({})", holes.join(", ")), params)
+                Ok((format!("stream IN ({})", holes.join(", ")), params))
             }
         }
     }
@@ -198,7 +209,7 @@ impl SqliteEventLog {
                     .transaction_with_behavior(TransactionBehavior::Immediate)
                     .map_err(classify)?;
 
-                let (predicate, params) = plan.predicate();
+                let (predicate, params) = plan.predicate()?;
 
                 // What would go, decided under the write lock.
                 let (removed, highest, streams): (i64, Option<i64>, i64) = tx
