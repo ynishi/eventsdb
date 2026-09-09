@@ -1,0 +1,244 @@
+//! The event envelope: what a caller may write, and what the store stamps.
+//!
+//! # The stored shape is envelope + meta + data
+//!
+//! An event is a JSON object with three caller-facing keys and three the
+//! store stamps, **and no others**:
+//!
+//! | key                  | written by | what it is                                          |
+//! |----------------------|------------|-----------------------------------------------------|
+//! | [`FIELD_KIND`]       | the caller | required, a string: what happened                    |
+//! | [`FIELD_META`]       | the caller | optional, a **shallow** object: scalars only         |
+//! | [`FIELD_DATA`]       | the caller | optional (default `{}`), an object of any depth      |
+//! | [`FIELD_SEQ`]        | the store  | `u64`, starts at 1, strictly increasing per stream   |
+//! | [`FIELD_EPOCH_MS`]   | the store  | `u64`, wall clock at append time                     |
+//! | [`FIELD_SCHEMA_VERSION`] | the store | the shape the event was written under             |
+//!
+//! A top-level key that is none of those is refused. That refusal is the
+//! point of the split. When an event is one flat object, an envelope key and
+//! a kind's own field sit at the same level, and a reader — a SQL view most
+//! of all — cannot tell which of them it is reading. A change to what one
+//! kind records then breaks a `json_extract` path silently, because nothing
+//! said where the kind's shape ended and the log's began.
+//!
+//! So the three levels are separated by rule:
+//!
+//! - the **envelope** is the stable contract. Its keys are never renamed;
+//!   they are columns of the log's table, and a view built on them is not
+//!   affected by any kind changing shape.
+//! - **`meta`** is shallow *by rule* — its values are scalars — so it can be
+//!   read without knowing the kind. It is the place for a correlation value,
+//!   a label, a flag: anything a reader groups or filters by. A nested value
+//!   is refused, and the refusal says where it goes instead.
+//! - **`data`** is the one place structured JSON lives, and its shape belongs
+//!   to whoever writes the kind. A view that reads a `data` path is updated
+//!   in the same round as the kind whose shape it reads — a rule a reader can
+//!   follow, because the paths that need watching are all under one key.
+//!
+//! # The store does not interpret `kind`
+//!
+//! `kind` is an opaque string here. Which kinds exist, which of them a
+//! particular caller may write, and what their `data` must contain are
+//! questions for the layer above; this crate checks the envelope and stores
+//! the `data` verbatim. A store that knew a vocabulary would be a store that
+//! had to be changed to record something new.
+
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde_json::{Map, Value};
+
+use crate::error::{Error, Result};
+
+/// Caller-written: what happened. Required, and a string.
+pub const FIELD_KIND: &str = "kind";
+/// Caller-written: a shallow object of scalars, for what readers filter by.
+pub const FIELD_META: &str = "meta";
+/// Caller-written: the kind's own content, of any depth.
+pub const FIELD_DATA: &str = "data";
+/// Store-written: per-stream sequence, from 1, strictly increasing.
+pub const FIELD_SEQ: &str = "seq";
+/// Store-written: wall clock at append time, milliseconds since the epoch.
+pub const FIELD_EPOCH_MS: &str = "epoch_ms";
+/// Store-written: the schema version the event was written under.
+pub const FIELD_SCHEMA_VERSION: &str = "_schema_version";
+
+/// The keys a caller may set. Anything else at the top level is refused.
+const CALLER_FIELDS: [&str; 3] = [FIELD_KIND, FIELD_META, FIELD_DATA];
+
+/// The version every new event is stamped with.
+///
+/// Bumped in the same round as any change to the shape of a stored event,
+/// together with an upcaster for the `n -> n+1` step. See [`crate::upcast`].
+pub const CURRENT_SCHEMA_VERSION: u64 = 1;
+
+/// Check that `event` satisfies the envelope contract.
+///
+/// Called before anything is written, so a rejected event leaves no trace and
+/// consumes no sequence number.
+pub fn validate(event: &Map<String, Value>) -> Result<()> {
+    match event.get(FIELD_KIND) {
+        None => return Err(Error::validation(format!("`{FIELD_KIND}` is required"))),
+        Some(Value::String(kind)) if kind.is_empty() => {
+            return Err(Error::validation(format!(
+                "`{FIELD_KIND}` must not be empty"
+            )))
+        }
+        Some(Value::String(_)) => {}
+        Some(other) => {
+            return Err(Error::validation(format!(
+                "`{FIELD_KIND}` must be a string, found {}",
+                type_name(other)
+            )))
+        }
+    }
+
+    for (key, value) in event {
+        if !CALLER_FIELDS.contains(&key.as_str()) {
+            return Err(Error::validation(format!(
+                "unknown top-level key `{key}`; a kind's own fields go under `{FIELD_DATA}`, \
+                 and a value readers filter by goes under `{FIELD_META}`"
+            )));
+        }
+        match key.as_str() {
+            FIELD_META => validate_meta(value)?,
+            FIELD_DATA if !value.is_object() => {
+                return Err(Error::validation(format!(
+                    "`{FIELD_DATA}` must be an object, found {}",
+                    type_name(value)
+                )))
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+/// `meta` is one level deep and holds scalars only.
+///
+/// The rule exists so that a reader can use `meta` without knowing the kind.
+/// A nested value there would be a second `data` that no schema governs.
+fn validate_meta(meta: &Value) -> Result<()> {
+    let Some(object) = meta.as_object() else {
+        return Err(Error::validation(format!(
+            "`{FIELD_META}` must be an object, found {}",
+            type_name(meta)
+        )));
+    };
+    for (key, value) in object {
+        match value {
+            Value::String(_) | Value::Number(_) | Value::Bool(_) => {}
+            other => {
+                return Err(Error::validation(format!(
+                    "`{FIELD_META}.{key}` must be a string, number or boolean, found {}; \
+                     a structured value goes under `{FIELD_DATA}`",
+                    type_name(other)
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate `event`, then fill in the store-written fields.
+///
+/// `data` is defaulted to `{}` and `meta` to `{}` on the way in, so a reader
+/// never has to tell an empty object from a missing one.
+pub fn stamp(mut event: Map<String, Value>, seq: u64, epoch_ms: u64) -> Result<Map<String, Value>> {
+    validate(&event)?;
+    event
+        .entry(FIELD_META.to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    event
+        .entry(FIELD_DATA.to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    event.insert(FIELD_SEQ.to_string(), Value::from(seq));
+    event.insert(FIELD_EPOCH_MS.to_string(), Value::from(epoch_ms));
+    event.insert(
+        FIELD_SCHEMA_VERSION.to_string(),
+        Value::from(CURRENT_SCHEMA_VERSION),
+    );
+    Ok(event)
+}
+
+/// Wall clock in milliseconds. Saturates rather than panicking on a clock set
+/// before the epoch: a wrong timestamp is recoverable, a panic inside a write
+/// is not.
+pub fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// The JSON type name, for a refusal that says what was actually found.
+fn type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn object(value: Value) -> Map<String, Value> {
+        value
+            .as_object()
+            .expect("test literal is an object")
+            .clone()
+    }
+
+    #[test]
+    fn a_kind_alone_is_a_valid_event() {
+        assert!(validate(&object(json!({ "kind": "noted" }))).is_ok());
+    }
+
+    #[test]
+    fn a_missing_kind_is_refused() {
+        let error = validate(&object(json!({ "data": {} }))).unwrap_err();
+        assert!(matches!(error, Error::Validation(_)));
+    }
+
+    #[test]
+    fn an_unknown_top_level_key_is_refused_and_the_message_says_where_it_goes() {
+        let error = validate(&object(json!({ "kind": "noted", "amount": 3 }))).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("amount"), "{message}");
+        assert!(message.contains("data"), "{message}");
+    }
+
+    #[test]
+    fn a_nested_meta_value_is_refused() {
+        let event = json!({ "kind": "noted", "meta": { "nested": { "x": 1 } } });
+        let error = validate(&object(event)).unwrap_err();
+        assert!(error.to_string().contains("meta.nested"), "{error}");
+    }
+
+    #[test]
+    fn scalar_meta_values_pass() {
+        let event = json!({ "kind": "noted", "meta": { "s": "x", "n": 1, "b": true } });
+        assert!(validate(&object(event)).is_ok());
+    }
+
+    #[test]
+    fn stamping_fills_defaults_and_store_written_fields() {
+        let stamped = stamp(object(json!({ "kind": "noted" })), 7, 1_700_000_000_000).unwrap();
+        assert_eq!(stamped[FIELD_SEQ], json!(7));
+        assert_eq!(stamped[FIELD_EPOCH_MS], json!(1_700_000_000_000u64));
+        assert_eq!(stamped[FIELD_SCHEMA_VERSION], json!(CURRENT_SCHEMA_VERSION));
+        assert_eq!(stamped[FIELD_META], json!({}));
+        assert_eq!(stamped[FIELD_DATA], json!({}));
+    }
+
+    #[test]
+    fn a_rejected_event_is_not_stamped() {
+        assert!(stamp(object(json!({ "data": {} })), 1, 0).is_err());
+    }
+}

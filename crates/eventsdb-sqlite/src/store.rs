@@ -1,0 +1,463 @@
+//! The durable per-stream backend.
+//!
+//! Every write takes an `IMMEDIATE` transaction, which is the point: a
+//! `DEFERRED` transaction acquires the write lock on its first write, and an
+//! upgrade at that moment fails immediately instead of waiting out the
+//! `busy_timeout`. Taking the reserved lock at `BEGIN` is what makes the
+//! timeout mean anything.
+//!
+//! Reads and writes share one connection on one thread, so a stream's writes
+//! are serialized by construction rather than by a lock this code holds.
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use eventsdb_core::error::{Error, Result};
+use eventsdb_core::event::{now_ms, stamp, validate};
+use eventsdb_core::position::{Committed, Position};
+use eventsdb_core::store::{Decision, EventStore};
+use eventsdb_core::upcast::{apply_chain, Current, UpcastChain};
+use rusqlite::{Connection, Transaction, TransactionBehavior};
+use serde_json::{Map, Value};
+
+use crate::row;
+use crate::shared::{backoff, classify, map_isle, Shared, MAX_BUSY_RETRIES};
+
+pub struct SqliteEventStore {
+    pub(crate) shared: Arc<Shared>,
+    pub(crate) stream: String,
+}
+
+impl SqliteEventStore {
+    /// Run `job` on the isle, re-submitting it while the lock is contended.
+    ///
+    /// `job` is built afresh for each attempt, because the closure the isle
+    /// takes is `FnOnce` and a retry needs its own.
+    async fn write_retrying<T, MakeJob, Job>(&self, mut make_job: MakeJob) -> Result<T>
+    where
+        T: Send + 'static,
+        Job: FnOnce(&mut Connection) -> rusqlite::Result<Result<T>> + Send + 'static,
+        MakeJob: FnMut() -> Job,
+    {
+        let mut attempt = 0;
+        loop {
+            let outcome = match self.shared.isle.call(make_job()).await {
+                Ok(inner) => inner,
+                Err(isle) => Err(map_isle(isle)),
+            };
+            match outcome {
+                Err(error) if error.is_busy() && attempt < MAX_BUSY_RETRIES => {
+                    attempt += 1;
+                    tokio::time::sleep(backoff(attempt)).await;
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// Read on the isle. Reads are not retried: a contended read under WAL is
+    /// already waited out by `busy_timeout`, and a failure past that is worth
+    /// surfacing rather than papering over.
+    async fn read_job<T, Job>(&self, job: Job) -> Result<T>
+    where
+        T: Send + 'static,
+        Job: FnOnce(&mut Connection) -> rusqlite::Result<Result<T>> + Send + 'static,
+    {
+        match self.shared.isle.call(job).await {
+            Ok(inner) => inner,
+            Err(isle) => Err(map_isle(isle)),
+        }
+    }
+
+    fn upcast_rows(chain: &UpcastChain, rows: Vec<Value>) -> Result<Vec<Current>> {
+        apply_chain(chain, rows)
+            .into_iter()
+            .map(Current::from_upcasted)
+            .collect()
+    }
+}
+
+/// The next sequence number for `stream`, read inside the caller's transaction.
+fn next_seq(tx: &Transaction<'_>, stream: &str) -> Result<u64> {
+    tx.query_row(
+        "SELECT COALESCE(MAX(seq), 0) + 1 FROM events WHERE stream = ?1",
+        [stream],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|seq| seq as u64)
+    .map_err(classify)
+}
+
+/// Insert one already-stamped event, returning where it landed.
+///
+/// The position is the rowid the insert assigned, read back with
+/// `last_insert_rowid` inside the same transaction — so it is allocated and
+/// committed together, which is what keeps the global order gap-free as read.
+fn insert_stamped(
+    tx: &Transaction<'_>,
+    stream: &str,
+    event: &Map<String, Value>,
+) -> Result<Committed> {
+    let (kind, seq, epoch_ms, schema_version) = row::envelope_columns(event)?;
+    let (meta, data) = row::json_columns(event)?;
+
+    tx.execute(
+        "INSERT INTO events (stream, seq, epoch_ms, kind, schema_version, meta, data) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![
+            stream,
+            seq as i64,
+            epoch_ms as i64,
+            kind,
+            schema_version as i64,
+            meta,
+            data
+        ],
+    )
+    .map_err(classify)?;
+
+    Ok(Committed {
+        seq,
+        epoch_ms,
+        position: Some(Position::new(tx.last_insert_rowid() as u64)),
+    })
+}
+
+/// Read a stream's events inside the caller's transaction, still as stored.
+fn select_stream(
+    tx: &Transaction<'_>,
+    stream: &str,
+    kinds: Option<&[String]>,
+    from_seq: u64,
+    limit: usize,
+) -> Result<Vec<Value>> {
+    if kinds.is_some_and(|kinds| kinds.is_empty()) {
+        return Ok(Vec::new());
+    }
+
+    let mut sql = format!(
+        "SELECT {} FROM events WHERE stream = ?1 AND seq >= ?2",
+        row::COLUMNS
+    );
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> =
+        vec![Box::new(stream.to_string()), Box::new(from_seq as i64)];
+
+    if let Some(kinds) = kinds {
+        let first = params.len() + 1;
+        let holes: Vec<String> = (0..kinds.len())
+            .map(|i| format!("?{}", first + i))
+            .collect();
+        sql.push_str(&format!(" AND kind IN ({})", holes.join(", ")));
+        for kind in kinds {
+            params.push(Box::new(kind.clone()));
+        }
+    }
+    sql.push_str(&format!(" ORDER BY seq LIMIT ?{}", params.len() + 1));
+    params.push(Box::new(clamp_limit(limit)));
+
+    let mut stmt = tx.prepare(&sql).map_err(classify)?;
+    let rows = stmt
+        .query_map(
+            rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())),
+            row::read,
+        )
+        .map_err(classify)?;
+
+    let mut out = Vec::new();
+    for stored in rows {
+        out.push(stored.map_err(classify)?.event);
+    }
+    Ok(out)
+}
+
+/// SQLite's `LIMIT` takes a signed 64-bit value; a negative one means "no
+/// limit". `usize::MAX` is the caller's way of saying the same thing, so it
+/// maps to -1 rather than overflowing into one.
+pub(crate) fn clamp_limit(limit: usize) -> i64 {
+    i64::try_from(limit).unwrap_or(-1)
+}
+
+#[async_trait]
+impl EventStore for SqliteEventStore {
+    fn stream_id(&self) -> &str {
+        &self.stream
+    }
+
+    fn database(&self) -> Option<&str> {
+        Some(&self.shared.database)
+    }
+
+    async fn append(&mut self, event: Map<String, Value>) -> Result<Committed> {
+        // Before the database, so a rejected event takes no lock and consumes
+        // no sequence number.
+        validate(&event)?;
+        let stream = self.stream.clone();
+
+        let committed = self
+            .write_retrying(move || {
+                let stream = stream.clone();
+                let event = event.clone();
+                move |conn: &mut Connection| {
+                    Ok((|| {
+                        let tx = conn
+                            .transaction_with_behavior(TransactionBehavior::Immediate)
+                            .map_err(classify)?;
+                        let seq = next_seq(&tx, &stream)?;
+                        let stamped = stamp(event, seq, now_ms())?;
+                        let committed = insert_stamped(&tx, &stream, &stamped)?;
+                        tx.commit().map_err(classify)?;
+                        Ok(committed)
+                    })())
+                }
+            })
+            .await?;
+
+        if let Some(position) = committed.position {
+            self.shared.publish(position);
+        }
+        Ok(committed)
+    }
+
+    /// One `IMMEDIATE` transaction for the whole batch, so a batch that fails
+    /// part-way leaves the stream exactly as it was.
+    async fn append_many(&mut self, events: Vec<Map<String, Value>>) -> Result<Vec<Committed>> {
+        for event in &events {
+            validate(event)?;
+        }
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
+        let stream = self.stream.clone();
+
+        let committed = self
+            .write_retrying(move || {
+                let stream = stream.clone();
+                let events = events.clone();
+                move |conn: &mut Connection| {
+                    Ok((|| {
+                        let tx = conn
+                            .transaction_with_behavior(TransactionBehavior::Immediate)
+                            .map_err(classify)?;
+                        // One clock reading for the batch: these are records
+                        // of one occurrence, and stamping them with times
+                        // that differ by the cost of the loop would suggest
+                        // an ordering that is not there.
+                        let base_seq = next_seq(&tx, &stream)?;
+                        let epoch_ms = now_ms();
+                        let mut out = Vec::with_capacity(events.len());
+                        for (offset, event) in events.into_iter().enumerate() {
+                            let stamped = stamp(event, base_seq + offset as u64, epoch_ms)?;
+                            out.push(insert_stamped(&tx, &stream, &stamped)?);
+                        }
+                        tx.commit().map_err(classify)?;
+                        Ok(out)
+                    })())
+                }
+            })
+            .await?;
+
+        if let Some(last) = committed.last().and_then(|c| c.position) {
+            self.shared.publish(last);
+        }
+        Ok(committed)
+    }
+
+    /// The read, the decision and the insert share one `IMMEDIATE`
+    /// transaction, so the invariant is checked against the stream as it is at
+    /// that instant.
+    ///
+    /// Not retried on contention: the decision is `FnOnce`. Contention
+    /// surfaces as [`Error::Busy`], and the caller decides whether to build a
+    /// fresh decision and call again.
+    async fn append_if(
+        &mut self,
+        kinds: Option<&[&str]>,
+        decide: Decision,
+    ) -> Result<Option<Committed>> {
+        let stream = self.stream.clone();
+        let kinds = kinds.map(|k| k.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let chain = self.shared.chain.clone();
+
+        let job = move |conn: &mut Connection| {
+            Ok((|| {
+                let tx = conn
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(classify)?;
+                let stored = select_stream(&tx, &stream, kinds.as_deref(), 0, usize::MAX)?;
+                let seen = SqliteEventStore::upcast_rows(&chain, stored)?;
+
+                let Some(event) = decide(&seen) else {
+                    // Nothing to record. The transaction is dropped, which
+                    // rolls back a read that changed nothing anyway.
+                    return Ok(None);
+                };
+                validate(&event)?;
+                let seq = next_seq(&tx, &stream)?;
+                let stamped = stamp(event, seq, now_ms())?;
+                let committed = insert_stamped(&tx, &stream, &stamped)?;
+                tx.commit().map_err(classify)?;
+                Ok(Some(committed))
+            })())
+        };
+
+        let committed = self.read_job(job).await?;
+        if let Some(position) = committed.and_then(|c| c.position) {
+            self.shared.publish(position);
+        }
+        Ok(committed)
+    }
+
+    async fn read_kinds(
+        &self,
+        kinds: Option<&[&str]>,
+        from_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<Current>> {
+        let stream = self.stream.clone();
+        let kinds = kinds.map(|k| k.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let chain = self.shared.chain.clone();
+
+        self.read_job(move |conn: &mut Connection| {
+            Ok((|| {
+                let tx = conn.transaction().map_err(classify)?;
+                let stored = select_stream(&tx, &stream, kinds.as_deref(), from_seq, limit)?;
+                SqliteEventStore::upcast_rows(&chain, stored)
+            })())
+        })
+        .await
+    }
+
+    /// `ORDER BY seq DESC LIMIT n`, reversed on the way back — so the tail of
+    /// a long log costs `n` rows rather than the whole stream.
+    async fn read_last(&self, n: usize) -> Result<Vec<Current>> {
+        let stream = self.stream.clone();
+        let chain = self.shared.chain.clone();
+
+        self.read_job(move |conn: &mut Connection| {
+            Ok((|| {
+                let sql = format!(
+                    "SELECT {} FROM events WHERE stream = ?1 ORDER BY seq DESC LIMIT ?2",
+                    row::COLUMNS
+                );
+                let mut stmt = conn.prepare(&sql).map_err(classify)?;
+                let rows = stmt
+                    .query_map(rusqlite::params![stream, clamp_limit(n)], row::read)
+                    .map_err(classify)?;
+                let mut stored = Vec::new();
+                for item in rows {
+                    stored.push(item.map_err(classify)?.event);
+                }
+                stored.reverse();
+                SqliteEventStore::upcast_rows(&chain, stored)
+            })())
+        })
+        .await
+    }
+
+    async fn head(&self) -> Result<Option<u64>> {
+        let stream = self.stream.clone();
+        self.read_job(move |conn: &mut Connection| {
+            Ok(conn
+                .query_row(
+                    "SELECT MAX(seq) FROM events WHERE stream = ?1",
+                    [stream],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .map_err(classify)
+                .map(|max| max.map(|seq| seq as u64)))
+        })
+        .await
+    }
+
+    async fn len(&self) -> Result<usize> {
+        let stream = self.stream.clone();
+        self.read_job(move |conn: &mut Connection| {
+            Ok(conn
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE stream = ?1",
+                    [stream],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(classify)
+                .map(|count| count as usize))
+        })
+        .await
+    }
+
+    /// A caller's own SQL, refused unless it only reads.
+    ///
+    /// The check is SQLite's own `sqlite3_stmt_readonly`, not a scan of the
+    /// text: a denylist of keywords is a guess about a parser, and this is the
+    /// parser's answer.
+    async fn query(&self, sql: &str, params: Vec<Value>) -> Result<Vec<Map<String, Value>>> {
+        let sql = sql.to_string();
+        self.read_job(move |conn: &mut Connection| {
+            Ok((|| {
+                let stmt = conn.prepare(&sql).map_err(classify)?;
+                if !stmt.readonly() {
+                    return Err(Error::Unsupported(
+                        "this statement writes; the log is append-only and is written \
+                         through the store, not through SQL"
+                            .to_string(),
+                    ));
+                }
+                drop(stmt);
+
+                let mut stmt = conn.prepare(&sql).map_err(classify)?;
+                let names: Vec<String> = stmt
+                    .column_names()
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect();
+                let bound: Vec<Box<dyn rusqlite::ToSql>> =
+                    params.into_iter().map(bind_value).collect();
+
+                let rows = stmt
+                    .query_map(
+                        rusqlite::params_from_iter(bound.iter().map(|p| p.as_ref())),
+                        |row| {
+                            let mut out = Map::new();
+                            for (index, name) in names.iter().enumerate() {
+                                out.insert(name.clone(), sql_to_json(row, index)?);
+                            }
+                            Ok(out)
+                        },
+                    )
+                    .map_err(classify)?;
+
+                let mut out = Vec::new();
+                for item in rows {
+                    out.push(item.map_err(classify)?);
+                }
+                Ok(out)
+            })())
+        })
+        .await
+    }
+}
+
+/// Bind a JSON parameter. Arrays and objects go as their text, which is what
+/// `json_extract` and friends expect anyway.
+fn bind_value(value: Value) -> Box<dyn rusqlite::ToSql> {
+    match value {
+        Value::Null => Box::new(Option::<String>::None),
+        Value::Bool(b) => Box::new(b),
+        Value::Number(n) => match n.as_i64() {
+            Some(i) => Box::new(i),
+            None => Box::new(n.as_f64().unwrap_or(0.0)),
+        },
+        Value::String(s) => Box::new(s),
+        other => Box::new(other.to_string()),
+    }
+}
+
+fn sql_to_json(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Value> {
+    use rusqlite::types::ValueRef;
+    Ok(match row.get_ref(index)? {
+        ValueRef::Null => Value::Null,
+        ValueRef::Integer(i) => Value::from(i),
+        ValueRef::Real(f) => Value::from(f),
+        ValueRef::Text(t) => Value::String(String::from_utf8_lossy(t).into_owned()),
+        ValueRef::Blob(_) => Value::String("<blob>".to_string()),
+    })
+}
