@@ -110,6 +110,44 @@ If `apply` fails part-way through a batch, neither the read model nor the
 cursor moves — so the retry neither double-counts nor skips. Writing the read
 model anywhere other than that transaction gives the guarantee up.
 
+## The escape hatch
+
+Without one, anyone needing a query the API does not have opens the database
+file themselves — and a second *writing* connection is what this store cannot
+survive. Position order is guaranteed by there being one writer; a second one
+commits on its own schedule, and a subscriber can pass a position that is
+still uncommitted. Deleting through a second connection is worse: it removes
+events with no retention ledger entry, so nothing downstream learns that a
+fold is now missing its input.
+
+So the hatch is not a convenience. It is what makes "do not open the file
+yourself" a reasonable thing to ask.
+
+    // Read anything, across the log and your own tables.
+    let rows = log.query(
+        "SELECT stream, json_extract(data, '$.n') AS n FROM events WHERE kind = ?1",
+        vec![json!("scored")],
+    ).await?;
+
+    // Or take a real transaction on the log's own connection.
+    log.with_transaction(|tx| {
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS my_view (k TEXT PRIMARY KEY)")?;
+        tx.execute("INSERT INTO my_view (k) VALUES ('x')", [])?;
+        Ok(())
+    }).await?;
+
+Your tables, your SQL, your schema, committed or rolled back with everything
+else in that transaction. Inside a projection you already have this — `apply`
+is handed the same kind of transaction.
+
+What the hatch refuses, through SQLite's authorizer rather than by reading
+your SQL: writing `events`, `checkpoints`, `retention` or `sqlite_sequence`;
+attaching another database; setting a pragma. Reading any of them is allowed
+and often the point. Each refusal is an invariant something else already
+promised — appends get stamped and ordered by the store, removals leave a
+ledger, `user_version` belongs to the migration ladder, `journal_mode` to the
+concurrency story.
+
 ## Schema evolution
 
 Two axes, and they are not the same one:

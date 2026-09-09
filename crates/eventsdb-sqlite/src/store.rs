@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use eventsdb_core::error::{Error, Result};
+use eventsdb_core::error::Result;
 use eventsdb_core::event::{now_ms, stamp, validate};
 use eventsdb_core::position::{Committed, Position};
 use eventsdb_core::store::{Decision, EventStore};
@@ -384,80 +384,15 @@ impl EventStore for SqliteEventStore {
         .await
     }
 
-    /// A caller's own SQL, refused unless it only reads.
+    /// A caller's own read-only SQL.
     ///
-    /// The check is SQLite's own `sqlite3_stmt_readonly`, not a scan of the
-    /// text: a denylist of keywords is a guess about a parser, and this is the
-    /// parser's answer.
+    /// Identical to [`crate::SqliteEventLog::query`] — the statement is not
+    /// scoped to this stream, because SQL over the log is a database-level
+    /// question. Prefer the log's method; this one exists so the trait has an
+    /// answer.
     async fn query(&self, sql: &str, params: Vec<Value>) -> Result<Vec<Map<String, Value>>> {
         let sql = sql.to_string();
-        self.read_job(move |conn: &mut Connection| {
-            Ok((|| {
-                let stmt = conn.prepare(&sql).map_err(classify)?;
-                if !stmt.readonly() {
-                    return Err(Error::Unsupported(
-                        "this statement writes; the log is append-only and is written \
-                         through the store, not through SQL"
-                            .to_string(),
-                    ));
-                }
-                drop(stmt);
-
-                let mut stmt = conn.prepare(&sql).map_err(classify)?;
-                let names: Vec<String> = stmt
-                    .column_names()
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect();
-                let bound: Vec<Box<dyn rusqlite::ToSql>> =
-                    params.into_iter().map(bind_value).collect();
-
-                let rows = stmt
-                    .query_map(
-                        rusqlite::params_from_iter(bound.iter().map(|p| p.as_ref())),
-                        |row| {
-                            let mut out = Map::new();
-                            for (index, name) in names.iter().enumerate() {
-                                out.insert(name.clone(), sql_to_json(row, index)?);
-                            }
-                            Ok(out)
-                        },
-                    )
-                    .map_err(classify)?;
-
-                let mut out = Vec::new();
-                for item in rows {
-                    out.push(item.map_err(classify)?);
-                }
-                Ok(out)
-            })())
-        })
-        .await
+        self.read_job(move |conn: &mut Connection| Ok(crate::hatch::query_rows(conn, &sql, params)))
+            .await
     }
-}
-
-/// Bind a JSON parameter. Arrays and objects go as their text, which is what
-/// `json_extract` and friends expect anyway.
-fn bind_value(value: Value) -> Box<dyn rusqlite::ToSql> {
-    match value {
-        Value::Null => Box::new(Option::<String>::None),
-        Value::Bool(b) => Box::new(b),
-        Value::Number(n) => match n.as_i64() {
-            Some(i) => Box::new(i),
-            None => Box::new(n.as_f64().unwrap_or(0.0)),
-        },
-        Value::String(s) => Box::new(s),
-        other => Box::new(other.to_string()),
-    }
-}
-
-fn sql_to_json(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Value> {
-    use rusqlite::types::ValueRef;
-    Ok(match row.get_ref(index)? {
-        ValueRef::Null => Value::Null,
-        ValueRef::Integer(i) => Value::from(i),
-        ValueRef::Real(f) => Value::from(f),
-        ValueRef::Text(t) => Value::String(String::from_utf8_lossy(t).into_owned()),
-        ValueRef::Blob(_) => Value::String("<blob>".to_string()),
-    })
 }

@@ -22,5 +22,9 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"
 # rusqlite-isle 0.5 tracks rusqlite 0.37. `libsqlite3-sys` declares
 # `links = "sqlite3"`, so the graph holds exactly one major of it: this pin and
 # the isle's track must move together.
-rusqlite = { version = "0.37", features = ["bundled", "serde_json"] }
+# `hooks` is for the authorizer, which is what lets the escape hatch
+# (`SqliteEventLog::with_transaction`) hand out a real connection while still
+# refusing writes to the log's own tables. Without it the hatch would be a
+# documented promise instead of an enforced one.
+rusqlite = { version = "0.37", features = ["bundled", "serde_json", "hooks"] }
 rusqlite-isle = { version = "0.5", features = ["tokio"] }

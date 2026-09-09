@@ -86,8 +86,7 @@ fn noise() -> Map<String, Value> {
 
 /// Read the model back, outside any runner.
 async fn totals_of(log: &SqliteEventLog, stream: &str) -> Option<i64> {
-    let handle = log.stream_handle("irrelevant");
-    let rows = handle
+    let rows = log
         .query(
             "SELECT total FROM totals WHERE stream = ?1",
             vec![json!(stream)],
