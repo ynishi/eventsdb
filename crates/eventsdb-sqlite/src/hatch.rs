@@ -252,8 +252,8 @@ pub(crate) fn query_rows(
 /// Bind a JSON parameter. Arrays and objects go as their text, which is what
 /// `json_extract` and friends expect anyway.
 ///
-/// The one place this loses information is stated with the conversions in the
-/// other direction, on [`SqliteEventLog::query`].
+/// Where this loses information is stated with the conversions in the other
+/// direction, on [`SqliteEventLog::query`].
 pub(crate) fn bind_value(value: Value) -> Box<dyn rusqlite::ToSql> {
     match value {
         Value::Null => Box::new(Option::<String>::None),
@@ -270,9 +270,8 @@ pub(crate) fn bind_value(value: Value) -> Box<dyn rusqlite::ToSql> {
 /// One cell of a result row as JSON.
 ///
 /// [`SqliteEventLog::query`] states what each SQLite type becomes and which of
-/// those conversions lose something; this is the code that performs them. It
-/// is the only route from a column to the JSON a caller reads, so a conversion
-/// stated there and not done here is a defect in one of the two.
+/// those conversions lose something; this is the code that performs them, and
+/// the two have to agree.
 pub(crate) fn sql_to_json(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Value> {
     use rusqlite::types::ValueRef;
     Ok(match row.get_ref(index)? {
