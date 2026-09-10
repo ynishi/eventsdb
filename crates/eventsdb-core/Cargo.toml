@@ -7,6 +7,8 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 description = "Append-only event log: envelope contract, schema versioning, and the store SPI"
+keywords = ["event-sourcing", "event-store", "event-log", "append-only", "cqrs"]
+categories = ["database-implementations", "data-structures", "asynchronous"]
 
 [dependencies]
 async-trait.workspace = true

@@ -8,3 +8,7 @@
 # where drafts, measurements and half-finished reasoning go, and none of that
 # is the crate.
 workspace
+
+# Local agent tooling config. A deploy target for tools that live outside this
+# repo, so what lands here is machine state rather than the crate.
+.claude
