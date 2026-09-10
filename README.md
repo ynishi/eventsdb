@@ -465,13 +465,6 @@ rustdoc of `eventsdb_sqlite::retention` has the two moments as a diagram.
 - **`reclaim` needs a database created by this version.** It relies on
   `auto_vacuum = INCREMENTAL`, which SQLite only accepts before the first
   table exists. On an older file it does nothing.
-- **A tenant is a file.** There is no tenant column and no per-tenant anything
-  inside one log; a second tenant is a second `SqliteEventLog` on a second
-  file, with its own position sequence, checkpoints, ledger and writer. One
-  sequence shared across tenants would leak each one's activity to the
-  others through the gaps they see, and a per-tenant sequence is what a
-  second file already is. The cost is a writer thread and `readers` reader
-  threads per open log; the rustdoc of `eventsdb_sqlite` has the arithmetic.
 
 ## Contributing
 
