@@ -3,6 +3,23 @@
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Export receipts and `Guard::Exported`.** `SqliteEventLog::export_recorded`
+  is `export` plus a row in a new `exports` table saying the page was handed
+  out; `confirm_export(id)` says it landed. `Guard::Exported` chains the
+  confirmed, unfiltered receipts from the beginning of the log and refuses,
+  with the new `Error::NotExported { up_to, exported_through }`, any plan
+  that would remove past the chain's end — and refuses to overrun a consumer,
+  as the default guard does. `exported_through()` reports the chain's end.
+  Where the export goes stays the caller's; what the store no longer allows is
+  for "I exported it first" to be something the caller merely remembers.
+- Schema step 5: the `exports` table. `TARGET_USER_VERSION` is 5, and
+  `exports` joins `RESERVED_TABLES`, so the hatch can read receipts but not
+  write them.
+
 ## [0.3.0] - 2026-09-10
 
 A minor rather than a patch, for two independent reasons. `Filter` gains a
