@@ -2,6 +2,7 @@
 name = "eventsdb-sqlite"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -9,6 +10,18 @@ homepage.workspace = true
 description = "SQLite backend for eventsdb: durable append-only log with global positions"
 keywords = ["event-sourcing", "event-store", "sqlite", "append-only", "cqrs"]
 categories = ["database-implementations", "database", "asynchronous"]
+
+# What ships. The tests and benches are on the list because the README cites
+# them by name as the measurements behind its claims — dropping them would
+# leave a reader on crates.io with references that go nowhere.
+include = [
+    "src/**/*.rs",
+    "tests/**/*.rs",
+    "benches/**/*.rs",
+    "README.md",
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+]
 
 [dependencies]
 eventsdb-core.workspace = true

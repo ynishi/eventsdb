@@ -2,6 +2,7 @@
 name = "eventsdb-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -9,6 +10,10 @@ homepage.workspace = true
 description = "Append-only event log: envelope contract, schema versioning, and the store SPI"
 keywords = ["event-sourcing", "event-store", "event-log", "append-only", "cqrs"]
 categories = ["database-implementations", "data-structures", "asynchronous"]
+
+# What ships. The README and the licences are symlinks to the workspace root,
+# so the crate carries its own copy without a second file to keep in step.
+include = ["src/**/*.rs", "README.md", "LICENSE-MIT", "LICENSE-APACHE"]
 
 [dependencies]
 async-trait.workspace = true

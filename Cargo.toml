@@ -5,6 +5,10 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+# Measured, not inherited. `libsqlite3-sys` declares no MSRV of its own and
+# uses `unsafe extern "C"`, so 1.78 cannot build it; 1.82 is the earliest
+# release this workspace was checked against and passed.
+rust-version = "1.82"
 authors = ["Yutaka Nishimura <ytk.nishimura@gmail.com>"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/ynishi/eventsdb"
