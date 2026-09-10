@@ -20,6 +20,12 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   `exports` joins `RESERVED_TABLES`, so the hatch can read receipts but not
   write them.
 
+### Changed
+
+- The rustdoc of `eventsdb_sqlite` and `Limitations` state that a tenant is
+  a file: no tenant column, a second log on a second file, and what that
+  costs in threads. Nothing in the code changed.
+
 ## [0.3.0] - 2026-09-10
 
 A minor rather than a patch, for two independent reasons. `Filter` gains a
