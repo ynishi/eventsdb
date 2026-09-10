@@ -394,6 +394,17 @@ one — a subscription reads `position > cursor` and does not see what is gone.
   `auto_vacuum = INCREMENTAL`, which SQLite only accepts before the first
   table exists. On an older file it does nothing.
 
+## Contributing
+
+Three files in the repository, absolute-linked because this README ships inside
+the crates and they do not:
+[CONTRIBUTING.md](https://github.com/ynishi/eventsdb/blob/main/CONTRIBUTING.md)
+has the issue, branch, verification and commit conventions,
+[PUBLIC_DEVELOPMENT.md](https://github.com/ynishi/eventsdb/blob/main/PUBLIC_DEVELOPMENT.md)
+the disclosure policy that outranks it, and
+[AGENTS.md](https://github.com/ynishi/eventsdb/blob/main/AGENTS.md) the same
+pointers arranged for a coding agent.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
