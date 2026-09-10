@@ -16,8 +16,12 @@ and tested.
 
 | crate | what it is |
 |-------|-----------|
+| `eventsdb` | one name for both: re-exports `eventsdb-core`, and `eventsdb-sqlite` behind the `sqlite` feature |
 | `eventsdb-core` | the envelope contract, schema versioning, the two traits, and an in-memory backend |
 | `eventsdb-sqlite` | the durable backend: one file, one writer thread, WAL — plus projections, which need the same connection to be exactly-once |
+
+Taking the two directly is the same code; the facade adds nothing but the
+name. Everything below names the crates the items come from.
 
 ## The shape of an event
 

@@ -1,0 +1,30 @@
+[package]
+name = "eventsdb"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "An embedded append-only event store: the contract and its backends under one name"
+keywords = ["event-sourcing", "event-store", "event-log", "append-only", "cqrs"]
+categories = ["database-implementations", "data-structures", "asynchronous"]
+
+# What ships. The README and the licences are symlinks to the workspace root,
+# so the crate carries its own copy without a second file to keep in step.
+include = ["src/**/*.rs", "README.md", "LICENSE-MIT", "LICENSE-APACHE"]
+
+# The backend is a feature rather than a dependency, so taking this crate for
+# the contract alone does not pull in SQLite.
+[features]
+sqlite = ["dep:eventsdb-sqlite"]
+
+[dependencies]
+eventsdb-core.workspace = true
+eventsdb-sqlite = { path = "../eventsdb-sqlite", version = "0.1.1", optional = true }
+
+# `sqlite` is off by default, so without this docs.rs would publish a page with
+# no backend on it.
+[package.metadata.docs.rs]
+all-features = true
