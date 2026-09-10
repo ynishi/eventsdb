@@ -15,6 +15,20 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   hatch section no longer calls a second writing connection unsurvivable, which
   `tests/two_logs.rs` measured and disproved. Nothing in the code changed.
 
+### Fixed
+
+- **The hatch no longer refuses `PRAGMA table_info(events)`.** The authorizer
+  denied any pragma SQLite handed it a value for, while the documentation
+  promised that only *setting* one was refused. SQLite passes a pragma's
+  argument in that slot whether it is an assignment or a name to describe, so
+  every introspection pragma taking a table or index name was refused — and
+  refused with a message saying the caller had tried to set one. The rule is
+  now by name, against the allowlist in `READ_ONLY_PRAGMAS`: `table_info`,
+  `table_xinfo`, `index_list`, `index_info`, `index_xinfo` and
+  `foreign_key_list` may carry an argument, anything else carrying one is
+  still refused, and a pragma carrying none is allowed as before. An
+  allowlist, so a pragma this crate has not considered defaults to refused.
+
 ## [0.4.0] - 2026-09-11
 
 A minor rather than a patch, for three independent reasons. `Guard` gains a
