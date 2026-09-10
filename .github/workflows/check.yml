@@ -68,9 +68,10 @@ jobs:
       # arriving with new lints turns the whole workspace red on a day
       # nobody touched it. Accepted for now: the alternative is a pin that
       # has to be raised by hand, and a workspace that meets three years of
-      # lints at once when somebody finally does. `rust-version = "1.82"` is
-      # the floor this repository promises and is a separate question from
-      # the ceiling it is built against; nothing here checks the floor yet.
+      # lints at once when somebody finally does. The floor this repository
+      # promises — `rust-version` in Cargo.toml — is a separate question
+      # from the ceiling it is built against, and the `msrv` job below is
+      # where the floor is checked.
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -101,3 +102,47 @@ jobs:
         run: |
           cargo doc --workspace --all-features --no-deps
           cargo doc -p eventsdb --no-deps
+
+  # The floor. `rust-version` in Cargo.toml is a claim made to everyone who
+  # depends on these crates, and until this job nothing checked it: the
+  # workspace was built on stable, and a dependency or a language feature
+  # newer than the floor would have gone unnoticed until a downstream build
+  # on the promised toolchain failed. This is `cargo check` on exactly that
+  # toolchain — check rather than test, because the question is whether the
+  # workspace compiles there, and the behaviour is the other job's to answer.
+  #
+  # No `--all-targets`, and that is the definition of the floor rather than
+  # a shortcut: a dependent compiles these libraries, not their tests or
+  # benches, so dev-dependencies are outside the promise. They are also
+  # already past it — `criterion` 0.8 declares 1.86 — which is what the first
+  # run of this job with `--all-targets` reported, and is the kind of thing
+  # the job exists to say out loud.
+  #
+  # The version is read from Cargo.toml rather than written here a second
+  # time. A copy of a number is the copy nobody edits the day the number
+  # moves, and the manifest is the one place the floor is stated.
+  msrv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: read rust-version from Cargo.toml
+        id: floor
+        run: |
+          version=$(sed -nE 's/^rust-version *= *"([0-9.]+)".*/\1/p' Cargo.toml)
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "floor: $version"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.floor.outputs.version }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo check on the floor
+        run: cargo check --workspace --all-features
