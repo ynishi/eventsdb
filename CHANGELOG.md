@@ -3,7 +3,15 @@
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] - 2026-09-10
+
+A minor rather than a patch, for two independent reasons. `Filter` gains a
+public field, so a struct literal that named every field stops compiling —
+add `..Filter::default()`. And the MSRV moves to 1.85.
+
+The Security entry is the one to act on: a database opened by 0.2.0 was
+opened by a SQLite that can corrupt it, and only taking this release changes
+that.
 
 ### Added
 
@@ -12,7 +20,6 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   the cursor fed back in — one borrowed reader per page, nothing held between
   pages — and the same loop as `subscribe`, which waits where `replay`
   returns.
-
 - `Filter::meta(key, value)`: a third read axis. A cross-stream read, a
   subscription and an export narrow on a `meta` key holding a scalar, ANDed
   with `kinds` and `streams`. An event without the key is out of the answer;
@@ -143,6 +150,7 @@ implemented and tested.
   and `retention`, against a file-backed log. Contention questions live in
   `tests/` instead, where a regression is a failure rather than a slower bar.
 
+[0.3.0]: https://github.com/ynishi/eventsdb/releases/tag/v0.3.0
 [0.2.0]: https://github.com/ynishi/eventsdb/releases/tag/v0.2.0
 [0.1.1]: https://github.com/ynishi/eventsdb/releases/tag/v0.1.1
 [0.1.0]: https://github.com/ynishi/eventsdb/releases/tag/v0.1.0
