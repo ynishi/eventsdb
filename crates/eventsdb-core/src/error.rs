@@ -116,6 +116,17 @@ pub enum Error {
         cursor: u64,
         up_to: u64,
     },
+
+    /// Retention would have removed events no confirmed export covers.
+    ///
+    /// `exported_through` is how far the chain of landed, unfiltered exports
+    /// reaches from the beginning; the plan wanted to remove up to `up_to`.
+    /// The gap between them is history that would exist nowhere afterwards.
+    #[error(
+        "retention would remove up to position {up_to}, but confirmed exports \
+         reach only {exported_through}"
+    )]
+    NotExported { up_to: u64, exported_through: u64 },
 }
 
 impl Error {

@@ -89,11 +89,12 @@ use crate::shared::{classify, map_isle};
 use crate::txn::TxnContext;
 
 /// Tables this crate owns. Reading them is fine; writing them is not.
-pub const RESERVED_TABLES: [&str; 5] = [
+pub const RESERVED_TABLES: [&str; 6] = [
     "events",
     "stream_seq",
     "checkpoints",
     "retention",
+    "exports",
     "sqlite_sequence",
 ];
 

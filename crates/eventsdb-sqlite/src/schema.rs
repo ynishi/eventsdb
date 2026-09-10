@@ -21,7 +21,7 @@ use rusqlite::{Connection, TransactionBehavior};
 use crate::shared::classify;
 
 /// The version this build expects. Bumped with every appended step.
-pub const TARGET_USER_VERSION: i64 = 4;
+pub const TARGET_USER_VERSION: i64 = 5;
 
 /// Step 1: the log and the consumer checkpoints.
 ///
@@ -146,6 +146,38 @@ const STEP_4: &str = "
     END;
 ";
 
+/// Step 5: export receipts.
+///
+/// An export is read off a reader and handed to the caller as a `Vec`; where
+/// it goes from there — a file, another log — is the caller's, and so is
+/// whether it got there. What the store can record is that a range was
+/// handed out (`taken_ms`) and that the caller said it landed (`landed_ms`).
+/// Two moments rather than one, because the second cannot be inferred from
+/// the first: a row with `landed_ms` still `NULL` is an export that was
+/// taken and never confirmed, and the retention guard treats it as if it had
+/// not happened.
+///
+/// `whole` records whether the export's filter selected every event in its
+/// range. A filtered export preserves some of the history and cannot vouch
+/// for the rest, so only whole ones count towards what retention may remove.
+///
+/// Append-only, like the retention ledger, and read by [`crate::retention`]
+/// as a chain: the ranges are exclusive on `from_position`, so page *k+1*'s
+/// `from_position` is page *k*'s `through`, and the highest `through`
+/// reachable from the beginning without a gap is how far the history is
+/// known to be preserved.
+const STEP_5: &str = "
+    CREATE TABLE exports (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        taken_ms      INTEGER NOT NULL,
+        from_position INTEGER NOT NULL,
+        through       INTEGER NOT NULL,
+        count         INTEGER NOT NULL,
+        whole         INTEGER NOT NULL,
+        landed_ms     INTEGER
+    );
+";
+
 /// The ladder, in order. Index `i` moves `user_version` from `i` to `i + 1`.
 ///
 /// A database that predates `position` would get its backfill as a step here:
@@ -153,7 +185,7 @@ const STEP_4: &str = "
 /// — wall clock first, because it approximates causal order across streams,
 /// with `seq` breaking ties deterministically within one. No such database
 /// exists yet, so no such step is written.
-const LADDER: &[&str] = &[STEP_1, STEP_2, STEP_3, STEP_4];
+const LADDER: &[&str] = &[STEP_1, STEP_2, STEP_3, STEP_4, STEP_5];
 
 /// Bring `conn` up to [`TARGET_USER_VERSION`], one transaction per step.
 ///
