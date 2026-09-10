@@ -5,10 +5,13 @@ resolver = "2"
 [workspace.package]
 version = "0.2.0"
 edition = "2021"
-# Measured, not inherited. `libsqlite3-sys` declares no MSRV of its own and
-# uses `unsafe extern "C"`, so 1.78 cannot build it; 1.82 is the earliest
-# release this workspace was checked against and passed.
-rust-version = "1.82"
+# Measured, not inherited, and raised here deliberately rather than left for a
+# build to discover. `libsqlite3-sys` still declares no MSRV of its own, but
+# `rusqlite` 0.40 pulls `hashlink` 0.12 and `hashbrown` 0.17, both of which
+# declare 1.85. That is the floor now, and 1.85 is the earliest release this
+# workspace was checked against and passed. It was 1.82 while the graph sat on
+# `rusqlite` 0.37.
+rust-version = "1.85"
 authors = ["Yutaka Nishimura <ytk.nishimura@gmail.com>"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/ynishi/eventsdb"
@@ -23,15 +26,21 @@ serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 
-# rusqlite-isle 0.5 tracks rusqlite 0.37. `libsqlite3-sys` declares
+# rusqlite-isle 0.6 tracks rusqlite 0.40. `libsqlite3-sys` declares
 # `links = "sqlite3"`, so the graph holds exactly one major of it: this pin and
 # the isle's track must move together.
+# The floor is not a preference. rusqlite 0.40 brings `libsqlite3-sys` 0.38,
+# which bundles SQLite 3.53.2; every SQLite from 3.7.0 to 3.51.2 carries the
+# WAL-reset bug, where two connections on one WAL database writing or
+# checkpointing at the same instant can corrupt the file. This crate opens a
+# writer and two readers on one file by default, so that is the standard
+# arrangement rather than an edge case. Fixed in 3.51.3.
 # `hooks` is for the authorizer, which is what lets the escape hatch
 # (`SqliteEventLog::with_transaction`) hand out a real connection while still
 # refusing writes to the log's own tables. Without it the hatch would be a
 # documented promise instead of an enforced one.
-rusqlite = { version = "0.37", features = ["bundled", "serde_json", "hooks"] }
-rusqlite-isle = { version = "0.5", features = ["tokio"] }
+rusqlite = { version = "0.40", features = ["bundled", "serde_json", "hooks"] }
+rusqlite-isle = { version = "0.6", features = ["tokio"] }
 
 criterion = { version = "0.8", features = ["async_tokio"] }
 tempfile = "3"

@@ -23,6 +23,16 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   sequence counter (`eventsdb_core::event`). `Expected` documents why two
   variants are the whole surface and `StreamExists` is not one of them.
   `Limitations` states that a long stream is designed away, not compacted.
+- `rusqlite` 0.37 to 0.40 and `rusqlite-isle` 0.5 to 0.6, which move
+  together: `libsqlite3-sys` declares `links = "sqlite3"`, so a build graph
+  holds exactly one major of it.
+- **The MSRV is 1.85**, up from 1.82. `rusqlite` 0.40 pulls `hashlink` 0.12
+  and `hashbrown` 0.17, both of which declare 1.85.
+- The escape hatch now refuses to run a statement when its authorizer cannot
+  be installed. `Connection::authorizer` returns a `Result` in `rusqlite`
+  0.40; ignoring it would have let an untrusted statement run with no guard
+  in front of it. A failure to *remove* the authorizer is reported too, since
+  it leaves the connection refusing every later write.
 
 ### Fixed
 
@@ -33,6 +43,17 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   with the timeout still at its default of zero and failed instead of
   waiting. The reader connections never had this: they set the timeout on
   the builder, before the connection is opened.
+
+### Security
+
+- **The bundled SQLite is no longer one affected by the WAL-reset corruption
+  bug.** Two connections on one WAL-mode database, in separate threads or
+  processes, writing or checkpointing at the same instant can corrupt the
+  file. `SqliteEventLog` opens a writer and two readers on one file by
+  default, so that is this crate's standard arrangement rather than an edge
+  case. The bug is in every SQLite from 3.7.0 (2010) through 3.51.2 and fixed
+  in 3.51.3; `rusqlite` 0.40 brings `libsqlite3-sys` 0.38, which bundles
+  3.53.2. The previous pin bundled 3.50.2.
 
 ## [0.2.0] - 2026-09-10
 
