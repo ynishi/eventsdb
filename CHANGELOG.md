@@ -3,6 +3,17 @@
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`eventsdb`**, a facade over the two published crates. It re-exports
+  `eventsdb-core` and, behind a `sqlite` feature, `eventsdb-sqlite`. It adds no
+  API of its own: depending on the two directly is the same code. The reason it
+  exists is the name — two crates were published under a stem that was not, and
+  anything published there by anyone else would read as their parent, with no
+  way to correct it afterwards.
+
 ## [0.1.1] - 2026-09-10
 
 Metadata only. The published sources are identical to 0.1.0.

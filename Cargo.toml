@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/eventsdb-core", "crates/eventsdb-sqlite"]
+members = ["crates/eventsdb", "crates/eventsdb-core", "crates/eventsdb-sqlite"]
 resolver = "2"
 
 [workspace.package]
