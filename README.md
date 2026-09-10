@@ -268,12 +268,16 @@ outside there is no way to tell how far it got.
 ## The escape hatch
 
 Without one, anyone needing a query the API does not have opens the database
-file themselves — and a second *writing* connection is what this store cannot
-survive. Position order is guaranteed by there being one writer; a second one
-commits on its own schedule, and a subscriber can pass a position that is
-still uncommitted. Deleting through a second connection is worse: it removes
-events with no retention ledger entry, so nothing downstream learns that a
-fold is now missing its input.
+file themselves — and what they then do to that file is unbounded. The global
+order is not what gives way: two logs on one file were measured, and the order
+holds, because a position is allocated inside the transaction that commits it
+and every write is `IMMEDIATE`, so two connections cannot both be allocating.
+Projections and the retention guard hold too, working as they do through
+shared tables. What degrades is the wake-up — a subscription on the other log
+sees the write on its poll interval rather than at once, at the cost
+`Limitations` measures. Deleting through a second connection is the one
+nothing recovers from: it removes events with no retention ledger entry, so
+nothing downstream learns that a fold is now missing its input.
 
 So the hatch is not a convenience. It is what makes "do not open the file
 yourself" a reasonable thing to ask.
@@ -290,6 +294,10 @@ yourself" a reasonable thing to ask.
         tx.execute("INSERT INTO my_view (k) VALUES ('x')", [])?;
         Ok(())
     }).await?;
+
+`query` answers in JSON, and turning a SQLite cell into JSON is not lossless —
+the rustdoc says which cells lose what, so a value that arrives is not always
+the column's contents.
 
 Your tables, your SQL, your schema, committed or rolled back with everything
 else in that transaction. Inside a projection you already have this — `apply`

@@ -251,6 +251,9 @@ pub(crate) fn query_rows(
 
 /// Bind a JSON parameter. Arrays and objects go as their text, which is what
 /// `json_extract` and friends expect anyway.
+///
+/// The one place this loses information is stated with the conversions in the
+/// other direction, on [`SqliteEventLog::query`].
 pub(crate) fn bind_value(value: Value) -> Box<dyn rusqlite::ToSql> {
     match value {
         Value::Null => Box::new(Option::<String>::None),
@@ -264,6 +267,12 @@ pub(crate) fn bind_value(value: Value) -> Box<dyn rusqlite::ToSql> {
     }
 }
 
+/// One cell of a result row as JSON.
+///
+/// [`SqliteEventLog::query`] states what each SQLite type becomes and which of
+/// those conversions lose something; this is the code that performs them. It
+/// is the only route from a column to the JSON a caller reads, so a conversion
+/// stated there and not done here is a defect in one of the two.
 pub(crate) fn sql_to_json(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Value> {
     use rusqlite::types::ValueRef;
     Ok(match row.get_ref(index)? {
@@ -285,6 +294,27 @@ impl SqliteEventLog {
     /// chain; SQL runs against the bytes as they were written, because the
     /// chain is Rust and the query is SQLite's. A statement reading across a
     /// schema change reads the versions it finds.
+    ///
+    /// **What a cell becomes, and where that loses something.** `NULL` becomes
+    /// `null`, an `INTEGER` a JSON integer, a finite `REAL` a JSON number, and
+    /// `TEXT` a JSON string. The rest do not arrive intact, and nothing in the
+    /// value that does arrive says so:
+    ///
+    /// - a `BLOB` becomes the string `"<blob>"`. The bytes are gone, and the
+    ///   result cannot be told apart from a `TEXT` cell holding those seven
+    ///   characters.
+    /// - a non-finite `REAL` — `±Inf` — becomes `null`, because
+    ///   `serde_json::Value::from(f64)` maps a non-finite number to `Null`, so
+    ///   it cannot be told apart from a real `NULL`. Stored data reaches this
+    ///   and not only an expression: `9e999` is a literal SQLite keeps and
+    ///   reads back as `real`. NaN does not reach it, because SQLite stores
+    ///   NaN as `NULL`.
+    /// - `TEXT` that is not valid UTF-8 goes through `String::from_utf8_lossy`,
+    ///   which substitutes rather than refuses.
+    /// - on the way in, a JSON integer too large for `i64` is bound as an
+    ///   `f64`: SQLite's `INTEGER` is an `i64`, and there is nothing wider to
+    ///   bind it to.
+    ///
     /// The authorizer runs here too, and not only as belt-and-braces:
     /// `sqlite3_stmt_readonly` reports `ATTACH` and `DETACH` as read-only —
     /// they change the connection's configuration rather than any file's
@@ -304,8 +334,9 @@ impl SqliteEventLog {
     /// indefinitely.
     ///
     /// The deadline interrupts the statement through SQLite's own interrupt
-    /// handle and reports [`Error::Busy`], so a caller can decide whether a
-    /// narrower query is worth another go.
+    /// handle and reports [`Error::Timeout`], so a caller can decide whether a
+    /// narrower query is worth another go. Why that is deliberately not
+    /// [`Error::Busy`] is on the variant.
     pub async fn query_timeout(
         &self,
         sql: &str,
