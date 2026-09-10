@@ -309,9 +309,12 @@ your SQL: writing `events`, `stream_seq`, `checkpoints`, `retention`,
 names in any
 schema, `TEMP` included, since a temp table shadows the real one for every
 unqualified statement on the connection; attaching another database; setting a
-pragma. Reading any of them is allowed and often the point, and so is adding
-your own index to `events` — that changes no data, and it is the only way to
-make a read cheap when the shipped indices do not cover what you filter on.
+pragma. Reading any of them is allowed and often the point — a pragma
+included, and `READ_ONLY_PRAGMAS` lists the introspection pragmas that may
+carry a table or index name, since SQLite's authorizer cannot tell that
+argument from an assignment. So is adding your own index to `events` — that
+changes no data, and it is the only way to make a read cheap when the shipped
+indices do not cover what you filter on.
 
 Each refusal is an invariant something else already promised — appends get
 stamped and ordered by the store, removals leave a ledger, `stream_seq` keeps
