@@ -24,6 +24,16 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   variants are the whole surface and `StreamExists` is not one of them.
   `Limitations` states that a long stream is designed away, not compacted.
 
+### Fixed
+
+- **`open` no longer returns `Busy` when two connections create one file at
+  the same time.** `apply_pragmas` set `busy_timeout` after the pragma batch
+  rather than before it, and `journal_mode = WAL` takes an exclusive lock to
+  rewrite the header — so the second of two concurrent opens met that lock
+  with the timeout still at its default of zero and failed instead of
+  waiting. The reader connections never had this: they set the timeout on
+  the builder, before the connection is opened.
+
 ## [0.2.0] - 2026-09-10
 
 One crate joins the workspace and every version moves together, so the three are
