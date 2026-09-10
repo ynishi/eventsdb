@@ -9,20 +9,62 @@
 //! that cannot be moved is a log its owner cannot leave, so being movable is a
 //! claim this crate makes, not a convenience one implementation happens to
 //! offer. A caller generic over `EventLog` can therefore write a migration.
+//!
+//! # Three read axes
+//!
+//! A cross-stream read or a subscription narrows the log along three axes,
+//! and only three. Each is a column or a key the caller wrote, matched on the
+//! **stored** shape before the upcaster chain runs:
+//!
+//! ```text
+//!              position ───────────────────────────────────────▶
+//!
+//!   streams  │ orders/17 │ orders/17 │ orders/18 │ orders/17 │ orders/19 │
+//!   kinds    │ placed    │ paid      │ placed    │ closed    │ placed    │
+//!   meta     │ tenant=a  │ tenant=a  │ tenant=b  │ tenant=a  │ tenant=a  │
+//!            │           │           │           │ closed=1  │           │
+//!
+//!   Filter { streams: [orders/17, orders/18] }     ─▶ 1st 2nd 3rd 4th
+//!   Filter { kinds: [placed] }                     ─▶ 1st     3rd     5th
+//!   Filter { meta: [(tenant, a)] }                 ─▶ 1st 2nd     4th 5th
+//!   Filter { kinds: [closed], meta: [(tenant, a)] } ─▶             4th
+//! ```
+//!
+//! `streams` and `kinds` are sets: a member matches. `meta` is a list of
+//! `(key, value)` pairs, every pair must match, and a key an event does not
+//! carry matches nothing — absence is not a value. Axes combine by AND.
+//!
+//! What the `meta` axis is: equality on a scalar the caller wrote, the same
+//! operation `kind IN (...)` is. What it is not: a query language. There is
+//! no range, no prefix, no `OR` across keys, and no reading inside `data`.
+//! A caller with that question builds a projection, which is what a
+//! projection is for; the axis exists so that the *properties a projection
+//! keys on* are cheap to read from the log directly, not so that the log
+//! becomes the projection. Why the properties live under `meta` at all,
+//! lifecycle included, is [`crate::event`]'s to say.
+//!
+//! Matching happens on the stored shape for the reason `kinds` states: an
+//! upcaster runs on the way *out*, so a key it would add is not in the row
+//! to be matched. A caller that renames a `meta` key has two names to filter
+//! by until the old rows are gone — which is a fact about the log, and the
+//! filter reports it rather than hiding it.
 
 use async_trait::async_trait;
 use futures_core::stream::BoxStream;
+use serde_json::Value;
 
 use crate::error::{Error, Result};
+use crate::event::FIELD_META;
 use crate::position::{Position, Recorded};
 use crate::store::EventStore;
 use crate::transfer::{ExportedEvent, ImportReport};
 
 /// Which events a cross-stream read or a subscription wants.
 ///
-/// Both filters are matched on the **stored** kind and the stored stream
-/// name, before the upcaster chain runs — the same rule
-/// [`EventStore::read_kinds`] follows, for the same reason.
+/// Every axis is matched on the **stored** shape — the stored kind, the
+/// stored stream name, the stored `meta` — before the upcaster chain runs,
+/// the same rule [`EventStore::read_kinds`] follows, for the same reason.
+/// The module doc has the three axes side by side.
 #[derive(Debug, Clone, Default)]
 pub struct Filter {
     /// Kinds to include. `None` includes every kind; an empty vector selects
@@ -38,6 +80,17 @@ pub struct Filter {
     /// be answered with one read per stream and a merge in the caller, which
     /// loses the position order the log exists to provide.
     pub streams: Option<Vec<String>>,
+    /// `meta` keys and the value each must hold. `None` and an empty vector
+    /// both place no condition — there is no "these keys" to be given none
+    /// of, so the two readings coincide here where they diverge above.
+    ///
+    /// **Pairs, not a set.** Every pair must hold, so two pairs on one key
+    /// with different values select nothing, which is what "both" means. A
+    /// value is a string, a number or a boolean — the scalars `meta` admits
+    /// on the way in — and anything else is refused by the backend rather
+    /// than matched against nothing: a `null` here could only ever mean
+    /// "select nothing", and that already has a spelling.
+    pub meta: Option<Vec<(String, Value)>>,
 }
 
 impl Filter {
@@ -52,8 +105,51 @@ impl Filter {
     {
         Filter {
             kinds: Some(kinds.into_iter().map(Into::into).collect()),
-            streams: None,
+            ..Filter::default()
         }
+    }
+
+    /// Require `key` under `meta` to hold `value`.
+    ///
+    /// Adds to whatever pairs were there — every pair must hold — so
+    /// `.meta("tenant", "a").meta("closed", true)` reads as "both", which is
+    /// the reading the plural axis has. Contrast [`Filter::stream`], which
+    /// replaces: one name is a singular claim, a property list is not.
+    pub fn meta(mut self, key: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.meta
+            .get_or_insert_with(Vec::new)
+            .push((key.into(), value.into()));
+        self
+    }
+
+    /// Whether every `meta` value is a scalar this filter can match.
+    ///
+    /// For a backend to call before it builds a query. The check is here
+    /// rather than in [`Filter::meta`] so that a filter assembled by hand
+    /// from its public fields is held to the same rule as one built through
+    /// the method.
+    pub fn validate(&self) -> Result<()> {
+        for (key, value) in self.meta.iter().flatten() {
+            match value {
+                Value::String(_) | Value::Number(_) | Value::Bool(_) => {}
+                Value::Null => {
+                    return Err(Error::validation(format!(
+                        "a filter on `{FIELD_META}.{key}` cannot match `null`: a key the \
+                         event does not carry matches nothing already, and an empty \
+                         `kinds` or `streams` is how to select nothing on purpose"
+                    )))
+                }
+                other => {
+                    return Err(Error::validation(format!(
+                        "a filter on `{FIELD_META}.{key}` must be a string, number or \
+                         boolean, found {}; `{FIELD_META}` holds scalars, so there is \
+                         nothing structured there to match",
+                        crate::event::type_name(other)
+                    )))
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Restrict to one stream.
@@ -192,5 +288,46 @@ pub trait EventLog: Send + Sync {
         Err(Error::Unsupported(
             "this log cannot take in exported events as one write".to_string(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn meta_pairs_accumulate_and_validate_as_scalars() {
+        let filter = Filter::all().meta("tenant", "a").meta("closed", true);
+        assert_eq!(
+            filter.meta,
+            Some(vec![
+                ("tenant".to_string(), json!("a")),
+                ("closed".to_string(), json!(true)),
+            ])
+        );
+        assert!(filter.validate().is_ok());
+        assert!(
+            !filter.selects_nothing(),
+            "a meta pair is a condition, not a set"
+        );
+    }
+
+    #[test]
+    fn a_null_or_structured_meta_value_fails_validation() {
+        for value in [json!(null), json!([1]), json!({ "id": 1 })] {
+            let err = Filter::all().meta("k", value).validate().unwrap_err();
+            assert!(matches!(err, Error::Validation(_)), "{err}");
+        }
+    }
+
+    #[test]
+    fn an_empty_meta_list_is_no_condition() {
+        let filter = Filter {
+            meta: Some(Vec::new()),
+            ..Filter::default()
+        };
+        assert!(!filter.selects_nothing());
+        assert!(filter.validate().is_ok());
     }
 }

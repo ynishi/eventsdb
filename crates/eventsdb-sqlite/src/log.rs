@@ -1,5 +1,58 @@
 //! The database-level backend: reads across streams, the live tail, and
 //! consumer checkpoints.
+//!
+//! # The `meta` predicate and its index are one expression
+//!
+//! `meta` is stored as a JSON `TEXT` column, so a key is reached with
+//! `json_extract(meta, '$."key"')`. SQLite uses an index on an expression
+//! only when the expression in the query is *textually identical* to the one
+//! in the index (`sqlite.org/expridx.html`). So one function spells the
+//! expression, and both the `WHERE` clause and `CREATE INDEX` call it:
+//!
+//! ```text
+//!   Filter { meta: [("tenant", "a")] }
+//!        │
+//!        ▼  meta_expr("tenant")  ──▶  json_extract(meta, '$."tenant"')
+//!        │                                     │
+//!        ├──▶ SELECT … WHERE … AND json_extract(meta, '$."tenant"') = ?
+//!        │                                     │
+//!        └──▶ CREATE INDEX events_meta_tenant     (same text)
+//!                 ON events (json_extract(meta, '$."tenant"'), position)
+//! ```
+//!
+//! The key is always quoted in the path, so a key containing `.` or `[`
+//! names a key rather than a path. `position` is the second column so the
+//! index also serves the `ORDER BY position` every read carries.
+//!
+//! # What `json_extract` hands back
+//!
+//! Not the JSON type, the SQL type: a string comes back `TEXT`, a number
+//! `INTEGER` or `REAL`, JSON `true`/`false` as `1`/`0`, and both JSON `null`
+//! and a missing key as SQL `NULL` (`sqlite.org/json1.html`). The predicate
+//! binds against that:
+//!
+//! | filter value   | bound as         | matches                          |
+//! |----------------|------------------|----------------------------------|
+//! | string         | `TEXT`           | the same string                  |
+//! | number         | `INTEGER`/`REAL` | the same number                  |
+//! | `true`/`false` | `1`/`0`          | the same boolean                 |
+//! | `null`         | refused          | — absence is not a value         |
+//!
+//! `NULL = NULL` is not true in SQL, which is what makes "a key the event does
+//! not carry matches nothing" fall out of the comparison rather than need a
+//! second clause. A stored `"1"` and a filter on `1` do not meet either: the
+//! expression has no column affinity, so `TEXT` and `INTEGER` stay what they
+//! are and compare unequal.
+//!
+//! # Indexing is on request, not on every key
+//!
+//! The shipped indices (the migration ladder in `schema.rs` is the list)
+//! cover the envelope columns every caller filters by. Which `meta` keys a
+//! caller filters by is the caller's vocabulary, and indexing all of them
+//! would index the vocabulary the store was told not to know. So [`SqliteEventLog::index_meta`] creates the
+//! expression index above for one key, idempotently; the hatch's allowance
+//! for `CREATE INDEX` remains for a shape this does not cover. Dropping a
+//! shipped index is still refused there.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -386,6 +439,7 @@ pub(crate) fn select_stored(
     if filter.selects_nothing() || limit == 0 {
         return Ok(Vec::new());
     }
+    filter.validate()?;
 
     let mut sql = format!("SELECT {} FROM events WHERE position > ?1", row::COLUMNS);
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(stored_position(from)?)];
@@ -412,6 +466,13 @@ pub(crate) fn select_stored(
             params.push(Box::new(kind.clone()));
         }
     }
+    if let Some(pairs) = &filter.meta {
+        check_placeholders(pairs.len(), "meta pairs")?;
+        for (key, value) in pairs {
+            params.push(meta_param(value));
+            sql.push_str(&format!(" AND {} = ?{}", meta_expr(key)?, params.len()));
+        }
+    }
     params.push(Box::new(clamp_limit(limit)));
     sql.push_str(&format!(" ORDER BY position LIMIT ?{}", params.len()));
 
@@ -428,6 +489,65 @@ pub(crate) fn select_stored(
         stored.push(item.map_err(classify)?);
     }
     Ok(stored)
+}
+
+/// The one spelling of "this `meta` key", shared by the predicate and the
+/// index so SQLite can see they are the same expression.
+///
+/// The key is a JSON path label in double quotes, which is what lets `.` and
+/// `[` in a key name the key. A key that itself contains `"` has no spelling
+/// in SQLite's path syntax and is refused; a `'` is doubled for the SQL
+/// string literal around the path.
+pub(crate) fn meta_expr(key: &str) -> Result<String> {
+    if key.is_empty() {
+        return Err(Error::validation(
+            "a `meta` key to filter by must not be empty",
+        ));
+    }
+    if key.contains('"') {
+        return Err(Error::validation(format!(
+            "a `meta` key cannot be filtered on when it contains `\"`: SQLite's JSON \
+             path syntax has no way to write it (key `{key}`)"
+        )));
+    }
+    Ok(format!(
+        "json_extract(meta, '$.\"{}\"')",
+        key.replace('\'', "''")
+    ))
+}
+
+/// A filter value as the SQL value `json_extract` would produce for it —
+/// integers where the number is one, `1`/`0` for a boolean. [`Filter::validate`]
+/// has already refused anything that is not a scalar.
+fn meta_param(value: &Value) -> Box<dyn rusqlite::ToSql> {
+    match value {
+        Value::String(s) => Box::new(s.clone()),
+        Value::Bool(b) => Box::new(i64::from(*b)),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Box::new(i)
+            } else {
+                Box::new(n.as_f64().unwrap_or(f64::NAN))
+            }
+        }
+        // Unreachable after `validate`; binding NULL keeps the statement well
+        // formed and matches nothing, which is the honest fallback.
+        _ => Box::new(rusqlite::types::Null),
+    }
+}
+
+/// The index name for a `meta` key. A key made of identifier characters is
+/// used as it is; any other key is spelled in hex, so two keys that differ
+/// only in punctuation cannot collapse onto one name and have the second
+/// `IF NOT EXISTS` silently skip.
+pub(crate) fn meta_index_name(key: &str) -> String {
+    let plain = key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if plain {
+        format!("events_meta_{key}")
+    } else {
+        let hex: String = key.bytes().map(|b| format!("{b:02x}")).collect();
+        format!("events_meta_x{hex}")
+    }
 }
 
 /// The newest position in the log, against an open connection.
@@ -682,6 +802,34 @@ impl SqliteEventLog {
     pub fn runner_now<P: Projection>(&self, projection: P) -> ProjectionRunner<P> {
         self.runner(projection)
             .expect("a runner for a name that is not already live")
+    }
+
+    /// Make reads that filter on `meta.<key>` cheap.
+    ///
+    /// Creates an index on exactly the expression the filter uses, so a
+    /// `Filter::meta(key, _)` read becomes an index range rather than a scan
+    /// of every row's `meta`. Idempotent: calling it again for a key that has
+    /// one is a no-op. It is a schema change on the events table and goes
+    /// through the writer, so it waits for any write in progress the way an
+    /// append would.
+    ///
+    /// Which keys to index is the caller's call, the same way which keys
+    /// exist is — see the module doc for why the store does not guess.
+    pub async fn index_meta(&self, key: &str) -> Result<()> {
+        let sql = format!(
+            "CREATE INDEX IF NOT EXISTS {} ON events ({}, position)",
+            meta_index_name(key),
+            meta_expr(key)?
+        );
+        match self
+            .shared
+            .isle
+            .call(move |conn: &mut Connection| Ok(conn.execute_batch(&sql).map_err(classify)))
+            .await
+        {
+            Ok(inner) => inner,
+            Err(isle) => Err(map_isle(isle)),
+        }
     }
 
     /// The shared handle, for the sibling modules that need the isle.

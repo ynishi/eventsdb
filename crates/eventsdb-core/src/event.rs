@@ -76,6 +76,59 @@
 //! questions for the layer above; this crate checks the envelope and stores
 //! the `data` verbatim. A store that knew a vocabulary would be a store that
 //! had to be changed to record something new.
+//!
+//! # `meta` is the caller's property bag, lifecycle included
+//!
+//! The three levels above say where a value goes. This section says what
+//! `meta` is *for*, because the answer decides three things a store could
+//! otherwise be asked to own.
+//!
+//! ```text
+//!   what a caller knows about an event      where it goes    who reads it
+//!   ─────────────────────────────────────    ─────────────    ───────────
+//!   what happened                            kind             everyone
+//!   the kind's own content                   data             the kind's author
+//!   a property a reader selects by:
+//!     an id, a tenant, a correlation value   meta             any reader, no
+//!     closed_at, archived, superseded_by     meta             kind knowledge
+//!     valid_from / valid_to                  meta             needed
+//! ```
+//!
+//! The last three rows are the point. A stream's lifecycle — that it was
+//! closed, that a later stream supersedes it, the period a fact was true for
+//! — is knowledge the caller has and the store does not. It is written the
+//! way any fact is written: as a key on the event that carries it, on an
+//! ordinary append. The store keeps **no stream state past the counter**
+//! ([`crate::store::Expected::Unwritten`] is the one question the counter
+//! answers), reserves no key, and never reads a `meta` value to decide
+//! anything. What `archived: true` means is a projection's to say.
+//!
+//! This is where the line sits between this store and the ones that grew a
+//! first-class surface for the same state. KurrentDB's stream metadata is a
+//! reserved `$`-namespace the server interprets, stored as events in a
+//! `$$stream`; Marten's `is_archived` is a column so a partition can be
+//! pruned. Both are the same knowledge moved into the store, and each pulled
+//! a second feature after it — a `StreamExists` expectation to refuse the
+//! soft-deleted, default exclusion rules for the archived. Keeping the
+//! knowledge in `meta` keeps the store out of the domain and keeps the
+//! feature count where it is.
+//!
+//! What the store owes in return is a **read axis**. A property a reader
+//! selects by is only that if a reader can select by it, so
+//! [`crate::log::Filter`] matches on `meta` keys, and a backend indexes them
+//! on request. Which keys exist is the caller's; that a key can be read
+//! cheaply is the store's.
+//!
+//! Two things `meta` is not:
+//!
+//! - **Not an identity the store enforces.** An id under `meta` is carried
+//!   and indexed, never compared. Two events with the same id are two events.
+//!   The deduplication a networked store performs on a caller-supplied id is
+//!   a retry protocol for a client that lost a response; in one process the
+//!   await returns or the process is gone, and there is nothing to retry.
+//! - **Not mutable.** Stored bytes are never rewritten, so a property that
+//!   changes is a new event carrying the new value. That is not a limitation
+//!   to work around; it is the fact that changed.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -317,7 +370,7 @@ pub fn now_ms() -> u64 {
 }
 
 /// The JSON type name, for a refusal that says what was actually found.
-fn type_name(value: &Value) -> &'static str {
+pub(crate) fn type_name(value: &Value) -> &'static str {
     match value {
         Value::Null => "null",
         Value::Bool(_) => "a boolean",

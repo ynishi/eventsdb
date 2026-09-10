@@ -5,6 +5,25 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- `Filter::meta(key, value)`: a third read axis. A cross-stream read, a
+  subscription and an export narrow on a `meta` key holding a scalar, ANDed
+  with `kinds` and `streams`. An event without the key is out of the answer;
+  a `null` or structured value is refused as validation rather than matched
+  against nothing. `Filter` gains the public field `meta` (existing struct
+  literals need `..Filter::default()`).
+- `SqliteEventLog::index_meta(key)`: an expression index on exactly the
+  `json_extract` the predicate uses, so SQLite can use it. Idempotent.
+
+### Changed
+
+- The rustdoc now says what `meta` is for — the caller's own properties,
+  lifecycle included — and why the store keeps no stream state past the
+  sequence counter (`eventsdb_core::event`). `Expected` documents why two
+  variants are the whole surface and `StreamExists` is not one of them.
+  `Limitations` states that a long stream is designed away, not compacted.
+
 ### Fixed
 
 - **`open` no longer returns `Busy` when two connections create one file at
