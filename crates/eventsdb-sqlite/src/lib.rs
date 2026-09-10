@@ -42,7 +42,7 @@ mod txn;
 pub use hatch::RESERVED_TABLES;
 pub use log::{OpenOptions, SqliteEventLog, DEFAULT_BUSY_TIMEOUT, DEFAULT_POLL_INTERVAL};
 pub use project::{Projection, ProjectionRunner, DEFAULT_BATCH};
-pub use retention::{Completeness, Guard, Plan, Report};
+pub use retention::{Completeness, ExportReceipt, Guard, Plan, Report};
 pub use schema::TARGET_USER_VERSION;
 pub use store::SqliteEventStore;
 pub use txn::TxnContext;

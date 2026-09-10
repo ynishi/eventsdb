@@ -465,6 +465,7 @@ async fn an_existing_database_is_carried_up_the_ladder() {
         conn.execute_batch(
             "DROP TABLE stream_seq; \
              DROP TABLE retention; \
+             DROP TABLE exports; \
              DROP INDEX events_epoch_ms; \
              DROP TRIGGER trg_events_no_update; \
              PRAGMA user_version = 1;",
@@ -476,7 +477,7 @@ async fn an_existing_database_is_carried_up_the_ladder() {
         assert_eq!(version, 1);
     }
 
-    // Reopening runs steps 2 through 4, and nothing before them.
+    // Reopening runs steps 2 through 5, and nothing before them.
     let log = SqliteEventLog::open(&path).await.unwrap();
     assert_eq!(log.removed_watermark().await.unwrap(), Position::BEGINNING);
 

@@ -296,8 +296,9 @@ else in that transaction. Inside a projection you already have this — `apply`
 is handed the same kind of transaction.
 
 What the hatch refuses, through SQLite's authorizer rather than by reading
-your SQL: writing `events`, `stream_seq`, `checkpoints`, `retention` or
-`sqlite_sequence`; creating anything that *shares* one of those names in any
+your SQL: writing `events`, `stream_seq`, `checkpoints`, `retention`,
+`exports` or `sqlite_sequence`; creating anything that *shares* one of those
+names in any
 schema, `TEMP` included, since a temp table shadows the real one for every
 unqualified statement on the connection; attaching another database; setting a
 pragma. Reading any of them is allowed and often the point, and so is adding
@@ -411,6 +412,31 @@ Dropping whole streams leaves holes in the global order. That is safe:
 positions are never reused (`AUTOINCREMENT`), and nothing waits for a specific
 one — a subscription reads `position > cursor` and does not see what is gone.
 
+### Removing only what is preserved elsewhere
+
+Retention deletes; it does not archive, because where an export goes is
+yours. What the store can do is refuse to delete what nobody has confirmed
+is safe — the order Kafka's tiered storage and KurrentDB's archiving keep,
+with the upload left to you:
+
+    let mut cursor = Position::BEGINNING;
+    loop {
+        let (page, receipt) = log.export_recorded(cursor, &Filter::all(), 1000).await?;
+        write_somewhere(&page)?;                  // yours: a file, another log
+        log.confirm_export(receipt.id).await?;    // "it landed"
+        cursor = receipt.through;
+        if page.len() < 1000 { break; }
+    }
+    log.retain(Plan::Before(cursor), Guard::Exported).await?;
+
+`export_recorded` is `export` plus a receipt row — taken, not yet landed —
+and `confirm_export` is the second half. `Guard::Exported` chains the
+confirmed, unfiltered receipts from the beginning of the log and refuses
+with `NotExported` any plan that would remove past the chain's end; a page
+taken and never confirmed, a filtered one, or a gap all leave the end where
+it was. It also refuses to overrun a consumer, as the default does. The
+rustdoc of `eventsdb_sqlite::retention` has the two moments as a diagram.
+
 ## Limitations
 
 - **Subscriptions outside the writing log poll.** SQLite has no
@@ -424,9 +450,11 @@ one — a subscription reads `position > cursor` and does not see what is gone.
   different upcaster chains will read the same bytes differently with nothing
   to detect it.
 - **No clustering, replication or network protocol**, by design — see above.
-- **Retention deletes; it does not archive.** Taking an `export` before a
-  `retain` is what preserves the history — the pieces are here, the policy
-  that decides when to do it is not.
+- **Retention deletes; it does not archive.** Where an export goes is yours,
+  and so is the retry if it does not get there. What the store keeps is the
+  receipt — taken, then confirmed — and `Guard::Exported` is the refusal to
+  delete past what has been confirmed. The policy that decides when to
+  export and when to retain is still not here.
 - **A long stream is designed away, not compacted.** `append_if` folds the
   stream under the write lock, and nothing in the store bounds how long a
   stream gets. The answer is a stream per period — a shift, a session, a
