@@ -68,17 +68,18 @@ exactly that. The rustdoc gate is not decoration — three intra-doc links were
 already found broken once (`5ac8618`), and a broken link is a promise the
 published documentation does not keep.
 
-The MSRV is 1.82, and the manifest says why: `libsqlite3-sys` declares none of
-its own and uses `unsafe extern "C"`, so 1.78 cannot build it. It is a claim
-this repository makes to everyone who depends on it. When a change reaches for
-something newer, raise the number deliberately in the same commit rather than
-letting the build discover it.
+The MSRV is `rust-version` in `Cargo.toml`, and the manifest says why it is
+where it is. It is a claim this repository makes to everyone who depends on
+it. When a change reaches for something newer, raise the number deliberately
+in the same commit rather than letting the build discover it.
 
 These four are also where CI answers: `.github/workflows/check.yml` runs them
 on every pull request and on every push to `main`, one step each so a red run
-names the gate. Running them locally first is still worth it — the loop is
-seconds rather than minutes — but the answer that counts is the one attached to
-the commit.
+names the gate. A fifth job, `msrv`, runs `cargo check` on the toolchain the
+manifest promises, reading the version from `Cargo.toml` so there is no
+second copy to drift. Running the four locally first is still worth it — the
+loop is seconds rather than minutes — but the answer that counts is the one
+attached to the commit.
 
 The `main` run is not a duplicate of the branch's. A change can be green on its
 own branch and red once merged, and no branch can answer that about itself.
