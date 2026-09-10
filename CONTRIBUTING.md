@@ -74,6 +74,15 @@ this repository makes to everyone who depends on it. When a change reaches for
 something newer, raise the number deliberately in the same commit rather than
 letting the build discover it.
 
+These four are also where CI answers: `.github/workflows/check.yml` runs them
+on every pull request and on every push to `main`, one step each so a red run
+names the gate. Running them locally first is still worth it — the loop is
+seconds rather than minutes — but the answer that counts is the one attached to
+the commit.
+
+The `main` run is not a duplicate of the branch's. A change can be green on its
+own branch and red once merged, and no branch can answer that about itself.
+
 Report what was actually run. "I did not verify X" is a usable report; a green
 claim resting on a command nobody ran is not.
 
