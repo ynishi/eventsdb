@@ -182,7 +182,11 @@ impl Plan {
 }
 
 /// Who is allowed to be left behind.
+///
+/// `#[non_exhaustive]`: a `match` on it needs a wildcard arm, so a guard can
+/// be added without breaking a caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum Guard {
     /// Refuse if any consumer with a stored checkpoint has not passed the
     /// events this plan would remove. The default, and the one that makes the
@@ -274,7 +278,11 @@ impl Report {
 }
 
 /// Whether the history from a given position is all still there.
+///
+/// `#[non_exhaustive]`: a `match` on it needs a wildcard arm. The common
+/// question has a method, [`Completeness::is_complete`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Completeness {
     Complete,
     /// Events at or below `removed_up_to` are gone, so a fold from the

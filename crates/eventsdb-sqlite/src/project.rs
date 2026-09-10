@@ -224,9 +224,9 @@ impl<P: Projection> ProjectionRunner<P> {
         let batch = self.batch;
         self.in_transaction(move |projection, tx, chain| {
             let name = projection.name().to_string();
-            let filter = Filter {
-                kinds: projection.kinds(),
-                ..Filter::default()
+            let filter = match projection.kinds() {
+                Some(kinds) => Filter::kinds(kinds),
+                None => Filter::all(),
             };
 
             let cursor = load_checkpoint(tx, &name)?;

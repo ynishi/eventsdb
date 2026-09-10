@@ -169,27 +169,18 @@ async fn readers_can_be_turned_off_and_an_in_memory_log_never_has_them() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("events.db");
 
-    let log = SqliteEventLog::open_with(
-        &path,
-        OpenOptions {
-            readers: 0,
-            ..OpenOptions::default()
-        },
-    )
-    .await
-    .unwrap();
+    let log = SqliteEventLog::open_with(&path, OpenOptions::default().readers(0))
+        .await
+        .unwrap();
     let mut s = log.stream_handle("s");
     s.append(event("a")).await.unwrap();
     assert_eq!(s.head().await.unwrap(), Some(1));
     log.shutdown().await.unwrap();
 
     // In-memory ignores the setting and stays correct.
-    let mem = SqliteEventLog::open_in_memory_with(OpenOptions {
-        readers: 4,
-        ..OpenOptions::default()
-    })
-    .await
-    .unwrap();
+    let mem = SqliteEventLog::open_in_memory_with(OpenOptions::default().readers(4))
+        .await
+        .unwrap();
     let mut s = mem.stream_handle("s");
     s.append(event("a")).await.unwrap();
     assert_eq!(s.head().await.unwrap(), Some(1));

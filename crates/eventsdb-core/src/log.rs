@@ -80,7 +80,13 @@ use crate::transfer::{ExportedEvent, ImportReport};
 /// stored stream name, the stored `meta` — before the upcaster chain runs,
 /// the same rule [`EventStore::read_kinds`] follows, for the same reason.
 /// The module doc has the three axes side by side.
+///
+/// `#[non_exhaustive]`, so an axis can be added without breaking a caller.
+/// Start from [`Filter::all`] or [`Filter::kinds`] and narrow with the
+/// methods, or set the public fields on a default; only the struct literal
+/// is reserved.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct Filter {
     /// Kinds to include. `None` includes every kind; an empty vector selects
     /// nothing, which is the honest reading of "include these" given none.

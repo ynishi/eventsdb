@@ -157,6 +157,12 @@ pub struct SqliteEventLog {
 
 /// Open options, so the two timings above can be set without a second
 /// constructor for each combination.
+///
+/// `#[non_exhaustive]`, so an option can be added without breaking a caller.
+/// Start from [`OpenOptions::default`] and set what differs through the
+/// methods — `OpenOptions::default().readers(0)` — or assign the public
+/// fields; only the struct literal is reserved.
+#[non_exhaustive]
 pub struct OpenOptions {
     pub busy_timeout: Duration,
     pub poll_interval: Duration,
@@ -182,6 +188,33 @@ impl Default for OpenOptions {
             upcasters: UpcastChain::new(),
             readers: DEFAULT_READERS,
         }
+    }
+}
+
+impl OpenOptions {
+    /// How long a statement waits on a lock before it fails as `Busy`.
+    pub fn busy_timeout(mut self, busy_timeout: Duration) -> Self {
+        self.busy_timeout = busy_timeout;
+        self
+    }
+
+    /// How often a subscription looks for writes made through another log.
+    pub fn poll_interval(mut self, poll_interval: Duration) -> Self {
+        self.poll_interval = poll_interval;
+        self
+    }
+
+    /// The upcaster chain every read runs through. Replaces, not appends.
+    pub fn upcasters(mut self, upcasters: UpcastChain) -> Self {
+        self.upcasters = upcasters;
+        self
+    }
+
+    /// How many read-only connections to open beside the writer; see the
+    /// field.
+    pub fn readers(mut self, readers: usize) -> Self {
+        self.readers = readers;
+        self
     }
 }
 

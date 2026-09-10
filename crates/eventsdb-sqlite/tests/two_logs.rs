@@ -103,10 +103,7 @@ async fn a_subscriber_on_one_log_learns_of_the_others_write_by_polling() {
     let path = dir.path().join("events.db");
 
     let slow_poll = Duration::from_millis(600);
-    let options = || OpenOptions {
-        poll_interval: slow_poll,
-        ..OpenOptions::default()
-    };
+    let options = || OpenOptions::default().poll_interval(slow_poll);
 
     let a = SqliteEventLog::open_with(&path, options()).await.unwrap();
     let b = SqliteEventLog::open_with(&path, options()).await.unwrap();

@@ -19,6 +19,20 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Schema step 5: the `exports` table. `TARGET_USER_VERSION` is 5, and
   `exports` joins `RESERVED_TABLES`, so the hatch can read receipts but not
   write them.
+- `OpenOptions::busy_timeout`, `poll_interval`, `upcasters` and `readers`,
+  consuming setters in the shape `Filter` already has, so an option can be
+  set from a default without a struct literal.
+
+### Changed
+
+- **`Filter`, `OpenOptions`, `Guard` and `Completeness` are
+  `#[non_exhaustive]`.** A field or a variant can now be added to any of
+  them without breaking a caller — which is what 0.3.0's `Filter` change and
+  this release's `Guard::Exported` each did. The cost lands once, here: a
+  struct literal of `Filter` or `OpenOptions` outside the crate stops
+  compiling, `..Default::default()` included — build from `Filter::all()` /
+  `OpenOptions::default()` and the methods, or assign the public fields — and
+  an exhaustive `match` on `Guard` or `Completeness` needs a wildcard arm.
 
 ## [0.3.0] - 2026-09-10
 

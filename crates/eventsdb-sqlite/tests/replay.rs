@@ -112,12 +112,9 @@ async fn a_replay_is_exclusive_on_from() {
 /// read on the same log completes, and so does a write.
 #[tokio::test]
 async fn a_half_consumed_replay_holds_no_reader() {
-    let log = SqliteEventLog::open_in_memory_with(OpenOptions {
-        readers: 1,
-        ..OpenOptions::default()
-    })
-    .await
-    .unwrap();
+    let log = SqliteEventLog::open_in_memory_with(OpenOptions::default().readers(1))
+        .await
+        .unwrap();
     let mut s = log.stream_handle("s");
     s.append_many((0..MANY).map(|_| event("x")).collect())
         .await
