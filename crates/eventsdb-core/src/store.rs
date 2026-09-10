@@ -72,6 +72,24 @@ pub type Decision = Box<dyn FnOnce(&[Current]) -> Option<Map<String, Value>> + S
 /// Equinox hides the number entirely rather than let it into domain code.
 /// Naming the empty case is the mitigation available to a store that has to
 /// expose it at all.
+///
+/// # Two variants are the surface
+///
+/// Stores that run as a service tend to offer four: these two, an `Any` that
+/// checks nothing, and a `StreamExists` that checks only that the stream was
+/// written to. `Any` is spelled here by not calling
+/// [`EventStore::append_expecting`]. `StreamExists` is absent on purpose.
+/// KurrentDB added it so an append could refuse a *soft-deleted* stream — a
+/// stream that was written, then marked gone. That third state has nothing to
+/// stand on here: the trait has no delete, retention leaves the counter
+/// alone, and a stream has either been written or it has not. Past the
+/// existence check `StreamExists` is `Any`, so it also adds nothing to
+/// concurrency that [`Expected::Seq`] does not already give.
+///
+/// The question it is usually reached for — "did the command that creates
+/// this stream run?" — is a fact about the domain, and it goes where domain
+/// facts go: a key under `meta` on the creating event, read through
+/// [`crate::log::Filter`]. See [`crate::event`] on why lifecycle lives there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Expected {

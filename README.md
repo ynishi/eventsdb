@@ -45,6 +45,14 @@ built on the envelope is not broken by a kind changing shape.
 `kind` is an opaque string here. Which kinds exist and what their `data` must
 contain belong to the layer above.
 
+`meta` is where a property a reader selects by goes — an id, a tenant, a
+correlation value, and the stream's lifecycle too: `closed_at`, `archived`,
+`superseded_by`, `valid_from`. The store carries these as it carries any
+fact, keeps no stream state of its own past the sequence counter, and never
+reads one to decide anything; what `archived: true` means is a projection's
+to say. What the store owes in return is a read axis, below. The rustdoc of
+`eventsdb_core::event` has the reasoning.
+
 ## Time is a coordinate, not an order
 
 Every event carries a time coordinate (`epoch_ms`) and log positions (`seq`,
@@ -135,6 +143,15 @@ store forfeits both, which is why this one does not distribute.
     // Or follow it: catch up, then stay live.
     let mut events = log.subscribe(Position::BEGINNING, Filter::all())?;
 
+A read narrows along three axes — `streams`, `kinds`, and `meta` keys — and
+combines them by AND. `meta` is equality on a scalar the caller wrote; an
+event without the key is out of the answer. The SQLite log indexes a key on
+request, on exactly the expression the filter uses:
+
+    log.index_meta("tenant").await?;
+    let theirs = Filter::kinds(["placed"]).meta("tenant", "a");
+    let batch = log.read_all(Position::BEGINNING, &theirs, 100).await?;
+
 ### A command with an invariant
 
 Two shapes, and which one you want depends on **where the decision was made**,
@@ -169,6 +186,12 @@ contended, and repeating it unchanged fails the same way.
 not the same as "the stream reads empty". Retention can empty a stream whose
 counter stands at 50, and the check is against the counter, so a caller meaning
 "this is a new order" is not told yes about an order that was archived.
+
+Those two are the whole of `Expected`. There is no `StreamExists`: the state
+it was invented to refuse — written, then soft-deleted — does not exist in a
+store with no delete, and past the existence check it is `Any`. "Did the
+command that creates this stream run?" is a `meta` key on the creating event,
+read through `Filter`.
 
 ### A projection
 
@@ -394,6 +417,13 @@ one — a subscription reads `position > cursor` and does not see what is gone.
 - **Retention deletes; it does not archive.** Taking an `export` before a
   `retain` is what preserves the history — the pieces are here, the policy
   that decides when to do it is not.
+- **A long stream is designed away, not compacted.** `append_if` folds the
+  stream under the write lock, and nothing in the store bounds how long a
+  stream gets. The answer is a stream per period — a shift, a session, a
+  month — closed by an event that carries its summary, so the next period
+  starts from that rather than from the beginning. There is no snapshot in
+  the log and no archive flag; a closed period's bytes are retention's to
+  remove.
 - **`reclaim` needs a database created by this version.** It relies on
   `auto_vacuum = INCREMENTAL`, which SQLite only accepts before the first
   table exists. On an older file it does nothing.

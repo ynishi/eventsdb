@@ -226,7 +226,7 @@ impl<P: Projection> ProjectionRunner<P> {
             let name = projection.name().to_string();
             let filter = Filter {
                 kinds: projection.kinds(),
-                streams: None,
+                ..Filter::default()
             };
 
             let cursor = load_checkpoint(tx, &name)?;
