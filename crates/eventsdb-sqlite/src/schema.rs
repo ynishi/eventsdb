@@ -219,11 +219,18 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
 /// On a database created before this line, the pragma is silently ignored and
 /// reclaim has nothing to do; that is a limitation, not a failure.
 pub fn apply_pragmas(conn: &Connection, busy_timeout: std::time::Duration) -> rusqlite::Result<()> {
+    // First, because the batch below is the first thing on this connection
+    // that can lose a lock. `journal_mode = WAL` takes an exclusive lock to
+    // rewrite the header, so two connections opening one fresh file put one
+    // of them there while the other holds it — and with the timeout still at
+    // its default of zero, the loser does not wait. It returns
+    // `SQLITE_BUSY` from `open`, which is not a state the caller of an
+    // `open` has any way to read as contention.
+    conn.busy_timeout(busy_timeout)?;
     conn.execute_batch(
         "PRAGMA auto_vacuum = INCREMENTAL; \
          PRAGMA journal_mode = WAL; \
          PRAGMA synchronous = NORMAL;",
     )?;
-    conn.busy_timeout(busy_timeout)?;
     Ok(())
 }
