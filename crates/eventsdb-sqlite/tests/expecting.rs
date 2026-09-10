@@ -225,12 +225,9 @@ async fn an_upcaster_selects_on_kind_and_version_together() {
     }
 
     let chain: UpcastChain = vec![Arc::new(OrderV1ToV2)];
-    let log = SqliteEventLog::open_in_memory_with(OpenOptions {
-        upcasters: chain,
-        ..OpenOptions::default()
-    })
-    .await
-    .unwrap();
+    let log = SqliteEventLog::open_in_memory_with(OpenOptions::default().upcasters(chain))
+        .await
+        .unwrap();
 
     let mut s = log.stream_handle("s");
     s.append(versioned("order_placed", 1)).await.unwrap();

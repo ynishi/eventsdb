@@ -105,17 +105,12 @@ async fn an_imported_event_keeps_the_schema_version_it_was_written_under() {
 
     // The version travelled, so the chain still recognises it.
     let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let reader = SqliteEventLog::open_in_memory_with(OpenOptions {
-        upcasters: {
-            let chain: UpcastChain = vec![Arc::new(RenameV1 {
-                seen: Arc::clone(&seen),
-            })];
-            chain
-        },
-        ..OpenOptions::default()
-    })
-    .await
-    .unwrap();
+    let chain: UpcastChain = vec![Arc::new(RenameV1 {
+        seen: Arc::clone(&seen),
+    })];
+    let reader = SqliteEventLog::open_in_memory_with(OpenOptions::default().upcasters(chain))
+        .await
+        .unwrap();
     reader.import(export_all(&target).await).await.unwrap();
 
     let read = reader
@@ -143,12 +138,9 @@ async fn an_export_is_not_upcasted() {
     }
 
     let chain: UpcastChain = vec![Arc::new(Rename)];
-    let log = SqliteEventLog::open_in_memory_with(OpenOptions {
-        upcasters: chain,
-        ..OpenOptions::default()
-    })
-    .await
-    .unwrap();
+    let log = SqliteEventLog::open_in_memory_with(OpenOptions::default().upcasters(chain))
+        .await
+        .unwrap();
     log.stream_handle("s")
         .append(event("as_written", 1))
         .await
