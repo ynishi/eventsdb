@@ -12,3 +12,19 @@ workspace
 # Local agent tooling config. A deploy target for tools that live outside this
 # repo, so what lands here is machine state rather than the crate.
 .claude
+
+# One worktree per issue lands here. They are checkouts of branches this
+# repository already has, so tracking them would commit the same history twice.
+.worktrees
+
+# Claude Code also reads CLAUDE.md and CLAUDE.local.md from the directory it
+# starts in and every directory above it. The instructions for this repository
+# are AGENTS.md, read through .claude/CLAUDE.md above, so either of these
+# landing anywhere in the tree is somebody's own and stays out of it. Both the
+# anchored and the unanchored form: the anchored one names the repository root
+# and stops matching the moment this tree is reached through a link or from a
+# worktree, where the root is somewhere else.
+/CLAUDE.md
+/CLAUDE.local.md
+CLAUDE.md
+CLAUDE.local.md
