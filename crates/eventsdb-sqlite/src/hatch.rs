@@ -439,14 +439,29 @@ where
     F: FnOnce(&mut Connection) -> Result<T>,
 {
     let flag = Arc::clone(&trusted);
+    // Refused rather than reported, because a failure here is the guard not
+    // being installed, and `body` is the untrusted statement it exists to
+    // stand in front of. Running it anyway would turn an enforced boundary
+    // into a documented one at the moment it matters.
     conn.authorizer(Some(move |context: AuthContext<'_>| {
         authorize(&context, flag.load(Ordering::SeqCst))
-    }));
+    }))
+    .map_err(|e| Error::storage(format!("could not install the authorizer: {e}")))?;
 
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(conn)));
 
-    conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+    // The uninstall's own failure is not allowed to replace `outcome`. A
+    // guard left installed refuses every later write on this connection,
+    // including the store's own, so it is reported — but after the call this
+    // frame was asked to make has been accounted for, not instead of it.
+    let uninstalled = conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
     trusted.store(false, Ordering::SeqCst);
+    if let Err(e) = uninstalled {
+        return Err(Error::storage(format!(
+            "the authorizer could not be removed, so this connection now \
+             refuses every write: {e}"
+        )));
+    }
 
     match outcome {
         Ok(Ok(value)) => Ok(value),
