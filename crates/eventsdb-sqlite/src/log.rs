@@ -1,6 +1,46 @@
 //! The database-level backend: reads across streams, the live tail, and
 //! consumer checkpoints.
 //!
+//! # A replay and a subscription are one loop
+//!
+//! Every read across streams is a page: `read_all` with a `from` and a
+//! `limit`, served by one query on one borrowed reader. The two streaming
+//! shapes this log offers are that page in a loop, with the cursor fed back
+//! in, and they differ in exactly one place — what happens when a page comes
+//! back short:
+//!
+//! ```text
+//!                  ┌──────────────────────────────────┐
+//!                  │  read_all(cursor, filter, BATCH)  │ ◀── one reader,
+//!                  │  borrowed for this query only     │     one query
+//!                  └────────────────┬─────────────────┘
+//!                                   │ yield each; cursor = last position
+//!                                   ▼
+//!                       page full? ──yes──▶ read again, now
+//!                                   │
+//!                                   no  (range exhausted as of this read)
+//!                                   │
+//!                 ┌─────────────────┴──────────────────┐
+//!             replay                             subscribe
+//!               end                     cursor = max(cursor, head);
+//!                                       wait for a commit or the poll
+//!                                       interval; read again
+//! ```
+//!
+//! Between pages the stream holds nothing: no connection, no statement, no
+//! read transaction. That is the property the shape is chosen for. A cursor
+//! left open on a SQLite statement keeps a read transaction open, and a read
+//! transaction that never ends stops every checkpoint from resetting the WAL
+//! (`sqlite.org/wal.html`, "checkpoint starvation"); a replay that paused
+//! half way would have been holding one of the two readers and a growing
+//! WAL file for as long as it paused. Paging gives that up for nothing —
+//! the log is append-only and positions are dense, so a new event can only
+//! land *after* the cursor, and page boundaries cannot duplicate or skip.
+//!
+//! The same loop, on the writer rather than a reader, is what a projection
+//! runs to rebuild; the fold in `append_if` and `TxnContext::read` stay off
+//! it because they must see uncommitted state.
+//!
 //! # The `meta` predicate and its index are one expression
 //!
 //! `meta` is stored as a JSON `TEXT` column, so a key is reached with
@@ -95,8 +135,8 @@ pub const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// and not many more because each is a thread and reads are usually short.
 pub const DEFAULT_READERS: usize = 2;
 
-/// How many events a subscription reads per round.
-const SUBSCRIBE_BATCH: usize = 256;
+/// How many events a replay or a subscription reads per page.
+const BATCH: usize = 256;
 
 /// Distinguishes in-memory databases from one another, so
 /// [`EventStore::database`] stays an identity rather than a shared label.
@@ -633,6 +673,91 @@ pub(crate) fn stored_position(position: Position) -> Result<i64> {
     })
 }
 
+/// What a paged read does when a batch comes back short.
+#[derive(Clone, Copy)]
+enum Exhausted {
+    /// Wait for a commit or the poll interval, then read again: a
+    /// subscription.
+    Wait,
+    /// Return: a replay.
+    End,
+}
+
+/// The one loop behind [`SqliteEventLog::replay`] and
+/// [`EventLog::subscribe`]: page `read_all` with the cursor fed back in,
+/// borrowing a reader for each page and holding nothing between pages.
+///
+/// A batch that comes back full is followed immediately by another read, so
+/// catching up does not crawl at the poll interval. A batch that comes back
+/// short means the filtered range is exhausted as of that read, and
+/// `on_exhausted` says whether that is the end or the moment to wait.
+fn paged(
+    shared: Arc<Shared>,
+    from: Position,
+    filter: Filter,
+    on_exhausted: Exhausted,
+) -> BoxStream<'static, Result<Recorded>> {
+    let mut cursor = from;
+    let mut woken = shared.notify.subscribe();
+    let poll_interval = shared.poll_interval;
+
+    let stream = async_stream::stream! {
+        loop {
+            // For the tail only: read the head before the batch, so advancing
+            // to it below cannot skip an event that landed in between. A
+            // replay never advances past what it read, so it never asks.
+            let head = match on_exhausted {
+                Exhausted::Wait => match head_shared(&shared).await {
+                    Ok(head) => Some(head),
+                    Err(error) => {
+                        yield Err(error);
+                        return;
+                    }
+                },
+                Exhausted::End => None,
+            };
+
+            let batch = read_all_shared(&shared, cursor, &filter, BATCH).await;
+            let batch = match batch {
+                Ok(batch) => batch,
+                Err(error) => {
+                    yield Err(error);
+                    return;
+                }
+            };
+
+            let full = batch.len() == BATCH;
+            for recorded in batch {
+                cursor = recorded.position;
+                yield Ok(recorded);
+            }
+
+            if full {
+                // Still behind. Read again rather than wait.
+                continue;
+            }
+
+            let Some(head) = head else {
+                // A replay: the range is exhausted, and that is the end.
+                return;
+            };
+
+            // The filtered range is exhausted, so everything up to `head`
+            // has been looked at. Without this a narrow filter would leave
+            // the cursor at the last match and re-scan the same prefix on
+            // every poll, for ever.
+            cursor = cursor.max(head);
+
+            // Caught up. Wake on an in-process commit, or look again
+            // after the interval — which is what covers a writer in
+            // another process.
+            let _ = tokio::time::timeout(poll_interval, woken.changed()).await;
+        }
+    };
+
+    Box::pin(stream)
+}
+
 #[async_trait]
 impl EventLog for SqliteEventLog {
     async fn stream(&self, id: &str) -> Result<Box<dyn EventStore>> {
@@ -669,66 +794,20 @@ impl EventLog for SqliteEventLog {
 
     /// Catch up, then tail.
     ///
-    /// The two halves are the same range read; the only difference is that
-    /// the second one waits first. A batch that comes back full is followed
-    /// immediately by another read, so catching up does not crawl at the poll
-    /// interval.
+    /// The catch-up half is [`SqliteEventLog::replay`]; the tail is what
+    /// happens instead of returning when the range runs dry. See the module
+    /// doc for the one loop both are.
     fn subscribe(
         &self,
         from: Position,
         filter: Filter,
     ) -> Result<BoxStream<'static, Result<Recorded>>> {
-        let shared = Arc::clone(&self.shared);
-        let mut cursor = from;
-        let mut woken = shared.notify.subscribe();
-        let poll_interval = shared.poll_interval;
-
-        let stream = async_stream::stream! {
-            loop {
-                // Before the batch, so advancing to it below cannot skip an
-                // event that landed in between.
-                let head = match head_shared(&shared).await {
-                    Ok(head) => head,
-                    Err(error) => {
-                        yield Err(error);
-                        return;
-                    }
-                };
-
-                let batch = read_all_shared(&shared, cursor, &filter, SUBSCRIBE_BATCH).await;
-                let batch = match batch {
-                    Ok(batch) => batch,
-                    Err(error) => {
-                        yield Err(error);
-                        return;
-                    }
-                };
-
-                let full = batch.len() == SUBSCRIBE_BATCH;
-                for recorded in batch {
-                    cursor = recorded.position;
-                    yield Ok(recorded);
-                }
-
-                if full {
-                    // Still behind. Read again rather than wait.
-                    continue;
-                }
-
-                // The filtered range is exhausted, so everything up to `head`
-                // has been looked at. Without this a narrow filter would leave
-                // the cursor at the last match and re-scan the same prefix on
-                // every poll, for ever.
-                cursor = cursor.max(head);
-
-                // Caught up. Wake on an in-process commit, or look again
-                // after the interval — which is what covers a writer in
-                // another process.
-                let _ = tokio::time::timeout(poll_interval, woken.changed()).await;
-            }
-        };
-
-        Ok(Box::pin(stream))
+        Ok(paged(
+            Arc::clone(&self.shared),
+            from,
+            filter,
+            Exhausted::Wait,
+        ))
     }
 
     async fn checkpoint_load(&self, consumer: &str) -> Result<Position> {
@@ -802,6 +881,25 @@ impl SqliteEventLog {
     pub fn runner_now<P: Projection>(&self, projection: P) -> ProjectionRunner<P> {
         self.runner(projection)
             .expect("a runner for a name that is not already live")
+    }
+
+    /// Everything with `position > from` that `filter` selects, in position
+    /// order, as a stream that ends when the range runs dry.
+    ///
+    /// This is [`EventLog::read_all`] with the cursor fed back in for you,
+    /// and nothing more: each page borrows a reader for one query and holds
+    /// nothing between pages, so a replay left half-consumed keeps no
+    /// connection, no statement and no read transaction. Two of them side by
+    /// side cost two queries at a time, not two readers for their lifetimes.
+    ///
+    /// The end is the first page that comes back short: the filtered range
+    /// was exhausted *as of that read*. An event committed after that page
+    /// was taken is not in the stream — a replay reports the log as it was,
+    /// and a caller that wants to keep going from there has
+    /// [`EventLog::subscribe`], which is this loop with waiting instead of
+    /// returning.
+    pub fn replay(&self, from: Position, filter: Filter) -> BoxStream<'static, Result<Recorded>> {
+        paged(Arc::clone(&self.shared), from, filter, Exhausted::End)
     }
 
     /// Make reads that filter on `meta.<key>` cheap.

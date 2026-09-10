@@ -7,6 +7,12 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Added
 
+- `SqliteEventLog::replay(from, filter)`: every selected event from `from`
+  as a stream that ends when the range runs dry. It is `read_all` paged with
+  the cursor fed back in — one borrowed reader per page, nothing held between
+  pages — and the same loop as `subscribe`, which waits where `replay`
+  returns.
+
 - `Filter::meta(key, value)`: a third read axis. A cross-stream read, a
   subscription and an export narrow on a `meta` key holding a scalar, ANDed
   with `kinds` and `streams`. An event without the key is out of the answer;

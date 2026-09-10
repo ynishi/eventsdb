@@ -48,6 +48,21 @@
 //! to be matched. A caller that renames a `meta` key has two names to filter
 //! by until the old rows are gone — which is a fact about the log, and the
 //! filter reports it rather than hiding it.
+//!
+//! # A read is a page; a stream is the page loop
+//!
+//! [`EventLog::read_all`] returns a `Vec` bounded by `limit`, and is
+//! exclusive on `from` so the position of the last event handled is the
+//! next call's `from`. That is the whole of the read contract: a page, and a
+//! cursor the caller owns. It is deliberately not a cursor the *log* owns —
+//! an open cursor on an embedded database is an open read transaction, and
+//! what that costs is the backend's to state, not this trait's to hide.
+//!
+//! Anything that reads more than a page is that call in a loop, and the
+//! loop is the same whether it ends when the range runs dry or waits there
+//! for more: [`EventLog::subscribe`] is the waiting form on this trait, and a
+//! backend may offer the ending form beside it. Neither holds anything
+//! between pages that `read_all` did not hold during one.
 
 use async_trait::async_trait;
 use futures_core::stream::BoxStream;
