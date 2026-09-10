@@ -3,7 +3,16 @@
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.0] - 2026-09-11
+
+A minor rather than a patch, for three independent reasons. `Guard` gains a
+variant, `Exported`, so an exhaustive `match` on it stops compiling. `Filter`,
+`OpenOptions`, `Guard` and `Completeness` become `#[non_exhaustive]`, so a
+struct literal of the first two outside the crate stops compiling as well —
+the Changed entry says what to write instead. And the schema moves to
+`user_version` 5: a file this release has opened is refused by 0.3.0, which
+does not write to a schema it does not know, so a downgrade needs the file
+from before the upgrade.
 
 ### Added
 
@@ -181,6 +190,7 @@ implemented and tested.
   and `retention`, against a file-backed log. Contention questions live in
   `tests/` instead, where a regression is a failure rather than a slower bar.
 
+[0.4.0]: https://github.com/ynishi/eventsdb/releases/tag/v0.4.0
 [0.3.0]: https://github.com/ynishi/eventsdb/releases/tag/v0.3.0
 [0.2.0]: https://github.com/ynishi/eventsdb/releases/tag/v0.2.0
 [0.1.1]: https://github.com/ynishi/eventsdb/releases/tag/v0.1.1
