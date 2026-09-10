@@ -3,7 +3,11 @@
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0] - 2026-09-10
+
+One crate joins the workspace and every version moves together, so the three are
+readable as one family on crates.io. Nothing in `eventsdb-core` or
+`eventsdb-sqlite` changed: their 0.2.0 is their 0.1.1 with a new number.
 
 ### Added
 
@@ -81,5 +85,6 @@ implemented and tested.
   and `retention`, against a file-backed log. Contention questions live in
   `tests/` instead, where a regression is a failure rather than a slower bar.
 
+[0.2.0]: https://github.com/ynishi/eventsdb/releases/tag/v0.2.0
 [0.1.1]: https://github.com/ynishi/eventsdb/releases/tag/v0.1.1
 [0.1.0]: https://github.com/ynishi/eventsdb/releases/tag/v0.1.0
