@@ -143,6 +143,16 @@ store forfeits both, which is why this one does not distribute.
     // Or follow it: catch up, then stay live.
     let mut events = log.subscribe(Position::BEGINNING, Filter::all())?;
 
+    // Or read all of it and stop: the same loop, ending where the log ends.
+    let mut history = log.replay(Position::BEGINNING, Filter::all());
+
+`read_all` is a page: `limit` bounds it and it is exclusive on `from`, so the
+last position handled is the next call's `from`. `replay` and `subscribe` are
+that call in a loop — each page borrows a reader for one query and nothing is
+held between pages, so a stream left half-consumed keeps no connection open
+and no read transaction pinning the WAL. `replay` ends at the first short
+page; `subscribe` waits there instead.
+
 A read narrows along three axes — `streams`, `kinds`, and `meta` keys — and
 combines them by AND. `meta` is equality on a scalar the caller wrote; an
 event without the key is out of the answer. The SQLite log indexes a key on
