@@ -344,9 +344,12 @@ async fn the_pragmas_survive_and_reclaim_still_works_on_the_copy() {
     restored.reclaim().await.unwrap();
 
     let free_after = pragma(&restored, "freelist_count").await;
-    assert!(
-        free_after < free_before,
-        "reclaim returned pages on the copy: free list went {free_before} -> {free_after}"
+    // To zero, not merely down: the pragma frees a page per step and this
+    // assertion once read `<`, which a single freed page satisfied — see
+    // `tests/tracing.rs`, whose `freed` field is what caught it.
+    assert_eq!(
+        free_after, 0,
+        "reclaim returned every page on the copy: free list went {free_before} -> {free_after}"
     );
     restored.shutdown().await.unwrap();
 }

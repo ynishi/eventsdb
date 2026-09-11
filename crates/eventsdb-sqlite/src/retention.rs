@@ -871,8 +871,21 @@ impl SqliteEventLog {
                         // nothing with the feature off — see
                         // [`trace::freelist_count`].
                         let before = trace::freelist_count(conn);
-                        conn.execute_batch("PRAGMA incremental_vacuum;")
-                            .map_err(classify)?;
+                        // Stepped to the end, not executed once. SQLite
+                        // compiles this pragma as a loop that frees one page
+                        // and then yields a row — `OP_IncrVacuum`,
+                        // `OP_ResultRow`, back to the top — so every
+                        // `sqlite3_step` is one page, and a caller that
+                        // steps once, which is what `execute_batch` does,
+                        // frees one page and returns. The row carries no
+                        // columns; it is the pragma's way of saying "again".
+                        {
+                            let mut statement = conn
+                                .prepare("PRAGMA incremental_vacuum")
+                                .map_err(classify)?;
+                            let mut steps = statement.query([]).map_err(classify)?;
+                            while steps.next().map_err(classify)?.is_some() {}
+                        }
                         Ok(before - trace::freelist_count(conn))
                     })())
                 })

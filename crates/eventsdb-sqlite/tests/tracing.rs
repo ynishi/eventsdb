@@ -640,22 +640,23 @@ async fn the_reclaim_span_counts_the_pages_it_freed() {
     assert_eq!(reclaim.len(), 1);
     assert_eq!(reclaim[0].level, Level::DEBUG);
     let freed: i64 = reclaim[0].field("freed").unwrap().parse().unwrap();
-    assert!(freed > 0, "the vacuum gave pages back: {freed}");
     assert_eq!(
         freed,
         before - after,
         "`freed` is the free list's own arithmetic: {before} -> {after}"
     );
+    // The pragma with no count frees every page on the list, and one call
+    // is the whole pragma — not one step of it. This is the assertion that
+    // caught `reclaim` freeing a single page per call.
+    assert_eq!(freed, before, "one call is the whole vacuum");
+    assert_eq!(after, 0);
 
-    // A second pass, and the field is the same arithmetic again, whatever
-    // the first pass left.
-    let before = freelist(&log).await;
+    // A second pass has nothing to give back, and the span says so rather
+    // than staying silent.
     log.reclaim().await.unwrap();
-    let after = freelist(&log).await;
     let reclaim = captured.spans("eventsdb.reclaim");
     assert_eq!(reclaim.len(), 2);
-    let second: i64 = reclaim[1].field("freed").unwrap().parse().unwrap();
-    assert_eq!(second, before - after);
+    assert_eq!(reclaim[1].field("freed"), Some("0"));
 }
 
 /// `PRAGMA freelist_count`, through the hatch.
