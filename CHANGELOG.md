@@ -7,6 +7,63 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Added
 
+- **The store runs the archive loop.**
+  `SqliteEventLog::archive_then_retain(plan, sink, page)` exports everything
+  `plan` would remove, hands each page to a `Sink`, confirms that page's
+  receipt only once the sink's write has returned, and then applies the plan
+  under `Guard::Exported`. What the caller supplies is the sink. The paging,
+  the confirming, the cursor and the stopping — four of the seven lines the
+  README used to show — are the store's, and so is the order between them,
+  which was the half a caller could get wrong while holding a guard that
+  could not stop it.
+
+  A sink error returns unchanged with that page's receipt unconfirmed:
+  nothing is removed, `exported_through()` is where the last confirmed page
+  left it, and the plan was never applied at all. That is what makes the next
+  call a resume rather than a restart — it starts at `exported_through()`, so
+  a page already in the chain is not written to a sink twice — and a process
+  that dies between a confirmation and the removal loses nothing either,
+  because the next call exports nothing and applies the plan. The guard is
+  fixed at `Guard::Exported` rather than taken as an argument: one the caller
+  could lower is the misuse this exists to remove. It still refuses to
+  overrun a registered consumer, and that refusal arriving after the export
+  landed wastes nothing, since the chain stays where the confirmations put
+  it.
+
+  `Sink` is an async trait — `async fn write(&mut self, page: &[ExportedEvent])`
+  — because the sink worth having imports into another log and
+  `EventLog::import` is async; a sink over a blocking writer is an `async fn`
+  that never awaits. Two ship, in `eventsdb-core` beside `ExportedEvent`
+  rather than in the backend, since neither needs SQLite for anything:
+  `JsonLinesSink` over any `std::io::Write`, flushed at the end of every page
+  because the receipt is confirmed the moment the write returns, and
+  `LogSink` over any `&EventLog`, which keeps the receiving log's
+  `ImportReport` per page so that `reproduced_coordinates()` can say whether
+  the archive is the same log rather than merely the same events. Both are
+  re-exported from `eventsdb-sqlite`.
+
+  What is exported is everything from `exported_through()` up to **the
+  highest position the plan would remove**, under `Filter::all()` — whole
+  pages, since a filtered receipt does not extend the chain `Guard::Exported`
+  walks. For `Plan::Before` that is the prefix the plan already is.
+  `Plan::OlderThan` and `Plan::Streams` remove a scattered set while the
+  chain is a prefix, so the export runs past events they will not remove;
+  over-exporting is safe and a chain with holes is the thing retention
+  refuses. That reach is read once off a reader and deliberately not in one
+  transaction with the export: a `Before` cannot grow, because positions are
+  allocated in increasing order and never reused, and where the other two can
+  — a backfilled timestamp, an append to a named stream — the plan
+  re-evaluated under the write lock reaches past the chain and the guard
+  refuses with `NotExported`. A refusal, never a removal of something no sink
+  was shown.
+
+  The ledger row an archive writes reads `archive-then-remove: <plan>`, so a
+  reader of the ledger can tell a removal that preserved first from one that
+  did not; a plain `retain` writes what it always wrote. `Plan`'s doc named
+  an archive-then-remove *variant* as the obvious next one, and that variant
+  does not fit: a `Plan` is `Clone + Debug` and is stored in the ledger as a
+  string, and a sink is none of those things. The doc names the method.
+
 - **A projection can follow the log instead of being polled.**
   `ProjectionRunner::follow` catches up, waits for the next commit, and catches
   up again, returning only on error. The wait is the one `subscribe` already
