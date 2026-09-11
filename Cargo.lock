@@ -242,7 +242,7 @@ dependencies = [
 
 [[package]]
 name = "eventsdb"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "eventsdb-core",
  "eventsdb-sqlite",
@@ -250,7 +250,7 @@ dependencies = [
 
 [[package]]
 name = "eventsdb-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "futures-core",
@@ -261,7 +261,7 @@ dependencies = [
 
 [[package]]
 name = "eventsdb-sqlite"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-stream",
  "async-trait",

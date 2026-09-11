@@ -5,6 +5,22 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-12
+
+A minor rather than a patch, and this time nothing in it breaks a caller. Every
+entry below is an addition — six, each closing an issue opened against 0.5.0 —
+and the one type that grew a field, `Filter`, is `#[non_exhaustive]`, so its
+fourth axis lands without touching a struct literal outside the crate. The
+number still moves by a minor because the only patch this project has cut,
+0.1.1, shipped sources identical to the release before it, and a patch that
+carried five new methods, a fourth read axis, a new way to run a projection, a
+physical copy, and a feature flag would read as a fix to 0.5.0 when 0.5.0
+needed none. Two additions are manifest-level and stated on their own:
+`rusqlite`'s `backup` feature is now on, which pulls no native code the
+amalgamation was not already building, and `tracing` 0.1 is an optional
+dependency behind a feature that is off by default and out of the graph when
+it is. Neither moves the MSRV from 1.85.
+
 ### Added
 
 - **The store can be watched.** A `tracing` feature on `eventsdb-sqlite`, off
@@ -620,7 +636,8 @@ implemented and tested.
   and `retention`, against a file-backed log. Contention questions live in
   `tests/` instead, where a regression is a failure rather than a slower bar.
 
-[Unreleased]: https://github.com/ynishi/eventsdb/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/ynishi/eventsdb/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/ynishi/eventsdb/releases/tag/v0.6.0
 [0.5.0]: https://github.com/ynishi/eventsdb/releases/tag/v0.5.0
 [0.4.0]: https://github.com/ynishi/eventsdb/releases/tag/v0.4.0
 [0.3.0]: https://github.com/ynishi/eventsdb/releases/tag/v0.3.0
