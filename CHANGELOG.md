@@ -53,6 +53,22 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Fixed
 
+- **Opening a file another connection is holding waits `busy_timeout` instead
+  of failing at once.** Two opens of the same fresh file could hand one of
+  them `Error::Busy` in well under a millisecond, whatever timeout the caller
+  had set — which is the opposite of what setting one says. The statement that
+  lost is `PRAGMA journal_mode = WAL`: it reads the header's version bytes
+  under a shared lock and then writes them, and a read promoted to a write
+  inside one statement is the case `sqlite3_busy_handler` documents as exempt,
+  because invoking the handler there could leave two connections each waiting
+  for the other. SQLite returns `SQLITE_BUSY` immediately and expects the
+  loser to let go and try again, which is now what `apply_pragmas` does:
+  the batch is retried, backing off from 1 ms to 50 ms, until it succeeds or
+  `busy_timeout` has passed from the first attempt, and then the last failure
+  is returned. The timeout stays the bound — nothing waits longer than the
+  caller asked — and a file already in WAL finds the version bytes set and
+  never reaches the write, so nothing about it changes.
+
 - **The hatch no longer refuses `PRAGMA table_info(events)`.** The authorizer
   denied any pragma SQLite handed it a value for, while the documentation
   promised that only *setting* one was refused. SQLite passes a pragma's
