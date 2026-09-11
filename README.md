@@ -340,9 +340,12 @@ yourself" a reasonable thing to ask.
         Ok(())
     }).await?;
 
-`query` answers in JSON, and turning a SQLite cell into JSON is not lossless —
-the rustdoc says which cells lose what, so a value that arrives is not always
-the column's contents.
+`query` answers in JSON, and a few SQLite cells have no JSON value at all. It
+refuses those rather than handing over a stand-in: the error names the column
+and the SQL that gets the value through — `hex(col)` for a blob, `CAST(col AS
+TEXT)` for an infinite real. `query_with` can be told to take the substitute
+instead, per statement, and the rustdoc on `QueryOptions::lossy` is the table
+of what each cell becomes.
 
 Your tables, your SQL, your schema, committed or rolled back with everything
 else in that transaction. Inside a projection you already have this — `apply`

@@ -8,7 +8,7 @@
 
 use eventsdb_core::error::{Error, Result};
 use eventsdb_core::{EventLog, EventStore, Filter, Position};
-use eventsdb_sqlite::{Guard, Plan, SqliteEventLog};
+use eventsdb_sqlite::{Guard, Plan, QueryOptions, SqliteEventLog};
 use serde_json::{json, Map, Value};
 
 fn event(kind: &str) -> Map<String, Value> {
@@ -421,4 +421,158 @@ async fn query_reads_the_stored_shape_across_the_whole_database() {
     assert_eq!(rows[0]["stream"], json!("a"));
     assert_eq!(rows[0]["n"], json!(2));
     assert_eq!(rows[1]["n"], json!(5));
+}
+
+/// A caller table holding one `TEXT` cell that is not valid UTF-8, and the
+/// proof SQLite really did store it as `TEXT` rather than as a blob.
+async fn text_that_is_not_utf8() -> SqliteEventLog {
+    let log = seeded().await;
+    log.with_transaction(|tx| {
+        tx.execute_batch(
+            "CREATE TABLE raw (t TEXT);
+             INSERT INTO raw (t) VALUES (CAST(x'ff' AS TEXT));",
+        )
+        .map_err(sql_error)
+    })
+    .await
+    .unwrap();
+
+    let kind = log
+        .query("SELECT typeof(t) AS k FROM raw", Vec::new())
+        .await
+        .unwrap();
+    assert_eq!(kind[0]["k"], json!("text"), "the cell has to be TEXT");
+    log
+}
+
+#[tokio::test]
+async fn query_refuses_a_blob_and_names_the_sql_that_gets_it() {
+    let log = seeded().await;
+    let error = log
+        .query("SELECT x'00ff' AS b", Vec::new())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Unsupported(_)), "got {error}");
+    let message = error.to_string();
+    assert!(message.contains('b'), "got {message}");
+    assert!(message.contains("hex("), "got {message}");
+}
+
+#[tokio::test]
+async fn query_refuses_a_non_finite_real_and_names_the_sql_that_gets_it() {
+    let log = seeded().await;
+    let error = log
+        .query("SELECT 1e999 AS r", Vec::new())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Unsupported(_)), "got {error}");
+    let message = error.to_string();
+    assert!(message.contains('r'), "got {message}");
+    assert!(message.contains("CAST("), "got {message}");
+}
+
+#[tokio::test]
+async fn query_refuses_text_that_is_not_utf8() {
+    let log = text_that_is_not_utf8().await;
+    let error = log
+        .query("SELECT t FROM raw", Vec::new())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Unsupported(_)), "got {error}");
+    assert!(error.to_string().contains("UTF-8"), "got {error}");
+}
+
+#[tokio::test]
+async fn query_refuses_to_bind_an_integer_above_i64_max() {
+    let log = seeded().await;
+    let error = log
+        .query("SELECT ?1 AS n", vec![json!(u64::MAX)])
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Validation(_)), "got {error}");
+
+    // A bind is not a read, so `lossy` does not reach it.
+    let still = log
+        .query_with(
+            "SELECT ?1 AS n",
+            vec![json!(u64::MAX)],
+            QueryOptions::default().lossy(true),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(still, Error::Validation(_)), "got {still}");
+}
+
+#[tokio::test]
+async fn lossy_answers_with_what_sql_itself_renders() {
+    let log = seeded().await;
+    let lossy = QueryOptions::default().lossy(true);
+
+    let blob = log
+        .query_with("SELECT x'00ff' AS c", Vec::new(), lossy.clone())
+        .await
+        .unwrap();
+    let hex = log
+        .query("SELECT hex(x'00ff') AS c", Vec::new())
+        .await
+        .unwrap();
+    assert_eq!(blob[0]["c"], hex[0]["c"]);
+    assert_eq!(blob[0]["c"], json!("00FF"));
+
+    let plus = log
+        .query_with("SELECT 1e999 AS c", Vec::new(), lossy.clone())
+        .await
+        .unwrap();
+    let cast_plus = log
+        .query("SELECT CAST(1e999 AS TEXT) AS c", Vec::new())
+        .await
+        .unwrap();
+    assert_eq!(plus[0]["c"], cast_plus[0]["c"]);
+    assert_eq!(plus[0]["c"], json!("Inf"));
+
+    let minus = log
+        .query_with("SELECT -1e999 AS c", Vec::new(), lossy)
+        .await
+        .unwrap();
+    let cast_minus = log
+        .query("SELECT CAST(-1e999 AS TEXT) AS c", Vec::new())
+        .await
+        .unwrap();
+    assert_eq!(minus[0]["c"], cast_minus[0]["c"]);
+    assert_eq!(minus[0]["c"], json!("-Inf"));
+}
+
+#[tokio::test]
+async fn lossy_replaces_the_invalid_sequences_in_text() {
+    let log = text_that_is_not_utf8().await;
+    let rows = log
+        .query_with(
+            "SELECT t FROM raw",
+            Vec::new(),
+            QueryOptions::default().lossy(true),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows[0]["t"],
+        json!(String::from_utf8_lossy(&[0xff]).into_owned())
+    );
+}
+
+#[tokio::test]
+async fn the_cells_that_have_a_json_value_are_untouched_either_way() {
+    let log = seeded().await;
+    let sql = "SELECT NULL AS a, 7 AS b, 1.5 AS c, 'text' AS d";
+
+    let strict = log.query(sql, Vec::new()).await.unwrap();
+    let lossy = log
+        .query_with(sql, Vec::new(), QueryOptions::default().lossy(true))
+        .await
+        .unwrap();
+
+    assert_eq!(strict, lossy);
+    assert_eq!(strict[0]["a"], json!(null));
+    assert_eq!(strict[0]["b"], json!(7));
+    assert_eq!(strict[0]["c"], json!(1.5));
+    assert_eq!(strict[0]["d"], json!("text"));
 }
