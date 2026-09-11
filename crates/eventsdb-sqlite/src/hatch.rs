@@ -239,15 +239,78 @@ fn denied() -> Error {
     ))
 }
 
+/// What one statement through the hatch is allowed to do.
+///
+/// `#[non_exhaustive]`, so an option can be added without breaking a caller.
+/// Start from [`QueryOptions::default`] and set what differs through the
+/// methods — `QueryOptions::default().lossy(true)` — or assign the public
+/// fields; only the struct literal is reserved.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default)]
+pub struct QueryOptions {
+    /// A deadline for the statement, as [`SqliteEventLog::query_timeout`]
+    /// gives it. `None` is no deadline.
+    pub timeout: Option<Duration>,
+    /// Accept a substitute for a cell that has no JSON value, instead of
+    /// refusing it.
+    ///
+    /// Strict is the default because a hatch answering with a stand-in is a
+    /// hatch whose answers cannot be trusted while debugging, which is what it
+    /// is for. What each cell does under either setting:
+    ///
+    /// ```text
+    /// cell             strict (default)                    lossy
+    /// ---------------  ----------------------------------  ---------------------------------
+    /// BLOB             Unsupported: <col>, use hex(<col>)  String, the bytes as hex(<col>)
+    /// REAL +-Inf       Unsupported: <col>, use CAST        String "Inf" / "-Inf", as CAST(<col> AS TEXT)
+    /// TEXT not UTF-8   Unsupported: <col>                  String, from_utf8_lossy
+    /// bind > i64::MAX  Validation                          Validation (a bind is not a read)
+    /// ```
+    ///
+    /// A substitute is the same bytes SQL itself would have rendered, so the
+    /// strict error's advice and this path agree: `hex()` in uppercase, `Inf`
+    /// and `-Inf` as `CAST(x AS TEXT)` writes them.
+    ///
+    /// **Nothing marks a substituted cell.** It arrives as a
+    /// [`Value::String`], indistinguishable from a `TEXT` cell holding the
+    /// same characters. `serde_json::Value` is not this crate's type, so there
+    /// is nowhere to put a tag that would not be a shape this conversion never
+    /// otherwise produces — and the caller who set `lossy` is the one who
+    /// knows which columns they meant.
+    pub lossy: bool,
+}
+
+impl QueryOptions {
+    /// A deadline for the statement; see the field.
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    /// Substitute rather than refuse a cell that has no JSON value; see the
+    /// field for what each one becomes.
+    pub fn lossy(mut self, lossy: bool) -> Self {
+        self.lossy = lossy;
+        self
+    }
+}
+
 /// Run a read-only statement and return its rows as JSON objects.
 ///
 /// The check is SQLite's own `sqlite3_stmt_readonly`, not a scan of the text:
 /// a denylist of keywords is a guess about a parser, and this is the parser's
 /// answer.
+///
+/// The rows are walked rather than run through `query_map`, because a refusal
+/// from [`sql_to_json`] is this crate's [`Error`] and the closure `query_map`
+/// takes can only carry a [`rusqlite::Error`] out. Wrapping one in the other
+/// would reach [`classify`] and come back as [`Error::Storage`] — the word for
+/// the database failing, which a cell that has no JSON value is not.
 pub(crate) fn query_rows(
     conn: &Connection,
     sql: &str,
     params: Vec<Value>,
+    lossy: bool,
 ) -> Result<Vec<Map<String, Value>>> {
     let stmt = conn.prepare(sql).map_err(classify)?;
     if !stmt.readonly() {
@@ -265,24 +328,22 @@ pub(crate) fn query_rows(
         .into_iter()
         .map(str::to_string)
         .collect();
-    let bound: Vec<Box<dyn rusqlite::ToSql>> = params.into_iter().map(bind_value).collect();
+    let bound = params
+        .into_iter()
+        .map(bind_value)
+        .collect::<Result<Vec<Box<dyn rusqlite::ToSql>>>>()?;
 
-    let rows = stmt
-        .query_map(
-            rusqlite::params_from_iter(bound.iter().map(|p| p.as_ref())),
-            |row| {
-                let mut out = Map::new();
-                for (index, name) in names.iter().enumerate() {
-                    out.insert(name.clone(), sql_to_json(row, index)?);
-                }
-                Ok(out)
-            },
-        )
+    let mut rows = stmt
+        .query(rusqlite::params_from_iter(bound.iter().map(|p| p.as_ref())))
         .map_err(classify)?;
 
     let mut out = Vec::new();
-    for item in rows {
-        out.push(item.map_err(classify)?);
+    while let Some(row) = rows.next().map_err(classify)? {
+        let mut object = Map::new();
+        for (index, name) in names.iter().enumerate() {
+            object.insert(name.clone(), sql_to_json(row, index, name, lossy)?);
+        }
+        out.push(object);
     }
     Ok(out)
 }
@@ -290,35 +351,104 @@ pub(crate) fn query_rows(
 /// Bind a JSON parameter. Arrays and objects go as their text, which is what
 /// `json_extract` and friends expect anyway.
 ///
-/// Where this loses information is stated with the conversions in the other
-/// direction, on [`SqliteEventLog::query`].
-pub(crate) fn bind_value(value: Value) -> Box<dyn rusqlite::ToSql> {
-    match value {
+/// A JSON integer above `i64::MAX` is refused rather than rounded: SQLite's
+/// `INTEGER` is an `i64` and there is nothing wider to bind it to, so the only
+/// alternative is an `f64` that compares equal to neighbours it is not. A bind
+/// is not a read, so [`QueryOptions::lossy`] does not reach this — the table
+/// there says so.
+pub(crate) fn bind_value(value: Value) -> Result<Box<dyn rusqlite::ToSql>> {
+    Ok(match value {
         Value::Null => Box::new(Option::<String>::None),
         Value::Bool(b) => Box::new(b),
         Value::Number(n) => match n.as_i64() {
             Some(i) => Box::new(i),
+            // `is_u64` is what separates "too large for `i64`" from a JSON
+            // float, which still binds as an `f64`.
+            None if n.is_u64() => {
+                return Err(Error::Validation(format!(
+                    "{n} is above i64::MAX and SQLite's INTEGER is an i64, so it \
+                     cannot be bound as one. Bind it as a string and compare \
+                     against text, or narrow the value before binding"
+                )))
+            }
             None => Box::new(n.as_f64().unwrap_or(0.0)),
         },
         Value::String(s) => Box::new(s),
         other => Box::new(other.to_string()),
-    }
+    })
 }
 
 /// One cell of a result row as JSON.
 ///
-/// [`SqliteEventLog::query`] states what each SQLite type becomes and which of
-/// those conversions lose something; this is the code that performs them, and
-/// the two have to agree.
-pub(crate) fn sql_to_json(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Value> {
+/// Three cells have no JSON value, and under `lossy == false` each is refused
+/// by name with the SQL that gets it through.
+/// [`QueryOptions::lossy`] carries the table of what either setting does; this
+/// is the code that performs it, and the two have to agree.
+pub(crate) fn sql_to_json(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+    column: &str,
+    lossy: bool,
+) -> Result<Value> {
     use rusqlite::types::ValueRef;
-    Ok(match row.get_ref(index)? {
+    Ok(match row.get_ref(index).map_err(classify)? {
         ValueRef::Null => Value::Null,
         ValueRef::Integer(i) => Value::from(i),
-        ValueRef::Real(f) => Value::from(f),
-        ValueRef::Text(t) => Value::String(String::from_utf8_lossy(t).into_owned()),
-        ValueRef::Blob(_) => Value::String("<blob>".to_string()),
+        ValueRef::Real(f) if f.is_finite() => Value::from(f),
+        // `Value::from(f64)` answers `Null` for a non-finite number, which
+        // cannot be told apart from a real `NULL`. Stored data reaches here
+        // and not only an expression: `9e999` is a literal SQLite keeps and
+        // reads back as `real`. NaN does not, because SQLite stores it as
+        // `NULL`.
+        ValueRef::Real(f) => {
+            if !lossy {
+                return Err(Error::Unsupported(format!(
+                    "column `{column}` holds a non-finite REAL, which JSON has no \
+                     number for. Select `CAST({column} AS TEXT)` for what SQL \
+                     renders, or set `QueryOptions::lossy`"
+                )));
+            }
+            Value::String(infinity_as_text(f))
+        }
+        ValueRef::Text(t) => match std::str::from_utf8(t) {
+            Ok(text) => Value::String(text.to_string()),
+            Err(_) if lossy => Value::String(String::from_utf8_lossy(t).into_owned()),
+            Err(_) => {
+                return Err(Error::Unsupported(format!(
+                    "column `{column}` holds TEXT that is not valid UTF-8, and a \
+                     JSON string is UTF-8. Set `QueryOptions::lossy` to take it \
+                     with the invalid sequences replaced"
+                )))
+            }
+        },
+        ValueRef::Blob(bytes) => {
+            if !lossy {
+                return Err(Error::Unsupported(format!(
+                    "column `{column}` holds a BLOB, which JSON has no value for. \
+                     Select `hex({column})` for the bytes, or set \
+                     `QueryOptions::lossy`"
+                )));
+            }
+            Value::String(hex(bytes))
+        }
     })
+}
+
+/// The bytes as SQLite's `hex()` writes them: two uppercase digits each, in
+/// order, nothing between.
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        // Writing to a `String` cannot fail.
+        let _ = write!(out, "{byte:02X}");
+    }
+    out
+}
+
+/// A non-finite `REAL` as `CAST(x AS TEXT)` renders it: `Inf` or `-Inf`.
+fn infinity_as_text(f: f64) -> String {
+    if f.is_sign_negative() { "-Inf" } else { "Inf" }.to_string()
 }
 
 impl SqliteEventLog {
@@ -332,25 +462,18 @@ impl SqliteEventLog {
     /// chain is Rust and the query is SQLite's. A statement reading across a
     /// schema change reads the versions it finds.
     ///
-    /// **What a cell becomes, and where that loses something.** `NULL` becomes
-    /// `null`, an `INTEGER` a JSON integer, a finite `REAL` a JSON number, and
-    /// `TEXT` a JSON string. The rest do not arrive intact, and nothing in the
-    /// value that does arrive says so:
+    /// **What a cell becomes, and what is refused.** `NULL` becomes `null`, an
+    /// `INTEGER` a JSON integer, a finite `REAL` a JSON number, and `TEXT` a
+    /// JSON string. A cell with no JSON value — a `BLOB`, a non-finite `REAL`,
+    /// `TEXT` that is not UTF-8 — is **refused**, as [`Error::Unsupported`]
+    /// naming the column and the SQL that gets the value through, rather than
+    /// answered with a stand-in nothing in the result says is one. On the way
+    /// in, a JSON integer above `i64::MAX` is [`Error::Validation`] for the
+    /// same reason.
     ///
-    /// - a `BLOB` becomes the string `"<blob>"`. The bytes are gone, and the
-    ///   result cannot be told apart from a `TEXT` cell holding those seven
-    ///   characters.
-    /// - a non-finite `REAL` — `±Inf` — becomes `null`, because
-    ///   `serde_json::Value::from(f64)` maps a non-finite number to `Null`, so
-    ///   it cannot be told apart from a real `NULL`. Stored data reaches this
-    ///   and not only an expression: `9e999` is a literal SQLite keeps and
-    ///   reads back as `real`. NaN does not reach it, because SQLite stores
-    ///   NaN as `NULL`.
-    /// - `TEXT` that is not valid UTF-8 goes through `String::from_utf8_lossy`,
-    ///   which substitutes rather than refuses.
-    /// - on the way in, a JSON integer too large for `i64` is bound as an
-    ///   `f64`: SQLite's `INTEGER` is an `i64`, and there is nothing wider to
-    ///   bind it to.
+    /// [`SqliteEventLog::query_with`] with [`QueryOptions::lossy`] takes the
+    /// substitute instead, per statement; the table of what each cell becomes
+    /// under either setting is on that field.
     ///
     /// The authorizer runs here too, and not only as belt-and-braces:
     /// `sqlite3_stmt_readonly` reports `ATTACH` and `DETACH` as read-only —
@@ -358,7 +481,8 @@ impl SqliteEventLog {
     /// contents — so the readonly gate alone would let a caller attach a
     /// database to the long-lived connection and keep it there.
     pub async fn query(&self, sql: &str, params: Vec<Value>) -> Result<Vec<Map<String, Value>>> {
-        self.query_within(sql, params, None).await
+        self.query_within(sql, params, QueryOptions::default())
+            .await
     }
 
     /// [`SqliteEventLog::query`] with a deadline.
@@ -380,29 +504,53 @@ impl SqliteEventLog {
         params: Vec<Value>,
         timeout: Duration,
     ) -> Result<Vec<Map<String, Value>>> {
-        self.query_within(sql, params, Some(timeout)).await
+        self.query_within(sql, params, QueryOptions::default().timeout(timeout))
+            .await
+    }
+
+    /// [`SqliteEventLog::query`] with the options set per statement.
+    ///
+    /// [`SqliteEventLog::query`] is this with [`QueryOptions::default`] and
+    /// [`SqliteEventLog::query_timeout`] is it with the deadline set; nothing
+    /// else about the call differs. The only option that changes an answer
+    /// rather than a bound is [`QueryOptions::lossy`], and the table on that
+    /// field is what it changes.
+    ///
+    /// Per statement rather than per log: whoever reaches for this knows that
+    /// *this* column is binary, which is not something the log can be told
+    /// once. It is on the log and not on [`crate::SqliteEventStore`] — the
+    /// handle's `query` is [`eventsdb_core::EventStore`]'s, and the trait
+    /// stays strict.
+    pub async fn query_with(
+        &self,
+        sql: &str,
+        params: Vec<Value>,
+        options: QueryOptions,
+    ) -> Result<Vec<Map<String, Value>>> {
+        self.query_within(sql, params, options).await
     }
 
     async fn query_within(
         &self,
         sql: &str,
         params: Vec<Value>,
-        timeout: Option<Duration>,
+        options: QueryOptions,
     ) -> Result<Vec<Map<String, Value>>> {
         let shared = self.shared_handle();
         let sql = sql.to_string();
+        let lossy = options.lossy;
         let job = move |conn: &mut Connection| {
             Ok(guarded(
                 conn,
                 Arc::new(AtomicBool::new(false)),
-                move |conn| query_rows(conn, &sql, params),
+                move |conn| query_rows(conn, &sql, params, lossy),
             ))
         };
 
         // A reader: `query` only reads, and running it on the writer is what
         // let one expensive statement stall every append.
         let isle = shared.reader();
-        let outcome = match timeout {
+        let outcome = match options.timeout {
             Some(timeout) => isle.call_timeout(timeout, job).await,
             None => isle.call(job).await,
         };

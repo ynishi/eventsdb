@@ -599,7 +599,7 @@ impl EventStore for SqliteEventStore {
             Ok(crate::hatch::guarded(
                 conn,
                 Arc::new(AtomicBool::new(false)),
-                move |conn| crate::hatch::query_rows(conn, &sql, params),
+                move |conn| crate::hatch::query_rows(conn, &sql, params, false),
             ))
         })
         .await
@@ -621,7 +621,7 @@ impl EventStore for SqliteEventStore {
             Ok(crate::hatch::guarded(
                 conn,
                 Arc::new(AtomicBool::new(false)),
-                move |conn| crate::hatch::query_rows(conn, &sql, params),
+                move |conn| crate::hatch::query_rows(conn, &sql, params, false),
             ))
         };
 
