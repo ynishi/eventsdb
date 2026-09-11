@@ -39,6 +39,9 @@ mod store;
 mod transfer;
 mod txn;
 
+/// Re-exported so a caller binding named parameters into `query` does not
+/// have to name `eventsdb-core` as a dependency of its own.
+pub use eventsdb_core::Params;
 pub use hatch::{QueryOptions, READ_ONLY_PRAGMAS, RESERVED_TABLES};
 pub use log::{OpenOptions, SqliteEventLog, DEFAULT_BUSY_TIMEOUT, DEFAULT_POLL_INTERVAL};
 pub use project::{Projection, ProjectionRunner, DEFAULT_BATCH};

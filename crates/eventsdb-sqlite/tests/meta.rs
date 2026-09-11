@@ -268,7 +268,7 @@ async fn a_key_with_punctuation_names_a_key_not_a_path() {
         .query(
             "SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'events_meta_%' \
              ORDER BY name",
-            vec![],
+            Vec::<Value>::new(),
         )
         .await
         .unwrap();

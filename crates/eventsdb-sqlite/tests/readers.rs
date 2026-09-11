@@ -146,7 +146,7 @@ async fn a_reader_cannot_write() {
     // `query` runs on a reader, and refuses a writing statement before it gets
     // there — but the connection would refuse it too.
     let error = log
-        .query("DELETE FROM events", Vec::new())
+        .query("DELETE FROM events", Vec::<Value>::new())
         .await
         .unwrap_err();
     assert!(matches!(error, Error::Unsupported(_)), "got {error}");
@@ -203,7 +203,7 @@ async fn a_slow_read_does_not_block_another_read() {
     log.stream_handle("s").append(event("a")).await.unwrap();
 
     let busy = Arc::clone(&log);
-    let slow = tokio::spawn(async move { busy.query(SLOW, Vec::new()).await });
+    let slow = tokio::spawn(async move { busy.query(SLOW, Vec::<Value>::new()).await });
 
     tokio::time::sleep(Duration::from_millis(40)).await;
 

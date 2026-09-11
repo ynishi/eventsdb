@@ -327,6 +327,13 @@ pub trait EventStore: Send + Sync {
     /// deliberately never rewrites or parses what it is given — the read-only
     /// check above is SQLite's answer about your text, not a reading of it.
     ///
+    /// **Parameters are positional here, and only here.** SQLite binds by name
+    /// as well, and [`crate::Params`] is how a backend's own `query` offers
+    /// both — but this trait is used as `Box<dyn EventStore>`, a dispatchable
+    /// method may not have type parameters, and argument-position `impl Trait`
+    /// is one. So the trait takes the `Vec` and a caller wanting `:name` calls
+    /// the concrete log.
+    ///
     /// The default refuses, because a store that is not a database has no
     /// answer to give.
     async fn query(&self, sql: &str, params: Vec<Value>) -> Result<Vec<Map<String, Value>>> {

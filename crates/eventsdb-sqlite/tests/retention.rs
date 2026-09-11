@@ -68,7 +68,7 @@ impl Projection for Counter {
 
 async fn counted(log: &SqliteEventLog) -> Option<i64> {
     let rows = log
-        .query("SELECT n FROM counted WHERE id = 1", Vec::new())
+        .query("SELECT n FROM counted WHERE id = 1", Vec::<Value>::new())
         .await
         .unwrap();
     rows.first().map(|r| r["n"].as_i64().unwrap())
@@ -406,7 +406,7 @@ async fn the_ledger_outlives_the_events_it_describes() {
     let rows = log
         .query(
             "SELECT plan, removed_count, highest_removed FROM retention ORDER BY id",
-            Vec::new(),
+            Vec::<Value>::new(),
         )
         .await
         .unwrap();

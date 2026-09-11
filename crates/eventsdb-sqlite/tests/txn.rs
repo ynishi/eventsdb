@@ -42,7 +42,10 @@ async fn an_append_and_a_caller_row_land_together() {
     .unwrap();
 
     let rows = log
-        .query("SELECT position, stream FROM order_index", Vec::new())
+        .query(
+            "SELECT position, stream FROM order_index",
+            Vec::<Value>::new(),
+        )
         .await
         .unwrap();
     assert_eq!(rows.len(), 1);
@@ -84,7 +87,7 @@ async fn an_error_rolls_back_the_append_as_well_as_the_row() {
         .unwrap()
         .is_empty());
     assert!(log
-        .query("SELECT k FROM side", Vec::new())
+        .query("SELECT k FROM side", Vec::<Value>::new())
         .await
         .unwrap()
         .is_empty());
@@ -139,7 +142,7 @@ async fn a_derived_row_can_be_keyed_on_the_real_position() {
         .unwrap();
 
     let rows = log
-        .query("SELECT position, seq FROM derived", Vec::new())
+        .query("SELECT position, seq FROM derived", Vec::<Value>::new())
         .await
         .unwrap();
     assert_eq!(

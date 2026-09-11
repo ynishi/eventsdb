@@ -324,7 +324,7 @@ async fn a_deadline_interrupts_an_expensive_statement() {
                    WHERE x < 1000000000) SELECT count(*) FROM c";
 
     let error = log
-        .query_timeout(runaway, Vec::new(), Duration::from_millis(150))
+        .query_timeout(runaway, Vec::<Value>::new(), Duration::from_millis(150))
         .await
         .unwrap_err();
     assert!(
@@ -388,7 +388,7 @@ async fn a_deadline_that_is_not_reached_returns_normally() {
     let rows: Vec<Map<String, Value>> = log
         .query_timeout(
             "SELECT count(*) AS n FROM events",
-            Vec::new(),
+            Vec::<Value>::new(),
             Duration::from_secs(5),
         )
         .await

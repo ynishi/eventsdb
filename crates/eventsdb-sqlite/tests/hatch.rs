@@ -98,7 +98,7 @@ async fn an_error_rolls_the_whole_transaction_back() {
     assert!(error.to_string().contains("changed my mind"), "got {error}");
 
     // The table was created *and* rolled back, so it is not there at all.
-    let missing = log.query("SELECT k FROM half", Vec::new()).await;
+    let missing = log.query("SELECT k FROM half", Vec::<Value>::new()).await;
     assert!(missing.is_err(), "the table should not exist");
 }
 
@@ -241,7 +241,7 @@ async fn a_stream_handles_sql_is_gated_exactly_as_the_logs_is() {
         "DELETE FROM events",
         "PRAGMA journal_mode = DELETE",
     ] {
-        let by_log = log.query(statement, Vec::new()).await;
+        let by_log = log.query(statement, Vec::<Value>::new()).await;
         let by_handle = s.query(statement, Vec::new()).await;
 
         assert!(by_log.is_err(), "the log should refuse `{statement}`");
@@ -318,7 +318,7 @@ async fn query_reads_a_pragma_that_names_a_table() {
     let log = seeded().await;
 
     let rows = log
-        .query("PRAGMA table_info(events)", Vec::new())
+        .query("PRAGMA table_info(events)", Vec::<Value>::new())
         .await
         .unwrap();
 
@@ -380,7 +380,7 @@ async fn the_authorizer_does_not_outlive_the_call() {
 async fn query_refuses_a_write() {
     let log = seeded().await;
     let error = log
-        .query("DELETE FROM events", Vec::new())
+        .query("DELETE FROM events", Vec::<Value>::new())
         .await
         .unwrap_err();
     assert!(matches!(error, Error::Unsupported(_)), "got {error}");
@@ -438,7 +438,7 @@ async fn text_that_is_not_utf8() -> SqliteEventLog {
     .unwrap();
 
     let kind = log
-        .query("SELECT typeof(t) AS k FROM raw", Vec::new())
+        .query("SELECT typeof(t) AS k FROM raw", Vec::<Value>::new())
         .await
         .unwrap();
     assert_eq!(kind[0]["k"], json!("text"), "the cell has to be TEXT");
@@ -449,7 +449,7 @@ async fn text_that_is_not_utf8() -> SqliteEventLog {
 async fn query_refuses_a_blob_and_names_the_sql_that_gets_it() {
     let log = seeded().await;
     let error = log
-        .query("SELECT x'00ff' AS b", Vec::new())
+        .query("SELECT x'00ff' AS b", Vec::<Value>::new())
         .await
         .unwrap_err();
     assert!(matches!(error, Error::Unsupported(_)), "got {error}");
@@ -462,7 +462,7 @@ async fn query_refuses_a_blob_and_names_the_sql_that_gets_it() {
 async fn query_refuses_a_non_finite_real_and_names_the_sql_that_gets_it() {
     let log = seeded().await;
     let error = log
-        .query("SELECT 1e999 AS r", Vec::new())
+        .query("SELECT 1e999 AS r", Vec::<Value>::new())
         .await
         .unwrap_err();
     assert!(matches!(error, Error::Unsupported(_)), "got {error}");
@@ -475,7 +475,7 @@ async fn query_refuses_a_non_finite_real_and_names_the_sql_that_gets_it() {
 async fn query_refuses_text_that_is_not_utf8() {
     let log = text_that_is_not_utf8().await;
     let error = log
-        .query("SELECT t FROM raw", Vec::new())
+        .query("SELECT t FROM raw", Vec::<Value>::new())
         .await
         .unwrap_err();
     assert!(matches!(error, Error::Unsupported(_)), "got {error}");
@@ -509,33 +509,33 @@ async fn lossy_answers_with_what_sql_itself_renders() {
     let lossy = QueryOptions::default().lossy(true);
 
     let blob = log
-        .query_with("SELECT x'00ff' AS c", Vec::new(), lossy.clone())
+        .query_with("SELECT x'00ff' AS c", Vec::<Value>::new(), lossy.clone())
         .await
         .unwrap();
     let hex = log
-        .query("SELECT hex(x'00ff') AS c", Vec::new())
+        .query("SELECT hex(x'00ff') AS c", Vec::<Value>::new())
         .await
         .unwrap();
     assert_eq!(blob[0]["c"], hex[0]["c"]);
     assert_eq!(blob[0]["c"], json!("00FF"));
 
     let plus = log
-        .query_with("SELECT 1e999 AS c", Vec::new(), lossy.clone())
+        .query_with("SELECT 1e999 AS c", Vec::<Value>::new(), lossy.clone())
         .await
         .unwrap();
     let cast_plus = log
-        .query("SELECT CAST(1e999 AS TEXT) AS c", Vec::new())
+        .query("SELECT CAST(1e999 AS TEXT) AS c", Vec::<Value>::new())
         .await
         .unwrap();
     assert_eq!(plus[0]["c"], cast_plus[0]["c"]);
     assert_eq!(plus[0]["c"], json!("Inf"));
 
     let minus = log
-        .query_with("SELECT -1e999 AS c", Vec::new(), lossy)
+        .query_with("SELECT -1e999 AS c", Vec::<Value>::new(), lossy)
         .await
         .unwrap();
     let cast_minus = log
-        .query("SELECT CAST(-1e999 AS TEXT) AS c", Vec::new())
+        .query("SELECT CAST(-1e999 AS TEXT) AS c", Vec::<Value>::new())
         .await
         .unwrap();
     assert_eq!(minus[0]["c"], cast_minus[0]["c"]);
@@ -548,7 +548,7 @@ async fn lossy_replaces_the_invalid_sequences_in_text() {
     let rows = log
         .query_with(
             "SELECT t FROM raw",
-            Vec::new(),
+            Vec::<Value>::new(),
             QueryOptions::default().lossy(true),
         )
         .await
@@ -564,9 +564,13 @@ async fn the_cells_that_have_a_json_value_are_untouched_either_way() {
     let log = seeded().await;
     let sql = "SELECT NULL AS a, 7 AS b, 1.5 AS c, 'text' AS d";
 
-    let strict = log.query(sql, Vec::new()).await.unwrap();
+    let strict = log.query(sql, Vec::<Value>::new()).await.unwrap();
     let lossy = log
-        .query_with(sql, Vec::new(), QueryOptions::default().lossy(true))
+        .query_with(
+            sql,
+            Vec::<Value>::new(),
+            QueryOptions::default().lossy(true),
+        )
         .await
         .unwrap();
 
@@ -575,4 +579,213 @@ async fn the_cells_that_have_a_json_value_are_untouched_either_way() {
     assert_eq!(strict[0]["b"], json!(7));
     assert_eq!(strict[0]["c"], json!(1.5));
     assert_eq!(strict[0]["d"], json!("text"));
+}
+
+#[tokio::test]
+async fn a_named_query_answers_what_its_positional_twin_does() {
+    let log = seeded().await;
+
+    let by_position = log
+        .query(
+            "SELECT stream, kind FROM events WHERE kind = ?1",
+            vec![json!("b")],
+        )
+        .await
+        .unwrap();
+    let by_name = log
+        .query(
+            "SELECT stream, kind FROM events WHERE kind = :kind",
+            vec![(":kind".to_string(), json!("b"))],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(by_position, by_name);
+    assert_eq!(by_name.len(), 1);
+    assert_eq!(by_name[0]["kind"], json!("b"));
+
+    // And through `query_with`, which is where the options live.
+    let with_options = log
+        .query_with(
+            "SELECT stream, kind FROM events WHERE kind = :kind",
+            vec![(":kind".to_string(), json!("b"))],
+            QueryOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(with_options, by_name);
+}
+
+/// `$` and `@` are the other two spellings of the same thing, and the `$`
+/// one shares its character with `json_extract`'s path syntax — which is why
+/// rewriting named placeholders to numbered ones outside the crate is a
+/// reading of the SQL rather than a substitution.
+#[tokio::test]
+async fn every_sigil_binds_and_a_dollar_in_a_literal_is_left_alone() {
+    let log = SqliteEventLog::open_in_memory().await.unwrap();
+    let mut s = log.stream_handle("s");
+    s.append(
+        json!({ "kind": "scored", "data": { "n": 7 } })
+            .as_object()
+            .unwrap()
+            .clone(),
+    )
+    .await
+    .unwrap();
+
+    let rows = log
+        .query(
+            "SELECT json_extract(data, '$.n') AS n FROM events \
+             WHERE kind = $kind AND stream = @stream",
+            vec![
+                ("$kind".to_string(), json!("scored")),
+                ("@stream".to_string(), json!("s")),
+            ],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["n"], json!(7));
+}
+
+#[tokio::test]
+async fn a_name_the_statement_declares_and_the_call_omits_is_refused() {
+    let log = seeded().await;
+    let error = log
+        .query(
+            "SELECT * FROM events WHERE kind = :kind AND stream = :stream",
+            vec![(":kind".to_string(), json!("a"))],
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, Error::Validation(_)), "got {error}");
+    assert!(
+        error.to_string().contains(":stream"),
+        "the refusal names the parameter: {error}"
+    );
+}
+
+/// The reason the check above exists: rusqlite leaves an unbound named
+/// parameter at `NULL`, so without it this statement would have answered.
+#[tokio::test]
+async fn an_omitted_name_is_refused_rather_than_read_as_null() {
+    let log = seeded().await;
+    let answered = log
+        .query(
+            "SELECT count(*) AS n FROM events WHERE kind IS :kind",
+            vec![(":kind".to_string(), json!("a"))],
+        )
+        .await
+        .unwrap();
+    assert_eq!(answered[0]["n"], json!(1));
+
+    // Same statement, nothing bound. `kind IS NULL` would have answered 0.
+    let error = log
+        .query(
+            "SELECT count(*) AS n FROM events WHERE kind IS :kind",
+            Vec::<(String, Value)>::new(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Validation(_)), "got {error}");
+}
+
+#[tokio::test]
+async fn a_name_the_call_supplies_and_the_statement_lacks_is_refused() {
+    let log = seeded().await;
+    let error = log
+        .query(
+            "SELECT * FROM events WHERE kind = :kind",
+            vec![
+                (":kind".to_string(), json!("a")),
+                (":stream".to_string(), json!("s")),
+            ],
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, Error::Validation(_)), "got {error}");
+    assert!(
+        error.to_string().contains(":stream"),
+        "the refusal names the parameter: {error}"
+    );
+}
+
+/// A name without its sigil matches no placeholder, and the refusal says so
+/// rather than binding it to nothing.
+#[tokio::test]
+async fn a_name_without_its_sigil_is_refused() {
+    let log = seeded().await;
+    let error = log
+        .query(
+            "SELECT * FROM events WHERE kind = :kind",
+            vec![("kind".to_string(), json!("a"))],
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, Error::Validation(_)), "got {error}");
+    assert!(error.to_string().contains(":kind"), "got {error}");
+}
+
+/// SQLite counts named and numbered placeholders in one space, so a statement
+/// bound by name with a bare `?` in it has a slot nothing supplies.
+#[tokio::test]
+async fn a_positional_placeholder_in_a_statement_bound_by_name_is_refused() {
+    let log = seeded().await;
+    let error = log
+        .query(
+            "SELECT * FROM events WHERE kind = :kind AND stream = ?",
+            vec![(":kind".to_string(), json!("a"))],
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, Error::Validation(_)), "got {error}");
+    assert!(error.to_string().contains("positional"), "got {error}");
+}
+
+#[tokio::test]
+async fn a_json_object_binds_by_name() {
+    let log = seeded().await;
+    let mut params = Map::new();
+    params.insert(":kind".to_string(), json!("a"));
+
+    let rows = log
+        .query("SELECT kind FROM events WHERE kind = :kind", params)
+        .await
+        .unwrap();
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["kind"], json!("a"));
+}
+
+/// A positional set whose count does not match the statement's used to be
+/// `Error::Storage` — corruption's class for the caller's own typo.
+#[tokio::test]
+async fn a_positional_count_that_does_not_match_is_refused_as_validation() {
+    let log = seeded().await;
+    let error = log
+        .query("SELECT ?1 AS a, ?2 AS b", vec![json!(1)])
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, Error::Validation(_)), "got {error}");
+    assert!(error.to_string().contains('2'), "got {error}");
+    assert!(error.to_string().contains('1'), "got {error}");
+}
+
+/// The trait's `query` is positional and stays that way: a
+/// `Box<dyn EventStore>` cannot dispatch a generic argument.
+#[tokio::test]
+async fn the_traits_query_still_takes_a_vec() {
+    let log = seeded().await;
+    let store: Box<dyn EventStore> = Box::new(log.stream_handle("s"));
+    let rows = store
+        .query("SELECT kind FROM events WHERE kind = ?1", vec![json!("a")])
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
 }

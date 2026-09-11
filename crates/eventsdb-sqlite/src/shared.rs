@@ -120,6 +120,14 @@ pub(crate) fn is_contention(error: &rusqlite::Error) -> bool {
 }
 
 /// Which of our error classes a rusqlite failure belongs to.
+///
+/// Contention is [`is_contention`]. A parameter set that does not match the
+/// statement is the caller's, and never reaches SQLite at all. Everything
+/// else is the database failing, and repeating it would only fail again.
+///
+/// This is the one place a rusqlite error is given a class, so a class that
+/// holds wherever the error can arise belongs here rather than at one call
+/// site — which is also why the conversion failure below is here.
 pub(crate) fn classify(error: rusqlite::Error) -> Error {
     if is_contention(&error) {
         return Error::Busy(error.to_string());
@@ -145,6 +153,30 @@ pub(crate) fn classify(error: rusqlite::Error) -> Error {
     // the same bytes.
     if matches!(error, rusqlite::Error::FromSqlConversionFailure(..)) {
         return Error::Corruption(error.to_string());
+    }
+
+    // The parameters and the statement disagree. rusqlite raises these before
+    // SQLite runs anything, so nothing about the database has failed and
+    // repeating the call unchanged would fail the same way — which is what
+    // `Storage` would have told a caller to consider. It is the caller's own
+    // input, so it is `Validation`, and the message carries the name or the
+    // two counts because that is the whole of what has to be fixed.
+    match &error {
+        rusqlite::Error::InvalidParameterName(name) => {
+            return Error::Validation(format!(
+                "the statement has no parameter named `{name}`. A name is the \
+                 placeholder as written in the SQL, sigil included — `:{stripped}`, \
+                 `@{stripped}` or `${stripped}`, not `{stripped}`",
+                stripped = name.trim_start_matches([':', '@', '$', '?'])
+            ))
+        }
+        rusqlite::Error::InvalidParameterCount(given, declared) => {
+            return Error::Validation(format!(
+                "the statement declares {declared} parameter(s) and {given} were \
+                 supplied"
+            ))
+        }
+        _ => {}
     }
 
     Error::Storage(error.to_string())

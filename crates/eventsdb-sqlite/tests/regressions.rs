@@ -190,14 +190,17 @@ async fn query_cannot_attach_a_database() {
     let log = SqliteEventLog::open_in_memory().await.unwrap();
 
     let error = log
-        .query("ATTACH DATABASE ':memory:' AS side", Vec::new())
+        .query("ATTACH DATABASE ':memory:' AS side", Vec::<Value>::new())
         .await
         .unwrap_err();
     assert!(matches!(error, Error::Unsupported(_)), "got {error}");
 
     // Nothing was attached, so a name qualified with it does not resolve.
     assert!(log
-        .query("SELECT count(*) FROM side.sqlite_master", Vec::new())
+        .query(
+            "SELECT count(*) FROM side.sqlite_master",
+            Vec::<Value>::new()
+        )
         .await
         .is_err());
 }
@@ -320,7 +323,7 @@ async fn a_projection_still_writes_its_own_tables_and_the_cursor_still_moves() {
     assert_eq!(runner.position().await.unwrap(), Position::new(3));
 
     let rows = log
-        .query("SELECT count(*) AS n FROM seen", Vec::new())
+        .query("SELECT count(*) AS n FROM seen", Vec::<Value>::new())
         .await
         .unwrap();
     assert_eq!(rows[0]["n"], serde_json::json!(3));
@@ -328,7 +331,7 @@ async fn a_projection_still_writes_its_own_tables_and_the_cursor_still_moves() {
     // And a rebuild, which calls reset + init inside the same guard.
     assert_eq!(runner.rebuild().await.unwrap(), 3);
     let rows = log
-        .query("SELECT count(*) AS n FROM seen", Vec::new())
+        .query("SELECT count(*) AS n FROM seen", Vec::<Value>::new())
         .await
         .unwrap();
     assert_eq!(rows[0]["n"], serde_json::json!(3));
