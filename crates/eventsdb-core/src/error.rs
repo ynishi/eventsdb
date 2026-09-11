@@ -2,9 +2,9 @@
 //!
 //! The variants are split by what a caller can *do* about them, not by where
 //! they were raised. `Busy` says another call is worth making; `Validation`
-//! says the event was wrong and no retry will change that; `Storage` says the
-//! database itself failed; `Unsupported` says the request was well-formed and
-//! this backend has no answer for it.
+//! says the event was wrong and no retry will change that; `Storage` says
+//! somewhere the bytes had to go or come from failed; `Unsupported` says the
+//! request was well-formed and this backend has no answer for it.
 
 use thiserror::Error;
 
@@ -41,10 +41,14 @@ pub enum Error {
     #[error("exceeded the deadline: {0}")]
     Timeout(String),
 
-    /// The database failed: it could not read, could not write, could not open.
+    /// Somewhere the bytes had to go or come from failed: the database could
+    /// not read, could not write, could not open — or a [`crate::Sink`] the
+    /// caller supplied refused the page it was handed.
     ///
-    /// Retry-or-call-someone. Contrast [`Error::Corruption`], which is the
-    /// same call site's other outcome and wants the opposite response.
+    /// Retry-or-call-someone, which is what puts those together: this module
+    /// divides by what a caller can do, not by which component raised it.
+    /// Contrast [`Error::Corruption`], which is the same call site's other
+    /// outcome and wants the opposite response.
     #[error("storage failure: {0}")]
     Storage(String),
 

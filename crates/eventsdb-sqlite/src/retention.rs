@@ -74,6 +74,9 @@
 //!   Err(NotExported { up_to, exported_through })   or   the delete
 //! ```
 //!
+//! [`SqliteEventLog::archive_then_retain`] is that diagram as one call: it
+//! walks both moments, page by page, and then applies the plan.
+//!
 //! A row that was taken and never confirmed is a page that may or may not
 //! exist anywhere; the guard treats it as if it did not. A filtered export
 //! (`whole = 0`) preserved some of its range and cannot vouch for the rest,
@@ -91,7 +94,7 @@ use eventsdb_core::error::{Error, Result};
 use eventsdb_core::event::now_ms;
 use eventsdb_core::log::Filter;
 use eventsdb_core::position::Position;
-use eventsdb_core::transfer::ExportedEvent;
+use eventsdb_core::transfer::{ExportedEvent, Sink};
 use rusqlite::{Connection, TransactionBehavior};
 
 use crate::log::SqliteEventLog;
@@ -100,8 +103,15 @@ use crate::shared::{classify, map_isle};
 /// What to remove.
 ///
 /// `#[non_exhaustive]` for the same reason as [`Error`]: the shapes worth
-/// removing by are not a closed set — an archive-then-remove plan is the
-/// obvious next one — and adding a variant should not be a breaking change.
+/// removing by are not a closed set, and adding a variant should not be a
+/// breaking change.
+///
+/// A plan says *what* goes and nothing about what has to happen first.
+/// Archiving before removing is therefore
+/// [`SqliteEventLog::archive_then_retain`], which takes a plan **and** a
+/// sink, rather than a variant holding one: a `Plan` is `Clone + Debug` and
+/// is written into the ledger as a string, and a sink is none of those
+/// things.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum Plan {
@@ -178,6 +188,18 @@ impl Plan {
             Plan::OlderThan(epoch_ms) => format!("older_than:{epoch_ms}"),
             Plan::Streams(streams) => format!("streams:{}", streams.len()),
         }
+    }
+
+    /// The same description, marked as having been preceded by an export.
+    ///
+    /// [`SqliteEventLog::archive_then_retain`] writes this instead of
+    /// [`Plan::describe`], so a reader of the ledger can tell a removal that
+    /// archived first from one that did not — which is a fact about the
+    /// removal, not about the plan, and is why it is a second rendering
+    /// rather than a field on `Plan`. The sink is not named: the store does
+    /// not know what it was.
+    fn describe_archived(&self) -> String {
+        format!("archive-then-remove: {}", self.describe())
     }
 }
 
@@ -258,6 +280,25 @@ pub(crate) fn exported_through(conn: &Connection) -> Result<Position> {
     Ok(Position::new(reach as u64))
 }
 
+/// The highest position `plan` would remove as of this read, or `None` when
+/// it matches nothing.
+///
+/// The `MAX(position)` half of what [`SqliteEventLog::retain`] reads before
+/// it deletes, without the count and the stream tally — so that a caller can
+/// ask how far a plan reaches without applying it. Takes `&Connection` so
+/// either isle can answer it.
+pub(crate) fn highest_matching(conn: &Connection, plan: &Plan) -> Result<Option<Position>> {
+    let (predicate, params) = plan.predicate()?;
+    let highest: Option<i64> = conn
+        .query_row(
+            &format!("SELECT MAX(position) FROM events WHERE {predicate}"),
+            rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())),
+            |row| row.get(0),
+        )
+        .map_err(classify)?;
+    Ok(highest.map(|position| Position::new(position as u64)))
+}
+
 /// What an application of a [`Plan`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Report {
@@ -333,8 +374,19 @@ impl SqliteEventLog {
     /// range between deciding and deleting, and the ledger can never disagree
     /// with what is actually gone.
     pub async fn retain(&self, plan: Plan, guard: Guard) -> Result<Report> {
-        let shared = self.shared_handle();
         let described = plan.describe();
+        self.apply(plan, guard, described).await
+    }
+
+    /// [`SqliteEventLog::retain`], with the ledger's description passed in.
+    ///
+    /// The one place a `retention` row is written, so that
+    /// [`SqliteEventLog::archive_then_retain`] can name itself in the ledger
+    /// without a second copy of the transaction that writes it. `retain`
+    /// passes [`Plan::describe`]; the archive passes
+    /// [`Plan::describe_archived`].
+    async fn apply(&self, plan: Plan, guard: Guard, described: String) -> Result<Report> {
+        let shared = self.shared_handle();
 
         let job = move |conn: &mut Connection| {
             Ok((|| {
@@ -428,6 +480,124 @@ impl SqliteEventLog {
         };
 
         match shared.isle.call(job).await {
+            Ok(inner) => inner,
+            Err(isle) => Err(map_isle(isle)),
+        }
+    }
+
+    /// Export what `plan` would remove, then apply it under
+    /// [`Guard::Exported`].
+    ///
+    /// The loop the module doc draws, run by the store: the caller supplies
+    /// the [`Sink`] and nothing else. `page` is the page size, the same
+    /// `limit` [`SqliteEventLog::export_recorded`] takes.
+    ///
+    /// # The order, and what a failure leaves behind
+    ///
+    /// Per page, and never in another order:
+    ///
+    /// 1. `export_recorded(cursor, &Filter::all(), page)` — the page, and a
+    ///    receipt that is taken, not landed;
+    /// 2. `sink.write(&page)`;
+    /// 3. `confirm_export(receipt.id)`, **only** if step 2 returned `Ok`;
+    /// 4. `cursor = receipt.through`.
+    ///
+    /// A sink error returns immediately, as it was: that page's receipt stays
+    /// unconfirmed, [`SqliteEventLog::exported_through`] is where the last
+    /// confirmed page left it, and nothing has been removed — the plan has
+    /// not been applied at all. The confirmed pages before it are still
+    /// confirmed, which is what makes the next call a resume: it starts from
+    /// `exported_through()` rather than from the beginning, so a page already
+    /// in the chain is not written to the sink twice. A process that dies
+    /// between step 3 and the removal loses nothing either; the next call
+    /// exports nothing and applies the plan.
+    ///
+    /// When the chain reaches the plan's highest position the loop stops and
+    /// [`SqliteEventLog::retain`] runs under [`Guard::Exported`] — fixed, not
+    /// a parameter: a guard the caller could lower is the misuse this method
+    /// exists to remove. That guard also refuses to overrun a stored
+    /// checkpoint, so a consumer that has not caught up fails the call with
+    /// [`Error::ConsumerBehind`] *after* the export was written and
+    /// confirmed. The export is not wasted — `exported_through` advanced, and
+    /// the retry removes without re-exporting.
+    ///
+    /// # Whole pages, and how far they go
+    ///
+    /// The export is under [`Filter::all`], because only a whole page extends
+    /// the chain [`Guard::Exported`] walks. A caller wanting a subset is not
+    /// archiving: that is [`SqliteEventLog::export_recorded`] with a filter.
+    ///
+    /// [`Plan::Before`] removes a prefix, but [`Plan::OlderThan`] and
+    /// [`Plan::Streams`] remove a scattered set while the chain is a prefix.
+    /// So what is exported is **everything up to the highest position the
+    /// plan would remove**, the events the plan leaves alone included. That
+    /// over-exports on purpose: a copy of an event that stays is harmless,
+    /// and the alternative — a chain with holes — is the thing this module
+    /// refuses.
+    ///
+    /// That reach is read once, before the loop, off a reader rather than
+    /// under the write lock, and it does not need to be one transaction with
+    /// the export. `Plan::Before` cannot grow: a position is allocated in
+    /// increasing order and never reused, so nothing appended later falls
+    /// below a fixed `Before`. The other two can — a backfilled timestamp, an
+    /// append to a named stream — and then the plan re-evaluated under the
+    /// lock reaches past the chain and `Guard::Exported` refuses with
+    /// [`Error::NotExported`]. A refusal, never a removal of something no
+    /// sink was shown.
+    ///
+    /// A plan matching nothing returns [`Report::nothing`] without touching
+    /// the sink.
+    pub async fn archive_then_retain(
+        &self,
+        plan: Plan,
+        sink: &mut (impl Sink + ?Sized),
+        page: usize,
+    ) -> Result<Report> {
+        if page == 0 {
+            return Err(Error::validation(
+                "a page size of 0 exports nothing, so the plan could never be covered",
+            ));
+        }
+
+        let Some(target) = self.plan_reach(&plan).await? else {
+            // Nothing matches, so there is nothing to preserve and nothing to
+            // remove. Handing the sink an empty page would be a write the
+            // caller has to interpret.
+            return Ok(Report::nothing());
+        };
+
+        let mut cursor = self.exported_through().await?;
+        while cursor < target {
+            let (events, receipt) = self.export_recorded(cursor, &Filter::all(), page).await?;
+            if events.is_empty() {
+                // The log ran dry below the reach — something removed those
+                // events between the two reads. Stop rather than spin; the
+                // guard below decides whether what is left is covered.
+                break;
+            }
+            sink.write(&events).await?;
+            self.confirm_export(receipt.id).await?;
+            cursor = receipt.through;
+        }
+
+        let described = plan.describe_archived();
+        self.apply(plan, Guard::Exported, described).await
+    }
+
+    /// How far [`highest_matching`] says `plan` reaches, off a reader.
+    ///
+    /// A reader rather than the writer because it is a read, and the export
+    /// that follows it reads the same way — see
+    /// [`SqliteEventLog::archive_then_retain`] for why it does not have to be
+    /// in the same transaction as anything.
+    async fn plan_reach(&self, plan: &Plan) -> Result<Option<Position>> {
+        let shared = self.shared_handle();
+        let plan = plan.clone();
+        match shared
+            .reader()
+            .call(move |conn: &mut Connection| Ok(highest_matching(conn, &plan)))
+            .await
+        {
             Ok(inner) => inner,
             Err(isle) => Err(map_isle(isle)),
         }

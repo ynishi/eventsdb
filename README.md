@@ -512,28 +512,46 @@ one — a subscription reads `position > cursor` and does not see what is gone.
 
 ### Removing only what is preserved elsewhere
 
-Retention deletes; it does not archive, because where an export goes is
-yours. What the store can do is refuse to delete what nobody has confirmed
-is safe — the order Kafka's tiered storage and KurrentDB's archiving keep,
-with the upload left to you:
+Retention deletes; where an export goes is yours. So you hand the store a
+sink and it runs the rest — the order Kafka's tiered storage and KurrentDB's
+archiving keep, with the upload left to you:
 
-    let mut cursor = Position::BEGINNING;
-    loop {
+    let mut archive = JsonLinesSink::new(File::create("2026-08.jsonl")?);
+    log.archive_then_retain(Plan::Before(cutoff), &mut archive, 1000).await?;
+
+    // Into another eventsdb file, which is the same call with another sink.
+    let mut archive = LogSink::new(&cold);
+    log.archive_then_retain(Plan::Before(cutoff), &mut archive, 1000).await?;
+    assert!(archive.reproduced_coordinates());
+
+What it does, spelled out:
+
+    // `target` is the highest position the plan would remove.
+    let mut cursor = log.exported_through().await?;   // resume, not restart
+    while cursor < target {
         let (page, receipt) = log.export_recorded(cursor, &Filter::all(), 1000).await?;
-        write_somewhere(&page)?;                  // yours: a file, another log
-        log.confirm_export(receipt.id).await?;    // "it landed"
+        archive.write(&page).await?;              // yours: a file, another log
+        log.confirm_export(receipt.id).await?;    // only if the write returned
         cursor = receipt.through;
-        if page.len() < 1000 { break; }
     }
-    log.retain(Plan::Before(cursor), Guard::Exported).await?;
+    log.retain(plan, Guard::Exported).await?;
 
-`export_recorded` is `export` plus a receipt row — taken, not yet landed —
-and `confirm_export` is the second half. `Guard::Exported` chains the
-confirmed, unfiltered receipts from the beginning of the log and refuses
-with `NotExported` any plan that would remove past the chain's end; a page
-taken and never confirmed, a filtered one, or a gap all leave the end where
-it was. It also refuses to overrun a consumer, as the default does. The
-rustdoc of `eventsdb_sqlite::retention` has the two moments as a diagram.
+The order is the point. `export_recorded` is `export` plus a receipt row —
+taken, not yet landed — and `confirm_export` is the second half; a sink that
+fails returns its error with that receipt unconfirmed and nothing removed, so
+the next call resumes from `exported_through()` instead of exporting the
+prefix twice. `Guard::Exported` chains the confirmed, unfiltered receipts from
+the beginning of the log and refuses with `NotExported` any plan that would
+remove past the chain's end; a page taken and never confirmed, a filtered one,
+or a gap all leave the end where it was. It also refuses to overrun a
+consumer, as the default does — and refusing after the export has landed
+wastes nothing, because the chain stays where the confirmations put it.
+
+`Plan::OlderThan` and `Plan::Streams` remove a scattered set while the chain
+is a prefix, so the export runs through the **highest position the plan
+touches** and the sink sees events that will stay. Over-exporting is safe; a
+chain with holes is what this refuses. The rustdoc of
+`eventsdb_sqlite::retention` has the two moments as a diagram.
 
 ## Limitations
 
@@ -548,11 +566,12 @@ rustdoc of `eventsdb_sqlite::retention` has the two moments as a diagram.
   different upcaster chains will read the same bytes differently with nothing
   to detect it.
 - **No clustering, replication or network protocol**, by design — see above.
-- **Retention deletes; it does not archive.** Where an export goes is yours,
-  and so is the retry if it does not get there. What the store keeps is the
-  receipt — taken, then confirmed — and `Guard::Exported` is the refusal to
-  delete past what has been confirmed. The policy that decides when to
-  export and when to retain is still not here.
+- **Retention deletes; where the bytes go is yours.** The store runs the loop
+  — `archive_then_retain` exports, confirms, then applies the plan under
+  `Guard::Exported` — and writes nothing itself: each page goes to a `Sink`
+  you supply, and the destination, the format, the durability and the retry
+  are all on the far side of that one method. Two sinks ship, JSON Lines over
+  any `Write` and another log; anything else is a trait with one method.
 - **A long stream is designed away, not compacted.** `append_if` folds the
   stream under the write lock, and nothing in the store bounds how long a
   stream gets. The answer is a stream per period — a shift, a session, a
