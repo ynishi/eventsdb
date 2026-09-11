@@ -7,6 +7,34 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Added
 
+- **A projection can follow the log instead of being polled.**
+  `ProjectionRunner::follow` catches up, waits for the next commit, and catches
+  up again, returning only on error. The wait is the one `subscribe` already
+  does — the log's in-process wake-up channel, with `poll_interval` as the
+  ceiling that covers a writer in another process — rather than a sleep, and
+  that is the whole point: a sleep loop has to be either slower than a
+  subscriber of the same log or short enough to spend a transaction per tick on
+  an idle one, and the wake-up that avoids both was already there with nothing
+  above it able to reach it. Measured: a commit landed in the read model
+  **373µs** after the append against a 30-second poll interval, so a pass of
+  that test cannot be the poll arriving early.
+
+  The receiver is subscribed before the first catch-up and every round marks
+  the channel seen before its reads, never after them — so a commit landing in
+  the gap between the last `run_once` and the wait leaves the receiver changed
+  and is folded at once rather than sitting for an interval. What that order
+  costs is a spurious round now and then, which is also what a projection that
+  names its `kinds` pays for being woken by a commit it declines: a wasted
+  read, not a wrong one, and the same cost `subscribe` pays.
+
+  The first error ends the follow and is returned; there is no retry inside,
+  because a projection whose `apply` failed has not advanced and retrying it
+  without the caller knowing is what the caller's own loop is for. Nothing is
+  spawned and nothing is held across the wait: the runner is still one value
+  holding its one name in the registry, each batch is still one `IMMEDIATE`
+  transaction, and dropping the future while it is parked stops the follow with
+  the read model and the cursor agreeing.
+
 - **A read narrows by stream-name prefix.** `Filter::stream_prefix(..)` and the
   public field behind it are a fourth read axis, honoured by everything that
   takes a `Filter`: `read_all`, `subscribe`, `replay`, `export` and
