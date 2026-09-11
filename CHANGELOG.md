@@ -7,6 +7,47 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Added
 
+- **The store can be watched.** A `tracing` feature on `eventsdb-sqlite`, off
+  by default and forwarded by the `eventsdb` facade, puts a span on the paths
+  this project describes in numbers and an event on the two moments that have
+  no duration. Nothing in the crate emitted anything before it, so the only
+  way to get any of those numbers out of a running process was to wrap each
+  call from outside — which cannot see how long the write lock was held, which
+  batch size the runner chose, or whether a subscription woke on the commit
+  channel or on the poll interval, because all three are inside the call.
+
+  Spans at `debug`: `eventsdb.append` (`stream`, `count`, `position`),
+  `eventsdb.decide` (`stream`, `folded`, `appended`), `eventsdb.project`
+  (`name`, `batch`, `applied`, `cursor`), `eventsdb.retain` (`plan`, `guard`,
+  `removed`, `highest_removed`), `eventsdb.archive` (`plan`, `page`, `pages`,
+  `exported`), `eventsdb.open` (`path`, `user_version` either side of the
+  ladder) and `eventsdb.hatch` (`op`, `rows` or `appended`). Events: a wake
+  per subscription round at `trace`, carrying `woken_by` as `commit` or
+  `interval` — the difference the README quotes in microseconds against
+  milliseconds, and the one thing about a subscription that cannot be seen
+  from outside its loop — and a refusal at `warn` carrying the error's own
+  text, for the four cases where the store declines rather than fails:
+  `Truncated`, `NotExported`, `ConsumerBehind`, and a statement the hatch's
+  authorizer turned down.
+
+  **No event's `data` or `meta` is a field, at any level.** Both are the
+  caller's and are where a tenant or a customer id lives, so what is emitted
+  is coordinates, counts, durations, a consumer or projection name, and — at
+  `debug`, never above — a stream id and a kind. The one caller-authored text
+  that is emitted at all is the hatch's `sql`, which a literal may carry data
+  through: it is a `trace` event rather than a span field, clipped to 256
+  characters, so a subscriber at `debug` sees the statement's row count and
+  never its text. `tests/tracing.rs` writes an event whose `data` and `meta`
+  hold a distinctive string, runs every instrumented path with a collecting
+  subscriber at `trace`, and asserts the string appears nowhere.
+
+  The feature is `dep:tracing` and nothing else: with it off `tracing` is not
+  in the dependency graph, the call sites compile to the code that was there
+  before, and `PRAGMA user_version` — the one field that costs a query — is
+  not read. No `log` dependency; a caller already on `log` reaches this
+  through `tracing`'s own compatibility layer. `tracing` 0.1 declares
+  `rust-version = "1.65"`, so the MSRV stays at 1.85.
+
 - **An open log can be copied.** `SqliteEventLog::backup_to(path)` takes a
   consistent physical copy of the file while the log is open and being written
   to. `export` is the logical copy and is deliberately only the events, so
