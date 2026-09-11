@@ -188,7 +188,7 @@ fn read(c: &mut Criterion) {
     group.bench_function("query_count_of_10000", |b| {
         b.to_async(&rt).iter(|| async {
             held.1
-                .query("SELECT count(*) AS n FROM events", Vec::<Value>::new())
+                .query("SELECT count(*) AS n FROM events", Vec::new())
                 .await
                 .expect("a query")
         });

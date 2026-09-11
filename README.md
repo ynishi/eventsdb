@@ -299,9 +299,7 @@ Then the ladder runs clean and the rows come in through the front door:
     let log = SqliteEventLog::open(&path).await?;
 
     // The hatch reads anything, the old table included.
-    let rows = log
-        .query("SELECT * FROM legacy_events ORDER BY id", Vec::<Value>::new())
-        .await?;
+    let rows = log.query("SELECT * FROM legacy_events ORDER BY id", vec![]).await?;
 
     // One record per row, carrying the position it had over there.
     let report = log.import(rows.iter().map(to_exported_event).collect()).await?;
@@ -345,12 +343,13 @@ yourself" a reasonable thing to ask.
         vec![json!("scored")],
     ).await?;
 
-    // The same query with named placeholders. The name is the placeholder as
-    // written, sigil included — `:kind`, not `kind` — and `$` / `@` bind too,
-    // so the `'$.n'` in the SQL is a literal and stays one.
+    // The same query with named placeholders: a JSON object, one entry per
+    // placeholder. The name is the placeholder as written, sigil included —
+    // `:kind`, not `kind` — and `$` / `@` bind too, so the `'$.n'` in the SQL
+    // is a literal and stays one.
     let rows = log.query(
         "SELECT stream, json_extract(data, '$.n') AS n FROM events WHERE kind = :kind",
-        vec![(":kind".to_string(), json!("scored"))],
+        json!({ ":kind": "scored" }).as_object().cloned().unwrap(),
     ).await?;
 
     // Or take a real transaction on the log's own connection.
@@ -362,10 +361,10 @@ yourself" a reasonable thing to ask.
 
 Every placeholder a named statement declares has to be supplied: one that is
 not is refused, because rusqlite would otherwise leave it at `NULL` and the
-statement would answer as though the caller had meant that. A set with no
-parameters at all now has to say which kind it is —
-`Vec::<serde_json::Value>::new()` rather than a bare `vec![]`, since both
-forms arrive as a `Vec`. `Params` in the rustdoc is the whole rule.
+statement would answer as though the caller had meant that. A `Vec` is the
+positional set and an object is the named one, so `vec![]` still means what
+it always did; a named set held in a `Vec` of pairs is written
+`Params::Named(vec![..])`. `Params` in the rustdoc is the whole rule.
 
 `query` answers in JSON, and a few SQLite cells have no JSON value at all. It
 refuses those rather than handing over a stand-in: the error names the column

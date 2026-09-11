@@ -117,7 +117,7 @@ async fn an_unconfirmed_export_does_not_let_retention_through() {
     assert_eq!(count(&log).await, 5, "nothing was removed");
     assert_eq!(log.removed_watermark().await.unwrap(), Position::BEGINNING);
     let ledger = log
-        .query("SELECT COUNT(*) AS n FROM retention", Vec::<Value>::new())
+        .query("SELECT COUNT(*) AS n FROM retention", Vec::new())
         .await
         .unwrap();
     assert_eq!(ledger[0]["n"], json!(0), "a refusal writes no ledger row");
@@ -278,7 +278,7 @@ async fn the_hatch_can_read_receipts_but_not_write_them() {
     let rows = log
         .query(
             "SELECT id, from_position, through, count, whole, landed_ms FROM exports",
-            Vec::<Value>::new(),
+            Vec::new(),
         )
         .await
         .unwrap();

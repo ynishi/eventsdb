@@ -47,21 +47,30 @@ use serde_json::{Map, Value};
 ///
 /// # Building one
 ///
+/// A `Vec` converts, and it is the positional set; a JSON object converts, and
+/// it is the named one. There is deliberately **no** conversion from a
+/// `Vec<(String, Value)>`: a second `From` over a `Vec` would make every
+/// existing `query(sql, vec![])` ambiguous, since an empty literal cannot say
+/// which element type it has. Named pairs in a `Vec` are still available by
+/// naming the variant.
+///
 /// ```
 /// # use eventsdb_core::Params;
 /// # use serde_json::{json, Map};
 /// let by_position: Params = vec![json!("placed")].into();
-/// let by_name: Params = vec![(":kind".to_string(), json!("placed"))].into();
+/// let nothing: Params = vec![].into();
+/// assert_eq!(nothing, Params::Positional(Vec::new()));
+///
+/// // A named set, as an object …
+/// let by_name: Params = json!({ ":kind": "placed" }).as_object().cloned().unwrap().into();
+/// // … or as the variant itself.
+/// let also_by_name = Params::Named(vec![(":kind".to_string(), json!("placed"))]);
+/// assert_eq!(by_name, also_by_name);
 ///
 /// let mut map = Map::new();
 /// map.insert(":kind".to_string(), json!("placed"));
-/// let also_by_name: Params = map.into();
-/// assert_eq!(by_name, also_by_name);
+/// assert_eq!(Params::from(map), also_by_name);
 /// ```
-///
-/// Two `From` impls are over a `Vec`, so an **empty** literal no longer says
-/// which kind it is: write `Vec::<Value>::new()` where `vec![]` used to do.
-/// A non-empty `vec![json!(..)]` is unambiguous and needs no change.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Params {
     /// Bound to `?`, `?1`, `?2` … in the order given.
@@ -73,12 +82,6 @@ pub enum Params {
 impl From<Vec<Value>> for Params {
     fn from(values: Vec<Value>) -> Self {
         Params::Positional(values)
-    }
-}
-
-impl From<Vec<(String, Value)>> for Params {
-    fn from(pairs: Vec<(String, Value)>) -> Self {
-        Params::Named(pairs)
     }
 }
 

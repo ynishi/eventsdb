@@ -12,19 +12,22 @@ And `SqliteEventLog::query`, `query_timeout` and `query_with` take
 `impl Into<Params>` where they took `Vec<Value>` — argument-position
 `impl Trait` is a generic parameter, so the number of generic arguments those
 methods have changes, which the Rust Reference calls a breaking change for a
-caller who turbofishes them. Nobody here does. What does bite in practice is
-inference: two of the three `From` impls are over a `Vec`, so an empty
-parameter literal no longer says which kind it is and `vec![]` /
-`Vec::new()` has to become `Vec::<Value>::new()`. A non-empty
-`vec![json!(..)]` is unchanged.
+caller who turbofishes them. Nobody here does, and every ordinary call site
+is untouched: `vec![]`, `Vec::new()` and `vec![json!(..)]` all still compile
+as the positional set they always were.
 
 ### Added
 
 - **The hatch binds by name, not only by position.** `eventsdb_core::Params`
   (re-exported by `eventsdb-sqlite`) is `Positional(Vec<Value>)` or
-  `Named(Vec<(String, Value)>)`, with `From` for `Vec<Value>`,
-  `Vec<(String, Value)>` and `Map<String, Value>`; `SqliteEventLog::query`,
-  `query_timeout` and `query_with` take anything that converts. SQLite has one
+  `Named(Vec<(String, Value)>)`, with `From` for `Vec<Value>` — the
+  positional set — and for `Map<String, Value>`, the named one;
+  `SqliteEventLog::query`, `query_timeout` and `query_with` take anything that
+  converts, and `Params::Named(vec![..])` names the variant for pairs already
+  in a `Vec`. There is deliberately no conversion from `Vec<(String, Value)>`:
+  a second `From` over a `Vec` makes `query(sql, vec![])` ambiguous at every
+  existing call site, which is a cost paid by callers who never asked for
+  named parameters. SQLite has one
   parameter space and four spellings for a slot in it, and refusing the named
   half guarded no invariant — it pushed the rewriting of `:name` to `?N` onto
   the caller, which means reading the SQL past its string literals, and this

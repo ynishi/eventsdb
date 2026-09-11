@@ -8,7 +8,7 @@
 
 use eventsdb_core::error::{Error, Result};
 use eventsdb_core::{EventLog, EventStore, Filter, Position};
-use eventsdb_sqlite::{Guard, Plan, QueryOptions, SqliteEventLog};
+use eventsdb_sqlite::{Guard, Params, Plan, QueryOptions, SqliteEventLog};
 use serde_json::{json, Map, Value};
 
 fn event(kind: &str) -> Map<String, Value> {
@@ -98,7 +98,7 @@ async fn an_error_rolls_the_whole_transaction_back() {
     assert!(error.to_string().contains("changed my mind"), "got {error}");
 
     // The table was created *and* rolled back, so it is not there at all.
-    let missing = log.query("SELECT k FROM half", Vec::<Value>::new()).await;
+    let missing = log.query("SELECT k FROM half", Vec::new()).await;
     assert!(missing.is_err(), "the table should not exist");
 }
 
@@ -241,7 +241,7 @@ async fn a_stream_handles_sql_is_gated_exactly_as_the_logs_is() {
         "DELETE FROM events",
         "PRAGMA journal_mode = DELETE",
     ] {
-        let by_log = log.query(statement, Vec::<Value>::new()).await;
+        let by_log = log.query(statement, Vec::new()).await;
         let by_handle = s.query(statement, Vec::new()).await;
 
         assert!(by_log.is_err(), "the log should refuse `{statement}`");
@@ -318,7 +318,7 @@ async fn query_reads_a_pragma_that_names_a_table() {
     let log = seeded().await;
 
     let rows = log
-        .query("PRAGMA table_info(events)", Vec::<Value>::new())
+        .query("PRAGMA table_info(events)", Vec::new())
         .await
         .unwrap();
 
@@ -380,7 +380,7 @@ async fn the_authorizer_does_not_outlive_the_call() {
 async fn query_refuses_a_write() {
     let log = seeded().await;
     let error = log
-        .query("DELETE FROM events", Vec::<Value>::new())
+        .query("DELETE FROM events", Vec::new())
         .await
         .unwrap_err();
     assert!(matches!(error, Error::Unsupported(_)), "got {error}");
@@ -438,7 +438,7 @@ async fn text_that_is_not_utf8() -> SqliteEventLog {
     .unwrap();
 
     let kind = log
-        .query("SELECT typeof(t) AS k FROM raw", Vec::<Value>::new())
+        .query("SELECT typeof(t) AS k FROM raw", Vec::new())
         .await
         .unwrap();
     assert_eq!(kind[0]["k"], json!("text"), "the cell has to be TEXT");
@@ -449,7 +449,7 @@ async fn text_that_is_not_utf8() -> SqliteEventLog {
 async fn query_refuses_a_blob_and_names_the_sql_that_gets_it() {
     let log = seeded().await;
     let error = log
-        .query("SELECT x'00ff' AS b", Vec::<Value>::new())
+        .query("SELECT x'00ff' AS b", Vec::new())
         .await
         .unwrap_err();
     assert!(matches!(error, Error::Unsupported(_)), "got {error}");
@@ -462,7 +462,7 @@ async fn query_refuses_a_blob_and_names_the_sql_that_gets_it() {
 async fn query_refuses_a_non_finite_real_and_names_the_sql_that_gets_it() {
     let log = seeded().await;
     let error = log
-        .query("SELECT 1e999 AS r", Vec::<Value>::new())
+        .query("SELECT 1e999 AS r", Vec::new())
         .await
         .unwrap_err();
     assert!(matches!(error, Error::Unsupported(_)), "got {error}");
@@ -475,7 +475,7 @@ async fn query_refuses_a_non_finite_real_and_names_the_sql_that_gets_it() {
 async fn query_refuses_text_that_is_not_utf8() {
     let log = text_that_is_not_utf8().await;
     let error = log
-        .query("SELECT t FROM raw", Vec::<Value>::new())
+        .query("SELECT t FROM raw", Vec::new())
         .await
         .unwrap_err();
     assert!(matches!(error, Error::Unsupported(_)), "got {error}");
@@ -509,33 +509,33 @@ async fn lossy_answers_with_what_sql_itself_renders() {
     let lossy = QueryOptions::default().lossy(true);
 
     let blob = log
-        .query_with("SELECT x'00ff' AS c", Vec::<Value>::new(), lossy.clone())
+        .query_with("SELECT x'00ff' AS c", Vec::new(), lossy.clone())
         .await
         .unwrap();
     let hex = log
-        .query("SELECT hex(x'00ff') AS c", Vec::<Value>::new())
+        .query("SELECT hex(x'00ff') AS c", Vec::new())
         .await
         .unwrap();
     assert_eq!(blob[0]["c"], hex[0]["c"]);
     assert_eq!(blob[0]["c"], json!("00FF"));
 
     let plus = log
-        .query_with("SELECT 1e999 AS c", Vec::<Value>::new(), lossy.clone())
+        .query_with("SELECT 1e999 AS c", Vec::new(), lossy.clone())
         .await
         .unwrap();
     let cast_plus = log
-        .query("SELECT CAST(1e999 AS TEXT) AS c", Vec::<Value>::new())
+        .query("SELECT CAST(1e999 AS TEXT) AS c", Vec::new())
         .await
         .unwrap();
     assert_eq!(plus[0]["c"], cast_plus[0]["c"]);
     assert_eq!(plus[0]["c"], json!("Inf"));
 
     let minus = log
-        .query_with("SELECT -1e999 AS c", Vec::<Value>::new(), lossy)
+        .query_with("SELECT -1e999 AS c", Vec::new(), lossy)
         .await
         .unwrap();
     let cast_minus = log
-        .query("SELECT CAST(-1e999 AS TEXT) AS c", Vec::<Value>::new())
+        .query("SELECT CAST(-1e999 AS TEXT) AS c", Vec::new())
         .await
         .unwrap();
     assert_eq!(minus[0]["c"], cast_minus[0]["c"]);
@@ -548,7 +548,7 @@ async fn lossy_replaces_the_invalid_sequences_in_text() {
     let rows = log
         .query_with(
             "SELECT t FROM raw",
-            Vec::<Value>::new(),
+            Vec::new(),
             QueryOptions::default().lossy(true),
         )
         .await
@@ -564,13 +564,9 @@ async fn the_cells_that_have_a_json_value_are_untouched_either_way() {
     let log = seeded().await;
     let sql = "SELECT NULL AS a, 7 AS b, 1.5 AS c, 'text' AS d";
 
-    let strict = log.query(sql, Vec::<Value>::new()).await.unwrap();
+    let strict = log.query(sql, Vec::new()).await.unwrap();
     let lossy = log
-        .query_with(
-            sql,
-            Vec::<Value>::new(),
-            QueryOptions::default().lossy(true),
-        )
+        .query_with(sql, Vec::new(), QueryOptions::default().lossy(true))
         .await
         .unwrap();
 
@@ -595,7 +591,7 @@ async fn a_named_query_answers_what_its_positional_twin_does() {
     let by_name = log
         .query(
             "SELECT stream, kind FROM events WHERE kind = :kind",
-            vec![(":kind".to_string(), json!("b"))],
+            json!({ ":kind": "b" }).as_object().cloned().unwrap(),
         )
         .await
         .unwrap();
@@ -608,7 +604,7 @@ async fn a_named_query_answers_what_its_positional_twin_does() {
     let with_options = log
         .query_with(
             "SELECT stream, kind FROM events WHERE kind = :kind",
-            vec![(":kind".to_string(), json!("b"))],
+            Params::Named(vec![(":kind".to_string(), json!("b"))]),
             QueryOptions::default(),
         )
         .await
@@ -637,10 +633,10 @@ async fn every_sigil_binds_and_a_dollar_in_a_literal_is_left_alone() {
         .query(
             "SELECT json_extract(data, '$.n') AS n FROM events \
              WHERE kind = $kind AND stream = @stream",
-            vec![
+            Params::Named(vec![
                 ("$kind".to_string(), json!("scored")),
                 ("@stream".to_string(), json!("s")),
-            ],
+            ]),
         )
         .await
         .unwrap();
@@ -655,7 +651,7 @@ async fn a_name_the_statement_declares_and_the_call_omits_is_refused() {
     let error = log
         .query(
             "SELECT * FROM events WHERE kind = :kind AND stream = :stream",
-            vec![(":kind".to_string(), json!("a"))],
+            json!({ ":kind": "a" }).as_object().cloned().unwrap(),
         )
         .await
         .unwrap_err();
@@ -675,7 +671,7 @@ async fn an_omitted_name_is_refused_rather_than_read_as_null() {
     let answered = log
         .query(
             "SELECT count(*) AS n FROM events WHERE kind IS :kind",
-            vec![(":kind".to_string(), json!("a"))],
+            json!({ ":kind": "a" }).as_object().cloned().unwrap(),
         )
         .await
         .unwrap();
@@ -685,7 +681,7 @@ async fn an_omitted_name_is_refused_rather_than_read_as_null() {
     let error = log
         .query(
             "SELECT count(*) AS n FROM events WHERE kind IS :kind",
-            Vec::<(String, Value)>::new(),
+            Params::Named(Vec::new()),
         )
         .await
         .unwrap_err();
@@ -698,10 +694,10 @@ async fn a_name_the_call_supplies_and_the_statement_lacks_is_refused() {
     let error = log
         .query(
             "SELECT * FROM events WHERE kind = :kind",
-            vec![
+            Params::Named(vec![
                 (":kind".to_string(), json!("a")),
                 (":stream".to_string(), json!("s")),
-            ],
+            ]),
         )
         .await
         .unwrap_err();
@@ -721,7 +717,7 @@ async fn a_name_without_its_sigil_is_refused() {
     let error = log
         .query(
             "SELECT * FROM events WHERE kind = :kind",
-            vec![("kind".to_string(), json!("a"))],
+            json!({ "kind": "a" }).as_object().cloned().unwrap(),
         )
         .await
         .unwrap_err();
@@ -738,7 +734,7 @@ async fn a_positional_placeholder_in_a_statement_bound_by_name_is_refused() {
     let error = log
         .query(
             "SELECT * FROM events WHERE kind = :kind AND stream = ?",
-            vec![(":kind".to_string(), json!("a"))],
+            Params::Named(vec![(":kind".to_string(), json!("a"))]),
         )
         .await
         .unwrap_err();

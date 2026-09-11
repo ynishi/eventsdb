@@ -539,10 +539,13 @@ impl SqliteEventLog {
     /// contents — so the readonly gate alone would let a caller attach a
     /// database to the long-lived connection and keep it there.
     ///
-    /// **Parameters bind by position or by name.** `vec![json!("placed")]`
-    /// fills `?1`; `vec![(":kind".to_string(), json!("placed"))]` fills
-    /// `:kind`, sigil and all. [`Params`] states the rule for a name and what
-    /// happens to a name the statement declares and the call leaves out. The
+    /// **Parameters bind by position or by name.** A `Vec` is the positional
+    /// set — `vec![json!("placed")]` fills `?1` — and a JSON object is the
+    /// named one: `json!({ ":kind": "placed" }).as_object().cloned().unwrap()`
+    /// fills `:kind`, sigil and all, as does `Params::Named(vec![..])`.
+    /// [`Params`] states the rule for a name, why a `Vec` of pairs does not
+    /// convert, and what happens to a name the statement declares and the call
+    /// leaves out. The
     /// [`eventsdb_core::EventStore`] trait's `query` stays positional — a
     /// `Box<dyn EventStore>` cannot dispatch a generic argument.
     pub async fn query(

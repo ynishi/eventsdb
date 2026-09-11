@@ -163,7 +163,7 @@ async fn the_documented_rename_and_import_brings_a_foreign_log_in() {
     let rows = log
         .query(
             "SELECT id, stream, kind, body, at FROM legacy_events ORDER BY id",
-            Vec::<Value>::new(),
+            vec![],
         )
         .await
         .unwrap();
