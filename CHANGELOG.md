@@ -3,6 +3,18 @@
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- The escape hatch's prose says what its code does. `query_timeout` documented
+  `Error::Busy` and returns `Error::Timeout`; `SqliteEventLog::query` now
+  states what each SQLite type becomes as JSON, including the four conversions
+  that lose information — a `BLOB`, a non-finite `REAL`, `TEXT` that is not
+  UTF-8, and an inbound integer too large for `i64`; and the README's escape
+  hatch section no longer calls a second writing connection unsurvivable, which
+  `tests/two_logs.rs` measured and disproved. Nothing in the code changed.
+
 ## [0.4.0] - 2026-09-11
 
 A minor rather than a patch, for three independent reasons. `Guard` gains a
