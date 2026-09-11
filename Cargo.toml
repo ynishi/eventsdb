@@ -3,7 +3,7 @@ members = ["crates/eventsdb", "crates/eventsdb-core", "crates/eventsdb-sqlite"]
 resolver = "2"
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 # Measured, not inherited, and raised here deliberately rather than left for a
 # build to discover. `libsqlite3-sys` still declares no MSRV of its own, but
@@ -18,7 +18,7 @@ repository = "https://github.com/ynishi/eventsdb"
 homepage = "https://github.com/ynishi/eventsdb"
 
 [workspace.dependencies]
-eventsdb-core = { path = "crates/eventsdb-core", version = "0.4.0" }
+eventsdb-core = { path = "crates/eventsdb-core", version = "0.5.0" }
 
 async-trait = "0.1"
 futures-core = "0.3"
