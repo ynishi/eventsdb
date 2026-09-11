@@ -3,7 +3,7 @@
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.0] - 2026-09-11
 
 A minor rather than a patch, for two independent reasons. `ExportedEvent`'s
 public `position` field becomes an `Option<Position>`, so every construction
@@ -329,6 +329,7 @@ implemented and tested.
   and `retention`, against a file-backed log. Contention questions live in
   `tests/` instead, where a regression is a failure rather than a slower bar.
 
+[0.5.0]: https://github.com/ynishi/eventsdb/releases/tag/v0.5.0
 [0.4.0]: https://github.com/ynishi/eventsdb/releases/tag/v0.4.0
 [0.3.0]: https://github.com/ynishi/eventsdb/releases/tag/v0.3.0
 [0.2.0]: https://github.com/ynishi/eventsdb/releases/tag/v0.2.0
