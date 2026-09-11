@@ -184,6 +184,49 @@ pub(crate) fn user_version(_conn: &rusqlite::Connection) -> i64 {
     -1
 }
 
+/// `PRAGMA freelist_count`, read only when somebody is instrumented to care.
+///
+/// What `eventsdb.reclaim` reports is this number before the vacuum minus
+/// this number after it, and each is a pragma read on the writer — so, as
+/// with [`user_version`], the read is part of the instrumentation. With the
+/// feature off both sides are this constant and the difference is `0`, which
+/// `Span::record` on the shim drops anyway.
+#[cfg(feature = "tracing")]
+pub(crate) fn freelist_count(conn: &rusqlite::Connection) -> i64 {
+    conn.pragma_query_value(None, "freelist_count", |row| row.get(0))
+        .unwrap_or(-1)
+}
+
+#[cfg(not(feature = "tracing"))]
+pub(crate) fn freelist_count(_conn: &rusqlite::Connection) -> i64 {
+    -1
+}
+
+/// Whether an index by this name is already in `sqlite_master`, read only
+/// when somebody is instrumented to care.
+///
+/// `CREATE INDEX IF NOT EXISTS` reports nothing about which of its two
+/// outcomes happened, and `eventsdb.index` wants to say which — a caller who
+/// waited on the writer for a while wants to know whether it was the scan or
+/// the queue. One row of `sqlite_master`, which is a table of a few dozen
+/// rows, and not read at all with the feature off: the answer is then
+/// `false`, and the field it would have fed is dropped by the shim.
+#[cfg(feature = "tracing")]
+pub(crate) fn index_exists(conn: &rusqlite::Connection, name: &str) -> bool {
+    conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+        [name],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|count| count > 0)
+    .unwrap_or(false)
+}
+
+#[cfg(not(feature = "tracing"))]
+pub(crate) fn index_exists(_conn: &rusqlite::Connection, _name: &str) -> bool {
+    false
+}
+
 /// How much of a statement the `sql` field carries.
 ///
 /// The hatch's SQL is the caller's text and a literal in it is the caller's

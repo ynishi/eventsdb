@@ -63,6 +63,7 @@ use rusqlite::Connection;
 
 use crate::log::SqliteEventLog;
 use crate::shared::{classify, map_isle};
+use crate::trace::{self, span};
 
 impl SqliteEventLog {
     /// Copy the whole database to `path`, as one consistent snapshot.
@@ -128,25 +129,47 @@ impl SqliteEventLog {
         let destination = path.as_ref().to_path_buf();
         claim(&destination)?;
 
+        // The copy is the one read here whose duration is set by the size of
+        // the file rather than of a page, and for the whole of it the reader
+        // holds a read transaction that a WAL checkpoint cannot pass — so how
+        // long it held is the number an operator of a busy log wants. `path`
+        // as given, the way `eventsdb.open` records it; `pages` is what the
+        // backup API counted, which is the whole file.
+        let span = span!(
+            "eventsdb.backup",
+            path = %destination.display(),
+            pages = tracing::field::Empty,
+        );
+
         let shared = self.shared_handle();
         let target = destination.clone();
-        let outcome = match shared
-            .reader()
-            .call(move |conn: &mut Connection| Ok(copy_pages(conn, &target)))
-            .await
-        {
-            Ok(inner) => inner,
-            Err(isle) => Err(map_isle(isle)),
-        };
+        let outcome = trace::instrument(span.clone(), async move {
+            match shared
+                .reader()
+                .call(move |conn: &mut Connection| Ok(copy_pages(conn, &target)))
+                .await
+            {
+                Ok(inner) => inner,
+                Err(isle) => Err(map_isle(isle)),
+            }
+        })
+        .await;
 
-        if outcome.is_err() {
-            // What is at the destination now is the empty file this call made
-            // or a half-written copy of the log, and neither is a backup.
-            // Best effort: if the removal fails too, the path holds a partial
-            // file and the next call refuses it, which is the honest outcome.
-            let _ = std::fs::remove_file(&destination);
+        match outcome {
+            Ok(pages) => {
+                span.record("pages", pages);
+                Ok(())
+            }
+            Err(error) => {
+                // What is at the destination now is the empty file this call
+                // made or a half-written copy of the log, and neither is a
+                // backup. Best effort: if the removal fails too, the path
+                // holds a partial file and the next call refuses it, which is
+                // the honest outcome.
+                let _ = std::fs::remove_file(&destination);
+                Err(error)
+            }
         }
-        outcome
     }
 }
 
@@ -183,12 +206,18 @@ fn claim(destination: &Path) -> Result<()> {
 ///
 /// Opens the destination on this thread, so the whole copy is one job on the
 /// isle and the destination connection is closed before the job returns.
-fn copy_pages(source: &Connection, destination: &Path) -> Result<()> {
+/// Answers with the page count the backup API reports, which after a step of
+/// `-1` is every page of the source: it is two reads of the backup handle,
+/// taken in both builds because the span's field is recorded on the async
+/// side, where the handle no longer exists.
+fn copy_pages(source: &Connection, destination: &Path) -> Result<i64> {
     let mut into = Connection::open(destination).map_err(classify)?;
     let backup = Backup::new(source, &mut into).map_err(classify)?;
 
-    match backup.step(-1).map_err(classify)? {
-        StepResult::Done => Ok(()),
+    let stepped = backup.step(-1).map_err(classify)?;
+    let pages = i64::from(backup.progress().pagecount);
+    match stepped {
+        StepResult::Done => Ok(pages),
         // The source is read-only and the destination was created by this
         // call, so neither lock is one anybody else should hold — but
         // "somebody does" is contention, and another attempt is worth making

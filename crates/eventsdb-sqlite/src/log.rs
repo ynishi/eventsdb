@@ -993,7 +993,22 @@ impl EventLog for SqliteEventLog {
         filter: &Filter,
         limit: usize,
     ) -> Result<Vec<ExportedEvent>> {
-        crate::transfer::export(self, from, filter, limit).await
+        // The same name `export_recorded` uses, with the fields a page without
+        // a receipt has — so a caller moving a log by hand sees each page
+        // leave, the way a caller archiving does.
+        let span = span!(
+            "eventsdb.export",
+            from = from.get(),
+            limit = limit,
+            exported = tracing::field::Empty,
+        );
+        let events = trace::instrument(
+            span.clone(),
+            crate::transfer::export(self, from, filter, limit),
+        )
+        .await?;
+        span.record("exported", events.len());
+        Ok(events)
     }
 
     /// One transaction for the whole batch, with the stream counter read and
@@ -1064,20 +1079,43 @@ impl SqliteEventLog {
     /// Which keys to index is the caller's call, the same way which keys
     /// exist is — see the module doc for why the store does not guess.
     pub async fn index_meta(&self, key: &str) -> Result<()> {
+        let name = meta_index_name(key);
         let sql = format!(
             "CREATE INDEX IF NOT EXISTS {} ON events ({}, position)",
-            meta_index_name(key),
+            name,
             meta_expr(key)?
         );
-        match self
-            .shared
-            .isle
-            .call(move |conn: &mut Connection| Ok(conn.execute_batch(&sql).map_err(classify)))
-            .await
-        {
-            Ok(inner) => inner,
-            Err(isle) => Err(map_isle(isle)),
-        }
+        // A scan of every row on the writer, or the no-op the doc promises,
+        // and nothing about the call says which — so the span does. `key` is
+        // the name of a `meta` key and never a value under it; caller-chosen
+        // the way a stream id is, and at `debug` for the same reason.
+        let span = span!(
+            "eventsdb.index",
+            key = %key,
+            created = tracing::field::Empty,
+        );
+        let created = trace::instrument(span.clone(), async move {
+            match self
+                .shared
+                .isle
+                .call(move |conn: &mut Connection| {
+                    Ok((|| {
+                        // The instrumentation's read, not the call's — see
+                        // [`trace::index_exists`].
+                        let existed = trace::index_exists(conn, &name);
+                        conn.execute_batch(&sql).map_err(classify)?;
+                        Ok(!existed)
+                    })())
+                })
+                .await
+            {
+                Ok(inner) => inner,
+                Err(isle) => Err(map_isle(isle)),
+            }
+        })
+        .await?;
+        span.record("created", created);
+        Ok(())
     }
 
     /// The shared handle, for the sibling modules that need the isle.
