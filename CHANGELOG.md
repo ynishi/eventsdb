@@ -32,6 +32,25 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   hatch section no longer calls a second writing connection unsurvivable, which
   `tests/two_logs.rs` measured and disproved. Nothing in the code changed.
 
+- **The hatch refuses a cell it cannot hand over intact, where it used to
+  substitute.** This is a behaviour change, and it is the four conversions the
+  entry above documented: `SqliteEventLog::query` and `EventStore::query`
+  return `Error::Unsupported` for a `BLOB`, a non-finite `REAL`, and `TEXT`
+  that is not valid UTF-8, naming the column and the SQL that gets the value
+  through — `hex(<col>)` and `CAST(<col> AS TEXT)`; and `Error::Validation`
+  for an inbound JSON integer above `i64::MAX` instead of rounding it through
+  an `f64`. A caller who relied on the string `"<blob>"`, or on `null` for an
+  infinite real, now gets an error rather than a value they could not tell
+  from a genuine one. To keep the old shape of answer, call the new
+  `SqliteEventLog::query_with` with `QueryOptions::default().lossy(true)`: it
+  substitutes per statement, and what it substitutes is what SQL itself
+  renders — `00FF` for `x'00ff'`, `Inf` and `-Inf` for `±` infinity,
+  `from_utf8_lossy` for the text — so it is a string rather than the
+  `"<blob>"` marker or the `null`. `QueryOptions` is `#[non_exhaustive]` with
+  `Default`, public fields and the setters `timeout` and `lossy`, as
+  `OpenOptions` has. `query_with` is on the log only; the `EventStore` trait's
+  `query` and `query_timeout` stay strict.
+
 ### Fixed
 
 - **The hatch no longer refuses `PRAGMA table_info(events)`.** The authorizer
