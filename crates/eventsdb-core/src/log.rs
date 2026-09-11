@@ -10,10 +10,10 @@
 //! claim this crate makes, not a convenience one implementation happens to
 //! offer. A caller generic over `EventLog` can therefore write a migration.
 //!
-//! # Three read axes
+//! # Four read axes
 //!
-//! A cross-stream read or a subscription narrows the log along three axes,
-//! and only three. Each is a column or a key the caller wrote, matched on the
+//! A cross-stream read or a subscription narrows the log along four axes,
+//! and only four. Each is a column or a key the caller wrote, matched on the
 //! **stored** shape before the upcaster chain runs:
 //!
 //! ```text
@@ -27,16 +27,21 @@
 //!   Filter { streams: [orders/17, orders/18] }     ─▶ 1st 2nd 3rd 4th
 //!   Filter { kinds: [placed] }                     ─▶ 1st     3rd     5th
 //!   Filter { meta: [(tenant, a)] }                 ─▶ 1st 2nd     4th 5th
+//!   Filter { stream_prefix: orders/1 }             ─▶ 1st 2nd 3rd 4th 5th
 //!   Filter { kinds: [closed], meta: [(tenant, a)] } ─▶             4th
 //! ```
 //!
 //! `streams` and `kinds` are sets: a member matches. `meta` is a list of
 //! `(key, value)` pairs, every pair must match, and a key an event does not
-//! carry matches nothing — absence is not a value. Axes combine by AND.
+//! carry matches nothing — absence is not a value. `stream_prefix` is a
+//! range on the stream name, and it is a second predicate on the same column
+//! `streams` is: the two narrow each other rather than replace each other.
+//! Axes combine by AND.
 //!
 //! What the `meta` axis is: equality on a scalar the caller wrote, the same
-//! operation `kind IN (...)` is. What it is not: a query language. There is
-//! no range, no prefix, no `OR` across keys, and no reading inside `data`.
+//! operation `kind IN (...)` is. What it is not: a query language. On this
+//! axis there is no range, no prefix, no `OR` across keys, and no reading
+//! inside `data`.
 //! A caller with that question builds a projection, which is what a
 //! projection is for; the axis exists so that the *properties a projection
 //! keys on* are cheap to read from the log directly, not so that the log
@@ -79,7 +84,8 @@ use crate::transfer::{ExportedEvent, ImportReport};
 /// Every axis is matched on the **stored** shape — the stored kind, the
 /// stored stream name, the stored `meta` — before the upcaster chain runs,
 /// the same rule [`EventStore::read_kinds`] follows, for the same reason.
-/// The module doc has the three axes side by side.
+///
+/// The module doc has the four axes side by side.
 ///
 /// `#[non_exhaustive]`, so an axis can be added without breaking a caller.
 /// Start from [`Filter::all`] or [`Filter::kinds`] and narrow with the
@@ -112,6 +118,32 @@ pub struct Filter {
     /// than matched against nothing: a `null` here could only ever mean
     /// "select nothing", and that already has a spelling.
     pub meta: Option<Vec<(String, Value)>>,
+    /// A prefix every stream name must start with.
+    ///
+    /// **A byte-range on a name the caller chose.** The store does not
+    /// interpret the name: no separator is assumed and no category is
+    /// parsed, so `stream_prefix("session-")` and `stream_prefix("sess")`
+    /// are both legitimate and mean what they say. A name matches when the
+    /// prefix's bytes are its first bytes — the ordering a backend comparing
+    /// UTF-8 bytewise gives, which is what [`stream_prefix_bound`] turns
+    /// into a range.
+    ///
+    /// **`None` and `Some("")` both place no condition**: every name starts
+    /// with nothing, so an empty prefix is every stream rather than none of
+    /// them, and [`Filter::selects_nothing`] says so.
+    ///
+    /// **AND with `streams`, not instead of it.** Both are predicates on the
+    /// stream name, so a filter carrying both reads the members of the set
+    /// that start with the prefix. Refusing the pair as contradictory would
+    /// make `Filter` the one place in this API that judges a caller's
+    /// predicate for usefulness.
+    ///
+    /// One prefix, not a list: a caller wanting two runs two reads. What the
+    /// axis is *for* is the group a set cannot name — a stream is a period,
+    /// so the sessions of one month are `session-2026-09-01`,
+    /// `session-2026-09-02`, … and the streams that belong together are not
+    /// a set anybody holds.
+    pub stream_prefix: Option<String>,
 }
 
 impl Filter {
@@ -197,14 +229,74 @@ impl Filter {
         self
     }
 
+    /// Restrict to streams whose name starts with `prefix`.
+    ///
+    /// Replaces whatever prefix was there — two prefixes on one filter would
+    /// be a question with one answer, and the empty set has a spelling
+    /// already. See the field for what a prefix is, how it meets `streams`,
+    /// and why an empty one is every stream.
+    pub fn stream_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.stream_prefix = Some(prefix.into());
+        self
+    }
+
     /// Whether this filter can match anything at all. An empty list of either
     /// kind cannot, and a backend can skip the query entirely.
+    ///
+    /// A prefix never makes it true: the empty prefix is every stream, and a
+    /// prefix no stream carries is a question with an empty answer rather
+    /// than a filter that cannot be asked.
     pub fn selects_nothing(&self) -> bool {
         self.kinds.as_ref().is_some_and(|kinds| kinds.is_empty())
             || self
                 .streams
                 .as_ref()
                 .is_some_and(|streams| streams.is_empty())
+    }
+}
+
+/// The exclusive upper bound of a stream-name prefix: the least string that
+/// sorts above every name starting with `prefix`, or `None` when there is no
+/// such string and the range is open at the top.
+///
+/// `stream >= prefix AND stream < bound` is then exactly "starts with
+/// `prefix`" — for a backend that compares names as bytes, which is what
+/// SQLite's default `BINARY` collation does to `TEXT`.
+///
+/// **The bound is the prefix with its last *character* replaced by the next
+/// Unicode scalar value, not its last byte incremented.** Incrementing the
+/// last byte can leave the bound invalid UTF-8, and a [`String`] is the only
+/// thing this function can hand back for a backend to bind as text. The two
+/// agree on where the boundary falls, because UTF-8 preserves code-point
+/// order under bytewise comparison and no character's encoding is a prefix
+/// of another's: a name sorts below the bound exactly when the character
+/// where it first differs does.
+///
+/// A last character of [`char::MAX`] has no successor, so it is dropped and
+/// the character before it carries — the carry a byte-level `0xFF` takes,
+/// exact for the same reason: nothing sorts between `char::MAX` and the
+/// carried bound, so the range loses no name and gains none. A prefix made
+/// only of `char::MAX`, and the empty prefix, have no bound at all and leave
+/// the range open above.
+pub fn stream_prefix_bound(prefix: &str) -> Option<String> {
+    for (at, ch) in prefix.char_indices().rev() {
+        if let Some(next) = next_scalar(ch) {
+            let mut bound = String::with_capacity(at + next.len_utf8());
+            bound.push_str(&prefix[..at]);
+            bound.push(next);
+            return Some(bound);
+        }
+    }
+    None
+}
+
+/// The next Unicode scalar value after `ch`, stepping over the surrogate
+/// range, which is not one. `None` at [`char::MAX`], which has no successor.
+fn next_scalar(ch: char) -> Option<char> {
+    match ch as u32 {
+        0x10FFFF => None,
+        0xD7FF => char::from_u32(0xE000),
+        other => char::from_u32(other + 1),
     }
 }
 
@@ -350,5 +442,119 @@ mod tests {
         };
         assert!(!filter.selects_nothing());
         assert!(filter.validate().is_ok());
+    }
+
+    /// A prefix is a range, and a range is never "select nothing" — not even
+    /// the empty one, which is every stream. Nor is there anything about a
+    /// prefix for `validate` to refuse: any string is a legitimate range.
+    #[test]
+    fn a_prefix_is_a_condition_never_an_empty_selection() {
+        for prefix in ["", "session-", "\u{10FFFF}"] {
+            let filter = Filter::all().stream_prefix(prefix);
+            assert_eq!(filter.stream_prefix.as_deref(), Some(prefix));
+            assert!(!filter.selects_nothing(), "prefix {prefix:?}");
+            assert!(filter.validate().is_ok(), "prefix {prefix:?}");
+        }
+
+        // The set still decides: an empty set selects nothing whatever the
+        // prefix says, because the two are ANDed.
+        let filter = Filter::all()
+            .streams(Vec::<String>::new())
+            .stream_prefix("a");
+        assert!(filter.selects_nothing());
+    }
+
+    /// `stream_prefix` replaces, and leaves the other axes alone.
+    #[test]
+    fn stream_prefix_replaces_and_composes() {
+        let filter = Filter::kinds(["placed"])
+            .streams(["session-1"])
+            .stream_prefix("sess")
+            .stream_prefix("session-");
+        assert_eq!(filter.stream_prefix.as_deref(), Some("session-"));
+        assert_eq!(filter.streams, Some(vec!["session-1".to_string()]));
+        assert_eq!(filter.kinds, Some(vec!["placed".to_string()]));
+    }
+
+    /// The bound is the last character's successor, so it is still a `String`
+    /// a backend can bind as text.
+    #[test]
+    fn the_bound_is_the_next_scalar_value_after_the_last_character() {
+        assert_eq!(stream_prefix_bound("session-").as_deref(), Some("session."));
+        assert_eq!(stream_prefix_bound("a").as_deref(), Some("b"));
+        // Multi-byte: the last character moves, the ones before it do not.
+        assert_eq!(stream_prefix_bound("会話-").as_deref(), Some("会話."));
+        assert_eq!(stream_prefix_bound("会話").as_deref(), Some("会該"));
+        // The surrogate range is not a scalar value and is stepped over.
+        assert_eq!(stream_prefix_bound("\u{D7FF}").as_deref(), Some("\u{E000}"));
+    }
+
+    /// Both ends of the carry: a last character at [`char::MAX`] is dropped
+    /// and the one before it moves, and a prefix that is nothing but
+    /// `char::MAX` has no bound at all.
+    #[test]
+    fn char_max_carries_and_an_all_max_prefix_has_no_bound() {
+        assert_eq!(
+            stream_prefix_bound("a\u{10FFFF}").as_deref(),
+            Some("b"),
+            "the carry, the same one 0xFF takes at the byte level"
+        );
+        assert_eq!(
+            stream_prefix_bound("a\u{10FFFF}\u{10FFFF}").as_deref(),
+            Some("b")
+        );
+        assert_eq!(stream_prefix_bound("\u{10FFFF}"), None);
+        assert_eq!(stream_prefix_bound("\u{10FFFF}\u{10FFFF}"), None);
+        assert_eq!(stream_prefix_bound(""), None, "every name starts with it");
+    }
+
+    /// The property the bound exists for, checked bytewise the way a backend
+    /// comparing `TEXT` under `BINARY` collation does: for every candidate
+    /// name, `prefix <= name < bound` holds exactly when the name starts with
+    /// the prefix.
+    #[test]
+    fn the_range_is_exactly_the_names_that_start_with_the_prefix() {
+        let names = [
+            "",
+            "a",
+            "ab",
+            "b",
+            "session",
+            "session-",
+            "session-2026-09-01",
+            "session.",
+            "sessions-x",
+            "sessio",
+            "会話",
+            "会話-1",
+            "会該",
+            "a\u{10FFFF}",
+            "a\u{10FFFF}z",
+            "a\u{10FFFF}\u{10FFFF}",
+            "az",
+            "b\u{10FFFF}",
+        ];
+        for prefix in [
+            "",
+            "a",
+            "session-",
+            "sess",
+            "会話",
+            "\u{10FFFF}",
+            "a\u{10FFFF}",
+        ] {
+            let bound = stream_prefix_bound(prefix);
+            for name in names {
+                let in_range = name.as_bytes() >= prefix.as_bytes()
+                    && bound
+                        .as_ref()
+                        .is_none_or(|b| name.as_bytes() < b.as_bytes());
+                assert_eq!(
+                    in_range,
+                    name.starts_with(prefix),
+                    "prefix {prefix:?}, bound {bound:?}, name {name:?}"
+                );
+            }
+        }
     }
 }

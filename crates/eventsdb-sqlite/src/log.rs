@@ -84,6 +84,46 @@
 //! expression has no column affinity, so `TEXT` and `INTEGER` stay what they
 //! are and compare unequal.
 //!
+//! # A stream prefix is a range, not a `LIKE`
+//!
+//! [`Filter::stream_prefix()`] becomes two bound comparisons on the `stream`
+//! column, and [`eventsdb_core::log::stream_prefix_bound`] is the one place
+//! that says what the upper bound is and why it is exact. Here is why the
+//! predicate takes that shape rather than another:
+//!
+//! ```text
+//!   stream_prefix("session-")
+//!        │
+//!        ├──▶ AND stream >= 'session-'      the prefix itself
+//!        └──▶ AND stream <  'session.'      the bound, last char + 1
+//! ```
+//!
+//! Stream names are Rust `String`s bound as `TEXT`, and SQLite compares
+//! `TEXT` under `BINARY` collation — `memcmp` over the stored UTF-8 bytes —
+//! unless a column or an expression says otherwise, and `events.stream`
+//! does not. So the comparison SQLite makes is bytewise over UTF-8, which is
+//! the comparison the bound is computed for.
+//!
+//! The bound is bound as `TEXT`, like the prefix, and that is why it is a
+//! character successor rather than an incremented last byte. A byte-level
+//! increment can produce bytes that are not UTF-8, which leaves nothing to
+//! bind: as a `TEXT` parameter it is not a `String`, and as a `BLOB` it would
+//! be worse than wrong — SQLite orders values by storage class before it
+//! compares them, so every `BLOB` sorts above every `TEXT` and
+//! `stream < ?bound` would stop excluding anything.
+//!
+//! A range and not `LIKE 'session-%'`, because two indices lead on `stream`
+//! — `events_stream_kind_seq` and the one `UNIQUE (stream, seq)` creates —
+//! and a range on a leading column is what SQLite can seek with. `LIKE`
+//! reaches that plan only under `case_sensitive_like`, a connection-wide
+//! pragma this crate does not set and the hatch refuses to set, so a `LIKE`
+//! here would be a predicate whose plan depended on state outside the query.
+//! Which index a given read actually gets is the planner's, and
+//! `tests/stream_prefix.rs` asks it rather than asserting from here. An
+//! empty prefix places no clause at all: every name starts with it, and a
+//! clause that excludes nothing would still be a term for the planner to
+//! cost.
+//!
 //! # Indexing is on request, not on every key
 //!
 //! The shipped indices (the migration ladder in `schema.rs` is the list)
@@ -102,7 +142,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use eventsdb_core::error::{Error, Result};
 use eventsdb_core::event::now_ms;
-use eventsdb_core::log::{EventLog, Filter};
+use eventsdb_core::log::{stream_prefix_bound, EventLog, Filter};
 use eventsdb_core::position::{Position, Recorded};
 use eventsdb_core::store::EventStore;
 use eventsdb_core::transfer::{ExportedEvent, ImportReport};
@@ -526,6 +566,14 @@ pub(crate) fn select_stored(
         sql.push_str(&format!(" AND stream IN ({})", holes.join(", ")));
         for stream in streams {
             params.push(Box::new(stream.clone()));
+        }
+    }
+    if let Some(prefix) = filter.stream_prefix.as_deref().filter(|p| !p.is_empty()) {
+        params.push(Box::new(prefix.to_string()));
+        sql.push_str(&format!(" AND stream >= ?{}", params.len()));
+        if let Some(bound) = stream_prefix_bound(prefix) {
+            params.push(Box::new(bound));
+            sql.push_str(&format!(" AND stream < ?{}", params.len()));
         }
     }
     if let Some(kinds) = &filter.kinds {

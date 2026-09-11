@@ -3,6 +3,51 @@
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **A read narrows by stream-name prefix.** `Filter::stream_prefix(..)` and the
+  public field behind it are a fourth read axis, honoured by everything that
+  takes a `Filter`: `read_all`, `subscribe`, `replay`, `export` and
+  `export_recorded`. `Filter` is `#[non_exhaustive]`, so a field and a method
+  are additive. The axis exists because this store's answer to a stream that
+  grows without bound is that a stream is a period — the sessions of one month
+  are `session-2026-09-01`, `session-2026-09-02`, … and the streams that belong
+  together are then not a set anybody holds, so `streams`, which names every
+  stream in full, could not ask for them without the caller enumerating them
+  first. No separator is assumed and no category is parsed: a prefix is a range
+  on a name the caller chose, and `stream_prefix("sess")` means what it says.
+
+  It compiles to `stream >= ?a AND stream < ?b`, a range rather than
+  `LIKE 'p%'`, because two indices lead on `stream` and a range on a leading
+  column is a seek, where `LIKE` reaches that plan only under
+  `case_sensitive_like` — a connection-wide pragma this crate does not set and
+  the hatch refuses to set, so a `LIKE` here would be a predicate whose plan
+  depended on state outside the query. The upper bound is the prefix with its
+  **last character** moved to the next Unicode scalar value, not its last byte
+  incremented. SQLite compares `TEXT` under `BINARY` collation — `memcmp` over
+  the stored UTF-8 — so a byte range is the right shape, but an incremented
+  last byte need not be valid UTF-8 and there would be nothing to bind: as
+  `TEXT` it is not a `String`, and as a `BLOB` it would be worse than wrong,
+  since SQLite orders by storage class before value and every `BLOB` sorts
+  above every `TEXT`, which would leave `stream < ?b` excluding nothing. UTF-8
+  preserves code-point order under bytewise comparison, so the character
+  successor falls exactly where the byte increment would. A last character at
+  `char::MAX` has no successor, so it is dropped and the character before it
+  carries — the carry a trailing `0xFF` takes, exact for the same reason — and
+  a prefix that is nothing but `char::MAX`, like the empty prefix, leaves the
+  range open above.
+
+  A prefix and `streams` **AND**: a filter carrying both reads the members of
+  the set that start with the prefix. Refusing the pair as contradictory would
+  have made `Filter` the one place in this API that judges a caller's predicate
+  for usefulness. An empty prefix is every stream rather than none of them,
+  which is the reading `Some(vec![])` deliberately does not get for `streams`.
+  And a prefix makes an export a filtered export: `export_recorded` reports
+  `whole = false`, so such a receipt does not extend the chain
+  `Guard::Exported` walks, however faithfully it is confirmed.
+
 ## [0.5.0] - 2026-09-11
 
 A minor rather than a patch, for two independent reasons. `ExportedEvent`'s
@@ -329,6 +374,7 @@ implemented and tested.
   and `retention`, against a file-backed log. Contention questions live in
   `tests/` instead, where a regression is a failure rather than a slower bar.
 
+[Unreleased]: https://github.com/ynishi/eventsdb/compare/v0.5.0...HEAD
 [0.5.0]: https://github.com/ynishi/eventsdb/releases/tag/v0.5.0
 [0.4.0]: https://github.com/ynishi/eventsdb/releases/tag/v0.4.0
 [0.3.0]: https://github.com/ynishi/eventsdb/releases/tag/v0.3.0
