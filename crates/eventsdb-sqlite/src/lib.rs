@@ -28,6 +28,7 @@
 //! # }
 //! ```
 
+mod backup;
 mod catalog;
 mod hatch;
 mod log;

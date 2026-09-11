@@ -286,6 +286,41 @@ a log that cannot do this declines rather than offering a partial import: a
 transfer that stopped half way is worse than one that refused, because from the
 outside there is no way to tell how far it got.
 
+### The logical copy and the physical one
+
+Export is the **logical** copy: the events, as records that carry no SQLite in
+them. It is backend-neutral and it survives a change of format — a log exported
+today reads into a store whose tables look nothing like these. What it
+deliberately leaves behind is everything that is not an event: the read models
+projections built, the `checkpoints` they advanced, the retention ledger and
+the export receipts. Restoring from an export means rebuilding every projection
+and doing without the ledger, which is the only remaining evidence of what
+retention removed.
+
+`backup_to` is the **physical** copy: every page of the file, read models and
+reserved tables included, in the SQLite file format the file is already in.
+
+    log.backup_to("events-backup.db").await?;
+
+    // Restoring is opening the copy. Nothing writes into the live file.
+    let restored = SqliteEventLog::open("events-backup.db").await?;
+
+It runs on a reader connection through SQLite's online backup API, in one step
+under one read transaction, so the copy is consistent while the log is open and
+a writer holding the lock is neither waited for nor refused: the copy holds
+what had committed when it started. That is the part `cp` cannot do — on a WAL
+database the `-wal` file holds committed pages the main file does not yet, and
+a copy taken between two writes can carry half a transaction.
+
+The destination is a path the caller names, and it must not exist: a backup
+that silently overwrote the backup before it is a shape that loses data on a
+typo, so an occupied path is refused and the copy is not taken.
+
+Which one to reach for follows from what each keeps. The physical copy is the
+same log — positions, per-stream counters, projections at their cursors — and
+it is a SQLite file, so it is as portable as SQLite is. The logical copy is the
+events, and it is as portable as JSON is.
+
 ### A table this crate did not create
 
 The file can already hold an `events` table — a hand-rolled log from before

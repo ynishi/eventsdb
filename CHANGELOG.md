@@ -7,6 +7,58 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Added
 
+- **An open log can be copied.** `SqliteEventLog::backup_to(path)` takes a
+  consistent physical copy of the file while the log is open and being written
+  to. `export` is the logical copy and is deliberately only the events, so
+  restoring from one means rebuilding every projection and doing without the
+  retention ledger — the only remaining evidence of what a removal took. `cp`
+  is the physical copy and on a WAL database with a writer open it is not a
+  consistent one: the `-wal` file holds committed pages the main file does not
+  yet, and a copy taken between two writes can carry half a transaction. This
+  is the whole file — events, `stream_seq`, `checkpoints`, the ledger, the
+  export receipts, the indices, the append-only trigger and the read-model
+  tables projections built — so the copy opens with `open`, finds itself
+  already at `TARGET_USER_VERSION`, and resumes its projections from their
+  cursors rather than rebuilding them.
+
+  It runs on a **reader** connection, in one step under one read transaction.
+  A `with_transaction` or a projection batch holding the write lock while the
+  copy runs is neither waited for nor refused: the copy holds what had
+  committed when it started, and the transaction in flight lands in the source
+  afterwards. The one step matters — the backup API restarts a copy that
+  another connection writes under, and this crate has a writer on another
+  thread by design, so a stepped copy that yielded between steps is the shape
+  that can restart for ever on a busy log.
+
+  **`VACUUM INTO` was measured against SQLite's online backup API and lost on
+  the reader, not on the pragmas.** Both were taken from a log this crate
+  created, standing at `user_version` 5 with `auto_vacuum` 2 (`INCREMENTAL`),
+  and both copies came back at `user_version` 5 and `auto_vacuum` 2 — so
+  either would have carried the pragma `reclaim` depends on and that SQLite
+  accepts only before the first table exists. What separated them is that a
+  reader connection here is pinned with `PRAGMA query_only = 1`, and
+  `VACUUM INTO` on one fails with `SQLITE_READONLY`, "attempt to write a
+  readonly database". It is the pragma and not the `SQLITE_OPEN_READ_ONLY`
+  flag that refuses it, measured both ways round, and that the destination is
+  a different file does not enter into it — so `VACUUM INTO` could only be had
+  by moving the copy to the writer, where it would hold every append behind
+  it, or by switching the reader's guard off around it. The backup API asks
+  the source connection for nothing but reads. `rusqlite`'s `backup` feature
+  is therefore enabled; it pulls no extra native code, the C functions being
+  in the amalgamation `bundled` already builds. The copy is taken with
+  `Backup::step(-1)` rather than `run_to_completion(-1, ..)`, which asserts its
+  page count is positive and panics on `-1`.
+
+  **The destination must not exist.** It is taken with an exclusive create, so
+  a path that already holds anything — a previous backup most of all — is
+  refused as `Error::Validation` rather than overwritten; the backup API
+  itself would overwrite it silently, which is a shape that loses data on a
+  typo. A failed copy removes the file the call created, so a retry to the
+  same path is not refused by the leftover of the attempt before it. Nothing
+  is written into the live file and nothing records the copy: this is not a
+  restore — restoring is opening the copy — and the `exports` table is for
+  pages of events and does not fit one.
+
 - **The log can be listed.** Five methods on `SqliteEventLog` —
   `streams(after, prefix, limit)`, `kinds(after, limit)`,
   `checkpoints(after, limit)`, `retention_ledger(after, limit)` and
