@@ -5,7 +5,38 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+A minor rather than a patch, for two independent reasons. `ExportedEvent`'s
+public `position` field becomes an `Option<Position>`, so every construction
+and every read of it outside this crate has to say `Some` or handle `None`.
+And `SqliteEventLog::query`, `query_timeout` and `query_with` take
+`impl Into<Params>` where they took `Vec<Value>` — argument-position
+`impl Trait` is a generic parameter, so the number of generic arguments those
+methods have changes, which the Rust Reference calls a breaking change for a
+caller who turbofishes them. Nobody here does. What does bite in practice is
+inference: two of the three `From` impls are over a `Vec`, so an empty
+parameter literal no longer says which kind it is and `vec![]` /
+`Vec::new()` has to become `Vec::<Value>::new()`. A non-empty
+`vec![json!(..)]` is unchanged.
+
 ### Added
+
+- **The hatch binds by name, not only by position.** `eventsdb_core::Params`
+  (re-exported by `eventsdb-sqlite`) is `Positional(Vec<Value>)` or
+  `Named(Vec<(String, Value)>)`, with `From` for `Vec<Value>`,
+  `Vec<(String, Value)>` and `Map<String, Value>`; `SqliteEventLog::query`,
+  `query_timeout` and `query_with` take anything that converts. SQLite has one
+  parameter space and four spellings for a slot in it, and refusing the named
+  half guarded no invariant — it pushed the rewriting of `:name` to `?N` onto
+  the caller, which means reading the SQL past its string literals, and this
+  crate's own example has a `$` inside one (`json_extract(data, '$.n')`). A
+  name is the placeholder as written, sigil included: `(":kind", json!("x"))`.
+  Every name a statement declares must be supplied — one that is not is
+  `Error::Validation` naming it, because rusqlite leaves an unbound named
+  parameter at `NULL` and the statement would otherwise answer as though the
+  caller had meant that. The `EventStore` trait's `query` and `query_timeout`
+  keep `Vec<Value>` and stay positional: the trait is used as
+  `Box<dyn EventStore>`, and a dispatchable method may not have type
+  parameters.
 
 - **A table this crate did not create is refused at open.** At `user_version`
   0, `migrate` looks in `sqlite_master` before the first ladder step and
@@ -23,6 +54,33 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   is left.
 
 ### Changed
+
+- **`ExportedEvent.position` is an `Option<Position>`.** The field is a
+  witness rather than an instruction — import reassigns `seq` and `position`
+  and never reads it to write — and a record from anywhere but an eventsdb log
+  has no witness to carry. The type used to require one, so a caller adopting
+  rows from a foreign table wrote `Position::BEGINNING`: that is `Position(0)`,
+  a stored position is a rowid and starts at 1, and `0` was therefore already
+  serving as "none" in band by a convention nobody had written down.
+  `reproduced_coordinates` is now
+  `exported.position.is_some_and(|p| landed.position == Some(p))`, so an
+  import of witness-less records reports `false` because the records say there
+  was nothing to reproduce, rather than by arithmetic accident. In JSON,
+  `to_json` omits the key when it is `None` and `from_json` reads a missing
+  key and an explicit `null` alike as `None`, still refusing anything else
+  that is not a non-negative integer. Struct literals outside the crate need
+  `Some(..)`, and a reader of the field needs to handle `None`; the struct
+  itself keeps public fields and stays not `#[non_exhaustive]`, because it is
+  a record a caller both receives and builds. A 0.4.0 reader cannot parse a
+  line that omits `position`; that direction was never promised.
+
+- A parameter set that does not match its statement is `Error::Validation`
+  where it was `Error::Storage`. rusqlite raises `InvalidParameterName` and
+  `InvalidParameterCount` before SQLite runs anything, so nothing about the
+  database has failed — a positional count mismatch used to arrive as
+  `Storage("Wrong number of parameters passed to query. Got 1, needed 2")`,
+  which is the class that tells a caller to consider the database, for the
+  caller's own typo. The message carries the name, or both counts.
 
 - The escape hatch's prose says what its code does. `query_timeout` documented
   `Error::Busy` and returns `Error::Timeout`; `SqliteEventLog::query` now
