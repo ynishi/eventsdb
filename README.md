@@ -297,7 +297,10 @@ Then the ladder runs clean and the rows come in through the front door:
     let report = log.import(rows.iter().map(to_exported_event).collect()).await?;
 
     // The old table goes once the report is right.
-    log.with_transaction(|tx| Ok(tx.execute_batch("DROP TABLE legacy_events")?)).await?;
+    log.with_transaction(|tx| {
+        tx.execute_batch("DROP TABLE legacy_events")?;
+        Ok(())
+    }).await?;
 
 Each record's `position` is the coordinate the row had in the old table, and
 it is a witness rather than an instruction, as in any other import. So
