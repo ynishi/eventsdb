@@ -27,7 +27,7 @@ async fn export_all(log: &SqliteEventLog) -> Vec<ExportedEvent> {
         let batch = log.export(cursor, &Filter::all(), 3).await.unwrap();
         let full = batch.len() == 3;
         if let Some(last) = batch.last() {
-            cursor = last.position;
+            cursor = last.position.expect("an export off a log witnesses itself");
         }
         out.extend(batch);
         if !full {
@@ -353,7 +353,7 @@ async fn move_log<L: EventLog>(from: &L, to: &L) -> (usize, bool) {
     loop {
         let batch = from.export(cursor, &Filter::all(), 2).await.unwrap();
         let Some(last) = batch.last() else { break };
-        cursor = last.position;
+        cursor = last.position.expect("an export off a log witnesses itself");
 
         let report = to.import(batch).await.unwrap();
         moved += report.imported;
@@ -377,4 +377,125 @@ async fn a_migration_can_be_written_against_the_trait_alone() {
     assert_eq!(moved, 5);
     assert!(faithful, "the same events, at the same coordinates");
     assert_eq!(export_all(&target).await, export_all(&source).await);
+}
+
+/// A record from somewhere that is not an eventsdb log has no witness, and the
+/// type can say so.
+#[tokio::test]
+async fn a_record_without_a_position_round_trips_as_none() {
+    let log = seeded(&[("s", 1)]).await;
+    let stored = export_all(&log).await[0].event.clone();
+
+    let no_witness = ExportedEvent {
+        stream: "s".to_string(),
+        position: None,
+        event: stored,
+    };
+
+    // The key is not there at all, rather than a `null` a reader has to know
+    // to treat as absent.
+    let json = no_witness.to_json();
+    assert!(
+        json.as_object().unwrap().get("position").is_none(),
+        "got {json}"
+    );
+
+    assert_eq!(ExportedEvent::from_json(json).unwrap(), no_witness);
+}
+
+/// A writer that spells absence as `null` is saying the same thing, and is
+/// read as saying it.
+#[tokio::test]
+async fn an_explicit_null_position_reads_as_none() {
+    let log = seeded(&[("s", 1)]).await;
+    let mut line = export_all(&log).await[0].to_json();
+    line.as_object_mut()
+        .unwrap()
+        .insert("position".to_string(), Value::Null);
+
+    let parsed = ExportedEvent::from_json(line).unwrap();
+    assert_eq!(parsed.position, None);
+}
+
+/// A line written by 0.4.0 carries an integer, and still parses to a witness.
+#[tokio::test]
+async fn a_line_with_an_integer_position_still_parses_to_some() {
+    let log = seeded(&[("s", 1)]).await;
+    let line = export_all(&log).await[0].to_json();
+    assert_eq!(line["position"], json!(1));
+
+    let parsed = ExportedEvent::from_json(line).unwrap();
+    assert_eq!(parsed.position, Some(Position::new(1)));
+}
+
+/// A position that is present and unreadable is not an absent one.
+#[tokio::test]
+async fn a_position_that_is_neither_absent_nor_an_integer_is_still_refused() {
+    let log = seeded(&[("s", 1)]).await;
+    let mut line = export_all(&log).await[0].to_json();
+    line.as_object_mut()
+        .unwrap()
+        .insert("position".to_string(), json!("1"));
+
+    let error = ExportedEvent::from_json(line).unwrap_err();
+    assert!(error.to_string().contains("position"), "got {error}");
+}
+
+/// Importing records that carry no witness reports `false` — which is the
+/// answer `Position::BEGINNING` used to arrive at by accident, now arrived at
+/// because the records say there was nothing to reproduce. The events
+/// themselves are intact.
+#[tokio::test]
+async fn an_import_of_records_with_no_witness_reproduces_nothing_and_says_so() {
+    let source = seeded(&[("a", 2), ("b", 1)]).await;
+    let with_witness = export_all(&source).await;
+    let without: Vec<ExportedEvent> = with_witness
+        .iter()
+        .map(|e| ExportedEvent {
+            stream: e.stream.clone(),
+            position: None,
+            event: e.event.clone(),
+        })
+        .collect();
+
+    let target = SqliteEventLog::open_in_memory().await.unwrap();
+    let report = target.import(without).await.unwrap();
+
+    assert_eq!(report.imported, 3);
+    assert!(
+        !report.reproduced_coordinates,
+        "a record that never had a position of ours is not evidence that one was reproduced"
+    );
+    assert_eq!(report.first, Some(Position::new(1)));
+    assert_eq!(report.last, Some(Position::new(3)));
+
+    // Everything except the witness travelled: same streams, same stored
+    // objects, in the same order.
+    let landed = export_all(&target).await;
+    assert_eq!(
+        landed.iter().map(|e| e.stream.as_str()).collect::<Vec<_>>(),
+        with_witness
+            .iter()
+            .map(|e| e.stream.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        landed.iter().map(|e| &e.event).collect::<Vec<_>>(),
+        with_witness.iter().map(|e| &e.event).collect::<Vec<_>>()
+    );
+}
+
+/// One record without a witness is enough to make the claim false, even when
+/// every other record landed where it said.
+#[tokio::test]
+async fn one_record_without_a_witness_is_enough_to_refuse_the_claim() {
+    let source = seeded(&[("a", 3)]).await;
+    let mut exported = export_all(&source).await;
+    exported[1].position = None;
+
+    let target = SqliteEventLog::open_in_memory().await.unwrap();
+    let report = target.import(exported).await.unwrap();
+
+    assert_eq!(report.imported, 3);
+    assert!(!report.reproduced_coordinates, "{report:?}");
 }

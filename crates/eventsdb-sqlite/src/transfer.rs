@@ -40,7 +40,9 @@ pub(crate) async fn export(
                 rows.into_iter()
                     .map(|row| ExportedEvent {
                         stream: row.stream,
-                        position: Position::new(row.position),
+                        // An export off this log always has a witness: the row
+                        // it came from is where it is.
+                        position: Some(Position::new(row.position)),
                         event: match row.event {
                             Value::Object(object) => object,
                             _ => unreachable!("a stored row is always an object"),
@@ -77,10 +79,15 @@ pub(crate) async fn import(
     log.with_transaction(move |tx| {
         let committed = tx.import_many(&events)?;
 
-        let reproduced = committed
-            .iter()
-            .zip(&events)
-            .all(|(landed, exported)| landed.position == Some(exported.position));
+        // A record with no witness cannot have landed back on it, so it is
+        // `false` rather than vacuously true: the claim this flag makes is
+        // that the copy is the same *log*, and a record that never had a
+        // position of ours is not evidence for it.
+        let reproduced = committed.iter().zip(&events).all(|(landed, exported)| {
+            exported
+                .position
+                .is_some_and(|p| landed.position == Some(p))
+        });
 
         Ok(ImportReport {
             imported: committed.len(),

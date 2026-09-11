@@ -466,7 +466,9 @@ impl SqliteEventLog {
         limit: usize,
     ) -> Result<(Vec<ExportedEvent>, ExportReceipt)> {
         let events = crate::transfer::export(self, from, filter, limit).await?;
-        let through = events.last().map_or(from, |last| last.position);
+        // `export` fills the witness on every record it produces, so the
+        // fallback is the empty page's, not a record's missing one.
+        let through = events.last().and_then(|last| last.position).unwrap_or(from);
         let count = events.len();
         let whole = filter.kinds.is_none()
             && filter.streams.is_none()

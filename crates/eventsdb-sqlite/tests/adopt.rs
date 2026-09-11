@@ -183,7 +183,9 @@ async fn the_documented_rename_and_import_brings_a_foreign_log_in() {
                 stream: row["stream"].as_str().unwrap().to_string(),
                 // The position it had in the old table. A witness, not an
                 // instruction — see `ImportReport::reproduced_coordinates`.
-                position: Position::new(row["id"].as_u64().unwrap()),
+                // `Some`, because this table did have keys: a foreign record
+                // that carries no coordinate at all writes `None`.
+                position: Some(Position::new(row["id"].as_u64().unwrap())),
                 event,
             }
         })
