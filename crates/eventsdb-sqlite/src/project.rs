@@ -36,6 +36,7 @@ use crate::hatch::{guarded, map_denial};
 use crate::log::{head_position_in, load_checkpoint, save_checkpoint, select_recorded};
 use crate::retention::require_complete_from;
 use crate::shared::{classify, map_isle, Shared};
+use crate::trace::{self, span};
 use crate::txn::{Trusted, Untrusted};
 
 /// How many events a runner applies per transaction unless told otherwise.
@@ -222,54 +223,73 @@ impl<P: Projection> ProjectionRunner<P> {
     /// means the projection is caught up.
     pub async fn run_once(&mut self) -> Result<usize> {
         let batch = self.batch;
-        self.in_transaction(move |projection, tx, chain| {
-            let name = projection.name().to_string();
-            let filter = match projection.kinds() {
-                Some(kinds) => Filter::kinds(kinds),
-                None => Filter::all(),
-            };
+        let span = span!(
+            "eventsdb.project",
+            name = %self.name,
+            batch = batch,
+            applied = tracing::field::Empty,
+            cursor = tracing::field::Empty,
+        );
 
-            let cursor = load_checkpoint(tx, &name)?;
-            // Inside the same transaction as the read, so retention cannot
-            // land between the check and the batch it vouches for.
-            if !projection.tolerates_truncation() {
-                require_complete_from(tx, cursor)?;
-            }
+        // The cursor comes back beside the count for the same reason
+        // `append_if`'s `folded` does: it is known inside the transaction, on
+        // the SQLite thread, where this span is not current.
+        let outcome = trace::instrument(
+            span.clone(),
+            self.in_transaction(move |projection, tx, chain| {
+                let name = projection.name().to_string();
+                let filter = match projection.kinds() {
+                    Some(kinds) => Filter::kinds(kinds),
+                    None => Filter::all(),
+                };
 
-            // Read before the batch, so "the batch was short, therefore
-            // everything up to here was scanned" stays true whatever else the
-            // database does.
-            let head = head_position_in(tx)?;
-            let events = select_recorded(tx, chain, cursor, &filter, batch)?;
-            let full = events.len() == batch;
-            let applied = events.len();
+                let cursor = load_checkpoint(tx, &name)?;
+                // Inside the same transaction as the read, so retention cannot
+                // land between the check and the batch it vouches for.
+                if !projection.tolerates_truncation() {
+                    require_complete_from(tx, cursor)?;
+                }
 
-            let mut last = cursor;
-            for event in &events {
-                tx.callback(|raw| projection.apply(raw, event))?;
-                last = event.position;
-            }
+                // Read before the batch, so "the batch was short, therefore
+                // everything up to here was scanned" stays true whatever else the
+                // database does.
+                let head = head_position_in(tx)?;
+                let events = select_recorded(tx, chain, cursor, &filter, batch)?;
+                let full = events.len() == batch;
+                let applied = events.len();
 
-            // How far the projection has *seen*, which is not how far it has
-            // applied. A projection that names its kinds declines everything
-            // else, and a cursor that only moved on matches would park at the
-            // last match for ever: it would report itself behind when it is
-            // not, block retention through `Guard::RegisteredConsumers`, and
-            // re-scan the same prefix on every poll.
-            //
-            // A short batch means the filtered range is exhausted, so
-            // everything up to `head` has been offered and declined. A full
-            // one says nothing about what lies beyond it, so the cursor stops
-            // at the last applied event.
-            let seen_through = if full { last } else { last.max(head) };
-            if seen_through > cursor {
-                // Same transaction as the applies above. This is the
-                // exactly-once claim, and it is one line.
-                save_checkpoint(tx, &name, seen_through)?;
-            }
-            Ok(applied)
-        })
-        .await
+                let mut last = cursor;
+                for event in &events {
+                    tx.callback(|raw| projection.apply(raw, event))?;
+                    last = event.position;
+                }
+
+                // How far the projection has *seen*, which is not how far it has
+                // applied. A projection that names its kinds declines everything
+                // else, and a cursor that only moved on matches would park at the
+                // last match for ever: it would report itself behind when it is
+                // not, block retention through `Guard::RegisteredConsumers`, and
+                // re-scan the same prefix on every poll.
+                //
+                // A short batch means the filtered range is exhausted, so
+                // everything up to `head` has been offered and declined. A full
+                // one says nothing about what lies beyond it, so the cursor stops
+                // at the last applied event.
+                let seen_through = if full { last } else { last.max(head) };
+                if seen_through > cursor {
+                    // Same transaction as the applies above. This is the
+                    // exactly-once claim, and it is one line.
+                    save_checkpoint(tx, &name, seen_through)?;
+                }
+                Ok((applied, seen_through))
+            }),
+        )
+        .await;
+
+        let (applied, cursor) = outcome?;
+        span.record("applied", applied);
+        span.record("cursor", cursor.get());
+        Ok(applied)
     }
 
     /// Run batches until the projection is caught up. Returns the total
@@ -450,12 +470,15 @@ impl<P: Projection> ProjectionRunner<P> {
             })
         };
 
-        match self.shared.isle.call(job).await {
+        // Every method here comes through this one place, so it is also the
+        // one place a refusal — a fold over a truncated log, a projection
+        // body the authorizer turned down — is reported.
+        trace::refusal(match self.shared.isle.call(job).await {
             Ok((projection, outcome)) => {
                 self.projection = projection;
                 outcome
             }
             Err(isle) => Err(map_isle(isle)),
-        }
+        })
     }
 }

@@ -23,6 +23,13 @@ include = [
     "LICENSE-APACHE",
 ]
 
+# Instrumentation is a feature because a store that nobody is watching should
+# not carry the machinery for being watched. `dep:tracing` and no implicit
+# feature, so `tracing` is in the graph exactly when the feature is on — see
+# the crate root's "Instrumentation" section for what it emits.
+[features]
+tracing = ["dep:tracing"]
+
 [dependencies]
 eventsdb-core.workspace = true
 
@@ -33,12 +40,36 @@ rusqlite.workspace = true
 rusqlite-isle.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+# 0.1 declares `rust-version = "1.65"`, which is inside this workspace's 1.85
+# floor with room to spare, so instrumenting does not move the MSRV. No `log`
+# bridge: a caller already on `log` reaches this through `tracing`'s own
+# compatibility layer, which is their dependency to add rather than ours.
+tracing = { version = "0.1", optional = true, default-features = false, features = [
+    "std",
+] }
 
 [dev-dependencies]
 criterion.workspace = true
 futures-util = "0.3"
 tempfile.workspace = true
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+# For `tests/tracing.rs`, which is behind the same feature. A dev-dependency
+# is not in a consumer's graph either way, so this does not weaken the claim
+# that the feature costs nothing when it is off.
+#
+# `registry` and nothing else: the test collects into a `Layer` of its own
+# rather than reading formatted text, and the default set would pull
+# `tracing-log` and with it `log`, which this workspace deliberately does not
+# depend on.
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "registry",
+    "std",
+] }
+
+# The feature is off by default, so without this docs.rs would publish a page
+# with no instrumentation section on it.
+[package.metadata.docs.rs]
+all-features = true
 
 # Criterion needs the default harness off so it can own `main`.
 [[bench]]

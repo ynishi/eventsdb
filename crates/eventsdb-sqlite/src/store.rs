@@ -24,6 +24,7 @@ use serde_json::{Map, Value};
 
 use crate::row;
 use crate::shared::{backoff, classify, map_isle, Shared, MAX_BUSY_RETRIES};
+use crate::trace::{self, span};
 
 pub struct SqliteEventStore {
     pub(crate) shared: Arc<Shared>,
@@ -251,9 +252,16 @@ impl EventStore for SqliteEventStore {
         // no sequence number.
         validate(&event)?;
         let stream = self.stream.clone();
+        let span = span!(
+            "eventsdb.append",
+            stream = %self.stream,
+            count = 1,
+            position = tracing::field::Empty,
+        );
 
-        let committed = self
-            .write_retrying(move || {
+        let committed = trace::instrument(
+            span.clone(),
+            self.write_retrying(move || {
                 let stream = stream.clone();
                 let event = event.clone();
                 move |conn: &mut Connection| {
@@ -269,10 +277,12 @@ impl EventStore for SqliteEventStore {
                         Ok(committed)
                     })())
                 }
-            })
-            .await?;
+            }),
+        )
+        .await?;
 
         if let Some(position) = committed.position {
+            span.record("position", position.get());
             self.shared.publish(position);
         }
         Ok(committed)
@@ -288,9 +298,16 @@ impl EventStore for SqliteEventStore {
             return Ok(Vec::new());
         }
         let stream = self.stream.clone();
+        let span = span!(
+            "eventsdb.append",
+            stream = %self.stream,
+            count = events.len(),
+            position = tracing::field::Empty,
+        );
 
-        let committed = self
-            .write_retrying(move || {
+        let committed = trace::instrument(
+            span.clone(),
+            self.write_retrying(move || {
                 let stream = stream.clone();
                 let events = events.clone();
                 move |conn: &mut Connection| {
@@ -314,10 +331,12 @@ impl EventStore for SqliteEventStore {
                         Ok(out)
                     })())
                 }
-            })
-            .await?;
+            }),
+        )
+        .await?;
 
         if let Some(last) = committed.last().and_then(|c| c.position) {
+            span.record("position", last.get());
             self.shared.publish(last);
         }
         Ok(committed)
@@ -357,7 +376,16 @@ impl EventStore for SqliteEventStore {
         let stream = self.stream.clone();
         let kinds = kinds.map(|k| k.iter().map(|s| s.to_string()).collect::<Vec<_>>());
         let chain = self.shared.chain.clone();
+        let span = span!(
+            "eventsdb.decide",
+            stream = %self.stream,
+            folded = tracing::field::Empty,
+            appended = tracing::field::Empty,
+        );
 
+        // `folded` travels back beside the outcome rather than being emitted
+        // where it is counted: the count is taken on the SQLite thread, inside
+        // the job, where this span is not current.
         let job = move |conn: &mut Connection| {
             Ok((|| {
                 let tx = conn
@@ -365,11 +393,12 @@ impl EventStore for SqliteEventStore {
                     .map_err(classify)?;
                 let stored = select_stream(&tx, &stream, kinds.as_deref(), 0, usize::MAX)?;
                 let seen = SqliteEventStore::upcast_rows(&chain, stored)?;
+                let folded = seen.len();
 
                 let Some(event) = decide(&seen) else {
                     // Nothing to record. The transaction is dropped, which
                     // rolls back a read that changed nothing anyway.
-                    return Ok(None);
+                    return Ok((folded, None));
                 };
                 validate(&event)?;
                 let seq = next_seq(&tx, &stream)?;
@@ -377,14 +406,16 @@ impl EventStore for SqliteEventStore {
                 let committed = insert_stamped(&tx, &stream, &stamped)?;
                 set_next_seq(&tx, &stream, seq + 1)?;
                 tx.commit().map_err(classify)?;
-                Ok(Some(committed))
+                Ok((folded, Some(committed)))
             })())
         };
 
         // On the writer, not a reader: this reads *and* appends in one
         // transaction, and a read-only connection could do neither the write
         // nor see it.
-        let committed = self.writer_job(job).await?;
+        let (folded, committed) = trace::instrument(span.clone(), self.writer_job(job)).await?;
+        span.record("folded", folded);
+        span.record("appended", committed.is_some());
         if let Some(position) = committed.and_then(|c| c.position) {
             self.shared.publish(position);
         }
@@ -394,9 +425,16 @@ impl EventStore for SqliteEventStore {
     async fn append_at(&mut self, epoch_ms: u64, event: Map<String, Value>) -> Result<Committed> {
         validate(&event)?;
         let stream = self.stream.clone();
+        let span = span!(
+            "eventsdb.append",
+            stream = %self.stream,
+            count = 1,
+            position = tracing::field::Empty,
+        );
 
-        let committed = self
-            .write_retrying(move || {
+        let committed = trace::instrument(
+            span.clone(),
+            self.write_retrying(move || {
                 let stream = stream.clone();
                 let event = event.clone();
                 move |conn: &mut Connection| {
@@ -412,10 +450,12 @@ impl EventStore for SqliteEventStore {
                         Ok(committed)
                     })())
                 }
-            })
-            .await?;
+            }),
+        )
+        .await?;
 
         if let Some(position) = committed.position {
+            span.record("position", position.get());
             self.shared.publish(position);
         }
         Ok(committed)
@@ -441,9 +481,17 @@ impl EventStore for SqliteEventStore {
     ) -> Result<Committed> {
         validate(&event)?;
         let stream = self.stream.clone();
+        let span = span!(
+            "eventsdb.append",
+            stream = %self.stream,
+            expected = ?expected,
+            outcome = tracing::field::Empty,
+            position = tracing::field::Empty,
+        );
 
-        let committed = self
-            .write_retrying(move || {
+        let committed = trace::instrument(
+            span.clone(),
+            self.write_retrying(move || {
                 let stream = stream.clone();
                 let event = event.clone();
                 move |conn: &mut Connection| {
@@ -471,10 +519,33 @@ impl EventStore for SqliteEventStore {
                         Ok(committed)
                     })())
                 }
-            })
-            .await?;
+            }),
+        )
+        .await;
+
+        // `outcome` rather than a refusal: a head that moved is the answer to
+        // a compare-and-swap, not the store declining to do something. What
+        // the caller does about it is the caller's, so it stays at the span's
+        // own level and out of `warn`.
+        let committed = match committed {
+            Ok(committed) => {
+                span.record("outcome", "appended");
+                committed
+            }
+            Err(error) => {
+                span.record(
+                    "outcome",
+                    match error {
+                        Error::HeadMismatch { .. } => "head_mismatch",
+                        _ => "failed",
+                    },
+                );
+                return Err(error);
+            }
+        };
 
         if let Some(position) = committed.position {
+            span.record("position", position.get());
             self.shared.publish(position);
         }
         Ok(committed)
