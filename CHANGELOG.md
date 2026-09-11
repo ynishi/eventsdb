@@ -7,6 +7,74 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Added
 
+- **The log can be listed.** Five methods on `SqliteEventLog` —
+  `streams(after, prefix, limit)`, `kinds(after, limit)`,
+  `checkpoints(after, limit)`, `retention_ledger(after, limit)` and
+  `export_receipts(after, limit)` — answer "which ones are there" for the five
+  reserved tables. Every other read takes a name the caller already holds, so
+  the only way to ask which streams, kinds, consumers, removals or receipts
+  existed was `log.query("SELECT stream, next_seq - 1 FROM stream_seq", …)`
+  through the escape hatch: the contract for "list my streams" was the column
+  layout of a table the migration ladder owns.
+
+  Each pages, and the shape is `read_all`'s — an exclusive cursor and a limit,
+  where the cursor is the ordering key of the last row of the previous page,
+  `None` starts at the beginning and a `limit` of 0 is an empty page. One
+  method per table rather than a `catalog()` returning all five, because a
+  catalogue cannot page and these have to: a log of many short streams has
+  many streams. All five read off a reader connection, so a listing does not
+  queue behind a write, and none of them is on the `EventLog` trait — that
+  stays as it is until a second backend wants them, and `MemEventStore` is one
+  stream with nothing to satisfy. No schema change and no new index: three of
+  the five page by a primary key and the other two by an index the ladder
+  already ships.
+
+  **Retention leaves the five tables in different states, and the listings
+  report their own table rather than an average of them.** A removal never
+  touches `stream_seq`, so a stream whose every event has been removed still
+  lists, with its head `seq` intact and no events under it — the counter is
+  the truth of a stream's existence, which is what `Expected::Unwritten`
+  already says, and a caller about to reuse the name needs to know it stands
+  at 50. No read can report that stream, so the listing is the only thing that
+  can. A kind has no counter, so one whose every event has been removed does
+  not list: "was this ever written here" stops being answerable, and `kinds`
+  says so rather than guessing. The ledger and the receipts are append-only
+  and outlive what they describe.
+
+  `StreamInfo { stream, head_seq }` carries `next_seq - 1`, the same
+  arithmetic `append_if` does to answer with `Expected::Seq`;
+  `ConsumerCheckpoint { consumer, position, updated_ms }` is the read
+  `Guard::RegisteredConsumers` makes on the caller's behalf, blind spot
+  included — a consumer that never checked in is not there either;
+  `RetentionEntry { id, applied_ms, plan, removed_count, highest_removed }`
+  hands back the stored description as the string it is, `archive-then-remove:
+  <plan>` included, because the store does not interpret it. All four have
+  public fields and no `#[non_exhaustive]`, which is what `Report` and
+  `ExportReceipt` already are: a row read out of a reserved table is a record
+  a caller only ever receives, so the marker would cost the destructuring
+  these are read with and buy freedom only a ladder step could use, and a
+  ladder step is a version bump on its own.
+
+  `export_receipts` returns `ExportRecord { receipt, taken_ms, landed_ms }`
+  rather than growing `ExportReceipt` by two fields. Not only because that
+  struct has public fields and no marker, so adding to it is a breaking
+  change: the two timestamps are not facts the returning path has.
+  `export_recorded` hands back a receipt at the moment it writes the row,
+  where `taken_ms` is "now" and `landed_ms` is structurally always `None`.
+  They become facts later, which is when this listing reads them — so the
+  receipt stays the range that was handed out, and the record is that plus
+  what has happened to it since. `record.receipt` is the value
+  `export_recorded` returned, the same `id` `confirm_export` takes.
+
+  The prefix on `streams` is a parameter rather than a `streams_with_prefix`
+  twin or a `&Filter`. It is `Filter::stream_prefix`'s axis through the same
+  `stream_prefix_bound`, so the range walked is the range a read walks — but a
+  `Filter` carries four axes and three of them are about *events*, and a
+  stream retention has emptied has no event to carry a kind or a `meta` key. A
+  listing taking a `Filter` and honouring only the stream half would be a
+  filter whose other half silently did nothing, on precisely the streams this
+  exists to show.
+
 - **The store runs the archive loop.**
   `SqliteEventLog::archive_then_retain(plan, sink, page)` exports everything
   `plan` would remove, hands each page to a `Sink`, confirms that page's

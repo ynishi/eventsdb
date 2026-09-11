@@ -28,6 +28,7 @@
 //! # }
 //! ```
 
+mod catalog;
 mod hatch;
 mod log;
 mod project;
@@ -39,6 +40,7 @@ mod store;
 mod transfer;
 mod txn;
 
+pub use catalog::{ConsumerCheckpoint, ExportRecord, RetentionEntry, StreamInfo};
 /// Re-exported so a caller binding named parameters into `query`, or handing
 /// [`SqliteEventLog::archive_then_retain`] somewhere to put the bytes, does
 /// not have to name `eventsdb-core` as a dependency of its own.
