@@ -52,5 +52,5 @@ pub use mem::MemEventStore;
 pub use params::Params;
 pub use position::{Committed, Position, Recorded};
 pub use store::{Decision, EventStore, Expected};
-pub use transfer::{ExportedEvent, ImportReport};
+pub use transfer::{ExportedEvent, ImportReport, JsonLinesSink, LogSink, Sink};
 pub use upcast::{Current, UpcastChain, Upcaster};
