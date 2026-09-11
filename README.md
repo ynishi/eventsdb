@@ -333,6 +333,39 @@ pretence of a coordinate.
 
 `tests/adopt.rs` is this sequence, run.
 
+## What is in the log
+
+Every other read takes a name the caller already holds: a stream id for
+`stream_handle`, a consumer for `checkpoint_load`, a receipt id for
+`confirm_export`. These five answer "which ones are there", off a reader
+connection, each a page with an exclusive cursor and a limit:
+
+    log.streams(None, None, 100).await?;              // name and head seq
+    log.streams(None, Some("session-"), 100).await?;  // the same, one prefix
+    log.kinds(None, 100).await?;                      // the kinds written
+    log.checkpoints(None, 100).await?;                // consumers, and where each sits
+    log.retention_ledger(None, 100).await?;           // what went, when, by which plan
+    log.export_receipts(None, 100).await?;            // taken, and whether it landed
+
+The first argument is the cursor, and it is exclusive: the key of the last row
+of a page — a name, or an id — handed straight back in reads the next one, and
+`None` starts at the beginning. That is `read_all`'s contract with a different
+key, for the reason `read_all` has it: a log of many short streams has many
+streams, and a long-running one has many ledger rows. The prefix on `streams`
+is `Filter::stream_prefix`'s axis, over the same range a read walks.
+
+What retention leaves behind differs by table, and each listing reports its
+own table rather than a smoothed-over average of them. A removal does not
+touch `stream_seq`, so **a stream whose every event has been removed still
+lists**, with its head `seq` intact and no events under it — which is what a
+caller about to reuse the name needs, since the counter stands at 50 and the
+next append is 51. No read can report that stream; there is nothing left of it
+to read. A kind has no counter, so a kind whose every event has been removed
+does not list at all: "was this ever written here" is not a question the store
+can answer once the events are gone, and the listing says so rather than
+guessing. The ledger and the receipts are append-only and outlive the events
+they describe.
+
 ## The escape hatch
 
 Without one, anyone needing a query the API does not have opens the database
@@ -349,6 +382,12 @@ nothing downstream learns that a fold is now missing its input.
 
 So the hatch is not a convenience. It is what makes "do not open the file
 yourself" a reasonable thing to ask.
+
+Listing what the log holds is not one of the queries it is for. *What is in
+the log* answers those, and the difference is which contract the caller ends
+up holding: a listing is a method, while `SELECT stream, next_seq - 1 FROM
+stream_seq` is the column layout of a reserved table, which belongs to the
+migration ladder and moves when it does.
 
     // Read anything, across the log and your own tables.
     let rows = log.query(
