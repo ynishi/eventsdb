@@ -470,9 +470,18 @@ impl SqliteEventLog {
         // fallback is the empty page's, not a record's missing one.
         let through = events.last().and_then(|last| last.position).unwrap_or(from);
         let count = events.len();
+        // Every axis, so an axis added to `Filter` cannot quietly widen what
+        // counts as whole. `meta` and `stream_prefix` are compared against
+        // what places no condition rather than against `None`, which is the
+        // reading each of those axes documents: an empty pair list and an
+        // empty prefix both select everything.
         let whole = filter.kinds.is_none()
             && filter.streams.is_none()
-            && filter.meta.as_ref().is_none_or(|pairs| pairs.is_empty());
+            && filter.meta.as_ref().is_none_or(|pairs| pairs.is_empty())
+            && filter
+                .stream_prefix
+                .as_ref()
+                .is_none_or(|prefix| prefix.is_empty());
 
         let shared = self.shared_handle();
         let taken_ms = now_ms() as i64;

@@ -153,14 +153,20 @@ held between pages, so a stream left half-consumed keeps no connection open
 and no read transaction pinning the WAL. `replay` ends at the first short
 page; `subscribe` waits there instead.
 
-A read narrows along three axes — `streams`, `kinds`, and `meta` keys — and
-combines them by AND. `meta` is equality on a scalar the caller wrote; an
-event without the key is out of the answer. The SQLite log indexes a key on
-request, on exactly the expression the filter uses:
+A read narrows along four axes — `streams`, `stream_prefix`, `kinds`, and
+`meta` keys — and combines them by AND. `meta` is equality on a scalar the
+caller wrote; an event without the key is out of the answer. The SQLite log
+indexes a key on request, on exactly the expression the filter uses:
 
     log.index_meta("tenant").await?;
     let theirs = Filter::kinds(["placed"]).meta("tenant", "a");
     let batch = log.read_all(Position::BEGINNING, &theirs, 100).await?;
+
+`stream_prefix` is a range on the stream name, which is how a group of
+streams is read when a stream is a period — every session of one month,
+without naming the days:
+
+    let month = Filter::all().stream_prefix("session-2026-09-");
 
 ### A command with an invariant
 
