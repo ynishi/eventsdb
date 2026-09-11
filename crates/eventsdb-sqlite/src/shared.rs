@@ -102,16 +102,31 @@ impl Shared {
     }
 }
 
-/// Which of our error classes a rusqlite failure belongs to.
+/// Whether a rusqlite failure is contention: another call is worth making.
 ///
-/// Busy and locked are contention: another call is worth making. Everything
-/// else is the database failing, and repeating it would only fail again.
+/// These two codes are the whole of SQLite's vocabulary for "somebody else
+/// holds it". Everything else is the database failing, and repeating it would
+/// only fail again.
+pub(crate) fn is_contention(error: &rusqlite::Error) -> bool {
+    match error {
+        rusqlite::Error::SqliteFailure(inner, _) => {
+            matches!(
+                inner.code,
+                ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked
+            )
+        }
+        _ => false,
+    }
+}
+
+/// Which of our error classes a rusqlite failure belongs to.
 pub(crate) fn classify(error: rusqlite::Error) -> Error {
+    if is_contention(&error) {
+        return Error::Busy(error.to_string());
+    }
+
     if let rusqlite::Error::SqliteFailure(inner, _) = &error {
         match inner.code {
-            ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked => {
-                return Error::Busy(error.to_string())
-            }
             // The isle interrupts a statement that passed its deadline, and
             // SQLite reports that as `SQLITE_INTERRUPT`. It is the caller's own
             // deadline arriving, not the database failing.

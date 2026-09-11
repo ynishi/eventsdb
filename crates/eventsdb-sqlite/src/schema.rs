@@ -15,11 +15,13 @@
 //! are append-only: a shipped step is never edited, because a database that
 //! already ran it will not run it again.
 
+use std::time::{Duration, Instant};
+
 use eventsdb_core::error::{Error, Result};
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 use crate::hatch::RESERVED_TABLES;
-use crate::shared::classify;
+use crate::shared::{classify, is_contention};
 
 /// The version this build expects. Bumped with every appended step.
 pub const TARGET_USER_VERSION: i64 = 5;
@@ -306,19 +308,47 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
 /// [`crate::retention`]'s reclaim a bounded, incremental operation instead.
 /// On a database created before this line, the pragma is silently ignored and
 /// reclaim has nothing to do; that is a limitation, not a failure.
-pub fn apply_pragmas(conn: &Connection, busy_timeout: std::time::Duration) -> rusqlite::Result<()> {
-    // First, because the batch below is the first thing on this connection
-    // that can lose a lock. `journal_mode = WAL` takes an exclusive lock to
-    // rewrite the header, so two connections opening one fresh file put one
-    // of them there while the other holds it — and with the timeout still at
-    // its default of zero, the loser does not wait. It returns
-    // `SQLITE_BUSY` from `open`, which is not a state the caller of an
-    // `open` has any way to read as contention.
+pub fn apply_pragmas(conn: &Connection, busy_timeout: Duration) -> rusqlite::Result<()> {
+    // Set first, because the batch below is the first thing on this
+    // connection that can lose a lock — and not enough on its own, because
+    // the busy handler the timeout installs is not always asked.
+    // `journal_mode = WAL` reads the header's version bytes under a shared
+    // lock and, finding them still saying rollback, writes them
+    // (`sqlite3BtreeSetVersion`). A read promoted to a write inside one
+    // statement is the case the `sqlite3_busy_handler` documentation exempts:
+    // invoking the handler could leave two connections each waiting for the
+    // other, so SQLite returns `SQLITE_BUSY` straight away and expects the
+    // loser to let go and try again. Two connections opening one fresh file
+    // put one of them there, and it is handed the error without the timeout
+    // being waited at all.
+    //
+    // So the loser does what SQLite expects of it, within the bound the
+    // caller set: retry the batch until the timeout has passed, and then
+    // report the last failure. Whole, because all three pragmas are
+    // idempotent — and splitting them would change nothing, the header write
+    // is refused on its own statement just the same. A file already in WAL
+    // finds the version bytes already set and never reaches the write.
     conn.busy_timeout(busy_timeout)?;
-    conn.execute_batch(
-        "PRAGMA auto_vacuum = INCREMENTAL; \
-         PRAGMA journal_mode = WAL; \
-         PRAGMA synchronous = NORMAL;",
-    )?;
-    Ok(())
+
+    let started = Instant::now();
+    let mut backoff = Duration::from_millis(1);
+    loop {
+        let error = match conn.execute_batch(
+            "PRAGMA auto_vacuum = INCREMENTAL; \
+             PRAGMA journal_mode = WAL; \
+             PRAGMA synchronous = NORMAL;",
+        ) {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+
+        let left = busy_timeout.saturating_sub(started.elapsed());
+        if left.is_zero() || !is_contention(&error) {
+            return Err(error);
+        }
+        // Clamped to what is left of the timeout, so the caller's bound is
+        // the bound rather than the bound plus one backoff.
+        std::thread::sleep(backoff.min(left));
+        backoff = (backoff * 2).min(Duration::from_millis(50));
+    }
 }
