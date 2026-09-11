@@ -8,7 +8,7 @@
 
 use eventsdb_core::error::{Error, Result};
 use eventsdb_core::{EventLog, EventStore, Filter, Position};
-use eventsdb_sqlite::{Guard, Plan, QueryOptions, SqliteEventLog};
+use eventsdb_sqlite::{Guard, Params, Plan, QueryOptions, SqliteEventLog};
 use serde_json::{json, Map, Value};
 
 fn event(kind: &str) -> Map<String, Value> {
@@ -575,4 +575,213 @@ async fn the_cells_that_have_a_json_value_are_untouched_either_way() {
     assert_eq!(strict[0]["b"], json!(7));
     assert_eq!(strict[0]["c"], json!(1.5));
     assert_eq!(strict[0]["d"], json!("text"));
+}
+
+#[tokio::test]
+async fn a_named_query_answers_what_its_positional_twin_does() {
+    let log = seeded().await;
+
+    let by_position = log
+        .query(
+            "SELECT stream, kind FROM events WHERE kind = ?1",
+            vec![json!("b")],
+        )
+        .await
+        .unwrap();
+    let by_name = log
+        .query(
+            "SELECT stream, kind FROM events WHERE kind = :kind",
+            json!({ ":kind": "b" }).as_object().cloned().unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(by_position, by_name);
+    assert_eq!(by_name.len(), 1);
+    assert_eq!(by_name[0]["kind"], json!("b"));
+
+    // And through `query_with`, which is where the options live.
+    let with_options = log
+        .query_with(
+            "SELECT stream, kind FROM events WHERE kind = :kind",
+            Params::Named(vec![(":kind".to_string(), json!("b"))]),
+            QueryOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(with_options, by_name);
+}
+
+/// `$` and `@` are the other two spellings of the same thing, and the `$`
+/// one shares its character with `json_extract`'s path syntax — which is why
+/// rewriting named placeholders to numbered ones outside the crate is a
+/// reading of the SQL rather than a substitution.
+#[tokio::test]
+async fn every_sigil_binds_and_a_dollar_in_a_literal_is_left_alone() {
+    let log = SqliteEventLog::open_in_memory().await.unwrap();
+    let mut s = log.stream_handle("s");
+    s.append(
+        json!({ "kind": "scored", "data": { "n": 7 } })
+            .as_object()
+            .unwrap()
+            .clone(),
+    )
+    .await
+    .unwrap();
+
+    let rows = log
+        .query(
+            "SELECT json_extract(data, '$.n') AS n FROM events \
+             WHERE kind = $kind AND stream = @stream",
+            Params::Named(vec![
+                ("$kind".to_string(), json!("scored")),
+                ("@stream".to_string(), json!("s")),
+            ]),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["n"], json!(7));
+}
+
+#[tokio::test]
+async fn a_name_the_statement_declares_and_the_call_omits_is_refused() {
+    let log = seeded().await;
+    let error = log
+        .query(
+            "SELECT * FROM events WHERE kind = :kind AND stream = :stream",
+            json!({ ":kind": "a" }).as_object().cloned().unwrap(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, Error::Validation(_)), "got {error}");
+    assert!(
+        error.to_string().contains(":stream"),
+        "the refusal names the parameter: {error}"
+    );
+}
+
+/// The reason the check above exists: rusqlite leaves an unbound named
+/// parameter at `NULL`, so without it this statement would have answered.
+#[tokio::test]
+async fn an_omitted_name_is_refused_rather_than_read_as_null() {
+    let log = seeded().await;
+    let answered = log
+        .query(
+            "SELECT count(*) AS n FROM events WHERE kind IS :kind",
+            json!({ ":kind": "a" }).as_object().cloned().unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(answered[0]["n"], json!(1));
+
+    // Same statement, nothing bound. `kind IS NULL` would have answered 0.
+    let error = log
+        .query(
+            "SELECT count(*) AS n FROM events WHERE kind IS :kind",
+            Params::Named(Vec::new()),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Validation(_)), "got {error}");
+}
+
+#[tokio::test]
+async fn a_name_the_call_supplies_and_the_statement_lacks_is_refused() {
+    let log = seeded().await;
+    let error = log
+        .query(
+            "SELECT * FROM events WHERE kind = :kind",
+            Params::Named(vec![
+                (":kind".to_string(), json!("a")),
+                (":stream".to_string(), json!("s")),
+            ]),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, Error::Validation(_)), "got {error}");
+    assert!(
+        error.to_string().contains(":stream"),
+        "the refusal names the parameter: {error}"
+    );
+}
+
+/// A name without its sigil matches no placeholder, and the refusal says so
+/// rather than binding it to nothing.
+#[tokio::test]
+async fn a_name_without_its_sigil_is_refused() {
+    let log = seeded().await;
+    let error = log
+        .query(
+            "SELECT * FROM events WHERE kind = :kind",
+            json!({ "kind": "a" }).as_object().cloned().unwrap(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, Error::Validation(_)), "got {error}");
+    assert!(error.to_string().contains(":kind"), "got {error}");
+}
+
+/// SQLite counts named and numbered placeholders in one space, so a statement
+/// bound by name with a bare `?` in it has a slot nothing supplies.
+#[tokio::test]
+async fn a_positional_placeholder_in_a_statement_bound_by_name_is_refused() {
+    let log = seeded().await;
+    let error = log
+        .query(
+            "SELECT * FROM events WHERE kind = :kind AND stream = ?",
+            Params::Named(vec![(":kind".to_string(), json!("a"))]),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, Error::Validation(_)), "got {error}");
+    assert!(error.to_string().contains("positional"), "got {error}");
+}
+
+#[tokio::test]
+async fn a_json_object_binds_by_name() {
+    let log = seeded().await;
+    let mut params = Map::new();
+    params.insert(":kind".to_string(), json!("a"));
+
+    let rows = log
+        .query("SELECT kind FROM events WHERE kind = :kind", params)
+        .await
+        .unwrap();
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["kind"], json!("a"));
+}
+
+/// A positional set whose count does not match the statement's used to be
+/// `Error::Storage` — corruption's class for the caller's own typo.
+#[tokio::test]
+async fn a_positional_count_that_does_not_match_is_refused_as_validation() {
+    let log = seeded().await;
+    let error = log
+        .query("SELECT ?1 AS a, ?2 AS b", vec![json!(1)])
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, Error::Validation(_)), "got {error}");
+    assert!(error.to_string().contains('2'), "got {error}");
+    assert!(error.to_string().contains('1'), "got {error}");
+}
+
+/// The trait's `query` is positional and stays that way: a
+/// `Box<dyn EventStore>` cannot dispatch a generic argument.
+#[tokio::test]
+async fn the_traits_query_still_takes_a_vec() {
+    let log = seeded().await;
+    let store: Box<dyn EventStore> = Box::new(log.stream_handle("s"));
+    let rows = store
+        .query("SELECT kind FROM events WHERE kind = ?1", vec![json!("a")])
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
 }

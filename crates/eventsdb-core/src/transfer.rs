@@ -25,6 +25,14 @@
 //! came from. `position` is not restored — it is kept so an import into an
 //! empty store can *check* that it reproduced the same log rather than merely
 //! claim to. See [`ImportReport::reproduced_coordinates`].
+//!
+//! A record from somewhere that is not an eventsdb log has no such witness,
+//! and says so: `position` is an `Option` and `None` is the honest answer for
+//! a row built out of a foreign table. It used to be required, so the caller
+//! bringing rows in from elsewhere wrote `Position::BEGINNING` — which is
+//! `Position(0)`, while a stored position is a rowid and starts at 1, so `0`
+//! was already serving as "none" in band, by a convention nobody had written
+//! down.
 
 use serde_json::{Map, Value};
 
@@ -32,11 +40,31 @@ use crate::error::{Error, Result};
 use crate::position::Position;
 
 /// One event as it travels: the stored object, plus where it lived.
+///
+/// A struct with public fields and no `#[non_exhaustive]`, because it is a
+/// record a caller both receives and builds — which is the shape the API
+/// guidelines name public fields for, and adding a field to it is a version
+/// bump rather than something a marker should hide.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExportedEvent {
     pub stream: String,
     /// The position it had in the source log. A witness, not an instruction.
-    pub position: Position,
+    ///
+    /// `None` when there was none: a record built from a table this crate did
+    /// not write has no position of ours to carry, and saying so is not the
+    /// same as claiming position 0. Import never reads this to write — it
+    /// reassigns `seq` and `position` either way — so the only thing it
+    /// changes is what [`ImportReport::reproduced_coordinates`] can claim
+    /// afterwards, and a record with no witness cannot be said to have landed
+    /// back on it.
+    ///
+    /// **In JSON it is a key that is simply not there.**
+    /// [`ExportedEvent::to_json`] omits `position` when it is `None`, and
+    /// [`ExportedEvent::from_json`] reads a missing key and an explicit `null`
+    /// both as `None`. Anything else that is not a non-negative integer is
+    /// still refused. A reader from before this field became optional does not
+    /// accept a line without it.
+    pub position: Option<Position>,
     /// The stored object, `seq` / `epoch_ms` / `_schema_version` included.
     pub event: Map<String, Value>,
 }
@@ -47,7 +75,12 @@ impl ExportedEvent {
     pub fn to_json(&self) -> Value {
         let mut out = Map::new();
         out.insert("stream".to_string(), Value::String(self.stream.clone()));
-        out.insert("position".to_string(), Value::from(self.position.get()));
+        // Absence is the key not being there, rather than a `null` a reader
+        // has to know to treat as absent — which is how every format that
+        // encodes an optional field at all encodes it.
+        if let Some(position) = self.position {
+            out.insert("position".to_string(), Value::from(position.get()));
+        }
         out.insert("event".to_string(), Value::Object(self.event.clone()));
         Value::Object(out)
     }
@@ -64,16 +97,22 @@ impl ExportedEvent {
                 ))
             }
         };
+        // A missing key and an explicit `null` are the same answer — there was
+        // no witness — because a writer that spells absence either way is
+        // saying the same thing, and a reader that took one and refused the
+        // other would be refusing the line rather than reading it. Anything
+        // else is still a fault: a position that is present and unreadable is
+        // not an absent one.
         let position = match object.remove("position") {
+            None | Some(Value::Null) => None,
             Some(value) => match value.as_u64() {
-                Some(position) => Position::new(position),
+                Some(position) => Some(Position::new(position)),
                 None => {
                     return Err(Error::validation(
-                        "`position` must be a non-negative integer",
+                        "`position` must be a non-negative integer, `null`, or absent",
                     ))
                 }
             },
-            None => return Err(Error::validation("`position` is required")),
         };
         let event = match object.remove("event") {
             Some(Value::Object(event)) => event,

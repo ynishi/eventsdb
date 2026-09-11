@@ -201,7 +201,14 @@ async fn export_carries_only_what_the_meta_axis_selects() {
         .export(Position::BEGINNING, &Filter::all().meta("tenant", "a"), 100)
         .await
         .unwrap();
-    let positions: Vec<u64> = batch.iter().map(|e| e.position.get()).collect();
+    let positions: Vec<u64> = batch
+        .iter()
+        .map(|e| {
+            e.position
+                .expect("an export off this log witnesses itself")
+                .get()
+        })
+        .collect();
     assert_eq!(positions, vec![1, 2, 4, 5]);
 }
 

@@ -259,6 +259,14 @@ than merely the same events. It is true for an in-order import into an empty
 store, which is what a migration is, and false when merging into a store that
 already has history — stated rather than left to assume.
 
+A record's `position` is an `Option`, and `None` means there was no witness:
+the record came from somewhere that is not an eventsdb log, so it carries no
+coordinate of ours to check against. An import of such records is
+`reproduced_coordinates == false`, because a record that never had a position
+here cannot have landed back on it. In JSON the key is simply absent; a
+`null` reads the same way, and anything else that is not a non-negative
+integer is still refused.
+
 Both calls are on the `EventLog` trait, so a migration is written once against
 the trait rather than once per backend. `ExportedEvent` is backend-neutral, and
 a log that cannot do this declines rather than offering a partial import: a
@@ -306,7 +314,9 @@ Each record's `position` is the coordinate the row had in the old table, and
 it is a witness rather than an instruction, as in any other import. So
 `reproduced_coordinates` is true only when the import happened to land every
 event back on it — which it does when the old keys ran from 1 with no gaps and
-the log was empty, and does not when they did not.
+the log was empty, and does not when they did not. A table with no key worth
+carrying writes `None` and gets `false`, which is the same answer without the
+pretence of a coordinate.
 
 `tests/adopt.rs` is this sequence, run.
 
@@ -333,12 +343,28 @@ yourself" a reasonable thing to ask.
         vec![json!("scored")],
     ).await?;
 
+    // The same query with named placeholders: a JSON object, one entry per
+    // placeholder. The name is the placeholder as written, sigil included —
+    // `:kind`, not `kind` — and `$` / `@` bind too, so the `'$.n'` in the SQL
+    // is a literal and stays one.
+    let rows = log.query(
+        "SELECT stream, json_extract(data, '$.n') AS n FROM events WHERE kind = :kind",
+        json!({ ":kind": "scored" }).as_object().cloned().unwrap(),
+    ).await?;
+
     // Or take a real transaction on the log's own connection.
     log.with_transaction(|tx| {
         tx.execute_batch("CREATE TABLE IF NOT EXISTS my_view (k TEXT PRIMARY KEY)")?;
         tx.execute("INSERT INTO my_view (k) VALUES ('x')", [])?;
         Ok(())
     }).await?;
+
+Every placeholder a named statement declares has to be supplied: one that is
+not is refused, because rusqlite would otherwise leave it at `NULL` and the
+statement would answer as though the caller had meant that. A `Vec` is the
+positional set and an object is the named one, so `vec![]` still means what
+it always did; a named set held in a `Vec` of pairs is written
+`Params::Named(vec![..])`. `Params` in the rustdoc is the whole rule.
 
 `query` answers in JSON, and a few SQLite cells have no JSON value at all. It
 refuses those rather than handing over a stand-in: the error names the column

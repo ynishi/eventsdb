@@ -82,6 +82,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use eventsdb_core::error::{Error, Result};
+use eventsdb_core::params::Params;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::{Connection, TransactionBehavior};
 use serde_json::{Map, Value};
@@ -309,7 +310,7 @@ impl QueryOptions {
 pub(crate) fn query_rows(
     conn: &Connection,
     sql: &str,
-    params: Vec<Value>,
+    params: Params,
     lossy: bool,
 ) -> Result<Vec<Map<String, Value>>> {
     let stmt = conn.prepare(sql).map_err(classify)?;
@@ -328,14 +329,32 @@ pub(crate) fn query_rows(
         .into_iter()
         .map(str::to_string)
         .collect();
-    let bound = params
-        .into_iter()
-        .map(bind_value)
-        .collect::<Result<Vec<Box<dyn rusqlite::ToSql>>>>()?;
 
-    let mut rows = stmt
-        .query(rusqlite::params_from_iter(bound.iter().map(|p| p.as_ref())))
-        .map_err(classify)?;
+    let mut rows = match params {
+        Params::Positional(values) => {
+            let bound = values
+                .into_iter()
+                .map(bind_value)
+                .collect::<Result<Vec<Box<dyn rusqlite::ToSql>>>>()?;
+            stmt.query(rusqlite::params_from_iter(bound.iter().map(|p| p.as_ref())))
+                .map_err(classify)?
+        }
+        Params::Named(pairs) => {
+            let bound = pairs
+                .into_iter()
+                .map(|(name, value)| Ok((name, bind_value(value)?)))
+                .collect::<Result<Vec<(String, Box<dyn rusqlite::ToSql>)>>>()?;
+            // Before the statement runs, not after: an answer computed with a
+            // placeholder left at `NULL` is the failure this is here to stop,
+            // and it is one that would otherwise look like a result.
+            every_declared_name_was_supplied(&stmt, &bound)?;
+            let by_name: Vec<(&str, &dyn rusqlite::ToSql)> = bound
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_ref()))
+                .collect();
+            stmt.query(by_name.as_slice()).map_err(classify)?
+        }
+    };
 
     let mut out = Vec::new();
     while let Some(row) = rows.next().map_err(classify)? {
@@ -346,6 +365,45 @@ pub(crate) fn query_rows(
         out.push(object);
     }
     Ok(out)
+}
+
+/// Refuse a named set that leaves one of the statement's placeholders unbound.
+///
+/// rusqlite does not: an unbound named parameter keeps whatever it was last
+/// bound with and falls back to `NULL`, so a forgotten `:kind` turns
+/// `WHERE kind = :kind` into `WHERE kind = NULL` — a statement that runs,
+/// answers nothing, and reports no fault. [`Params`] carries the rule; this is
+/// where it is enforced.
+///
+/// A parameter with no name is a bare `?` or `?N` in a statement being bound by
+/// name. Nothing in this call supplies it, so it is the same refusal.
+fn every_declared_name_was_supplied(
+    stmt: &rusqlite::Statement<'_>,
+    bound: &[(String, Box<dyn rusqlite::ToSql>)],
+) -> Result<()> {
+    for index in 1..=stmt.parameter_count() {
+        match stmt.parameter_name(index) {
+            Some(name) if bound.iter().any(|(supplied, _)| supplied == name) => {}
+            Some(name) => {
+                return Err(Error::Validation(format!(
+                    "the statement declares the parameter `{name}` and nothing was \
+                     bound to it. A name is the placeholder as written in the SQL, \
+                     sigil included — `{name}`, not `{}`. An unbound name would be \
+                     read as NULL",
+                    name.trim_start_matches([':', '@', '$', '?'])
+                )))
+            }
+            None => {
+                return Err(Error::Validation(format!(
+                    "parameter {index} of this statement is positional and this call \
+                     binds by name, so nothing supplies it. Number every placeholder \
+                     or name every placeholder — SQLite counts both in one space, and \
+                     mixing them is how a parameter ends up bound to the wrong value"
+                )))
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Bind a JSON parameter. Arrays and objects go as their text, which is what
@@ -480,8 +538,22 @@ impl SqliteEventLog {
     /// they change the connection's configuration rather than any file's
     /// contents — so the readonly gate alone would let a caller attach a
     /// database to the long-lived connection and keep it there.
-    pub async fn query(&self, sql: &str, params: Vec<Value>) -> Result<Vec<Map<String, Value>>> {
-        self.query_within(sql, params, QueryOptions::default())
+    ///
+    /// **Parameters bind by position or by name.** A `Vec` is the positional
+    /// set — `vec![json!("placed")]` fills `?1` — and a JSON object is the
+    /// named one: `json!({ ":kind": "placed" }).as_object().cloned().unwrap()`
+    /// fills `:kind`, sigil and all, as does `Params::Named(vec![..])`.
+    /// [`Params`] states the rule for a name, why a `Vec` of pairs does not
+    /// convert, and what happens to a name the statement declares and the call
+    /// leaves out. The
+    /// [`eventsdb_core::EventStore`] trait's `query` stays positional — a
+    /// `Box<dyn EventStore>` cannot dispatch a generic argument.
+    pub async fn query(
+        &self,
+        sql: &str,
+        params: impl Into<Params>,
+    ) -> Result<Vec<Map<String, Value>>> {
+        self.query_within(sql, params.into(), QueryOptions::default())
             .await
     }
 
@@ -501,10 +573,10 @@ impl SqliteEventLog {
     pub async fn query_timeout(
         &self,
         sql: &str,
-        params: Vec<Value>,
+        params: impl Into<Params>,
         timeout: Duration,
     ) -> Result<Vec<Map<String, Value>>> {
-        self.query_within(sql, params, QueryOptions::default().timeout(timeout))
+        self.query_within(sql, params.into(), QueryOptions::default().timeout(timeout))
             .await
     }
 
@@ -524,16 +596,16 @@ impl SqliteEventLog {
     pub async fn query_with(
         &self,
         sql: &str,
-        params: Vec<Value>,
+        params: impl Into<Params>,
         options: QueryOptions,
     ) -> Result<Vec<Map<String, Value>>> {
-        self.query_within(sql, params, options).await
+        self.query_within(sql, params.into(), options).await
     }
 
     async fn query_within(
         &self,
         sql: &str,
-        params: Vec<Value>,
+        params: Params,
         options: QueryOptions,
     ) -> Result<Vec<Map<String, Value>>> {
         let shared = self.shared_handle();
