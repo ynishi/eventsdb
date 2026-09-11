@@ -58,8 +58,10 @@
 //! the text: writing any table in [`RESERVED_TABLES`], **creating anything
 //! that shares one of those names in any schema** (a `TEMP TABLE events`
 //! shadows the real one for every unqualified statement on the connection),
-//! attaching another database, and setting pragmas. Reading those tables is
-//! allowed and often the point, and so is adding your own index to `events`.
+//! attaching another database, and setting a pragma. Reading those tables is
+//! allowed and often the point; so is reading a pragma, including the
+//! introspection ones that take a table or index name, which
+//! [`READ_ONLY_PRAGMAS`] lists; and so is adding your own index to `events`.
 //!
 //! The refusals are not paternalism about your data. Each one is an invariant
 //! something else in this crate already promised: appends go through
@@ -102,6 +104,35 @@ fn is_reserved(table: &str) -> bool {
     RESERVED_TABLES
         .iter()
         .any(|reserved| reserved.eq_ignore_ascii_case(table))
+}
+
+/// Pragmas a caller may read *with an argument*, because the argument names
+/// something to describe rather than state to set.
+///
+/// Setting a pragma is refused and reading one is allowed, but SQLite's
+/// authorizer does not draw that line: a pragma's argument arrives in the same
+/// slot whether it is an assignment (`PRAGMA user_version = 99`) or a name to
+/// describe (`PRAGMA table_info(events)`), and `PRAGMA table_info = events` is
+/// a valid read written in assignment form. So the two are told apart by name,
+/// and this is the list: a pragma carrying an argument is refused unless it is
+/// one of these, and a pragma carrying none is allowed as before.
+///
+/// An allowlist rather than a denylist of the state-bearing pragmas, so a
+/// pragma this crate has not considered is refused rather than admitted.
+/// Names are matched case-insensitively, as SQLite matches them.
+pub const READ_ONLY_PRAGMAS: [&str; 6] = [
+    "table_info",
+    "table_xinfo",
+    "index_list",
+    "index_info",
+    "index_xinfo",
+    "foreign_key_list",
+];
+
+fn is_read_only_pragma(pragma: &str) -> bool {
+    READ_ONLY_PRAGMAS
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(pragma))
 }
 
 /// Whether an attempted action is allowed.
@@ -166,8 +197,13 @@ fn authorize(context: &AuthContext<'_>, trusted: bool) -> Authorization {
 
         // Reading a pragma is fine; setting one is not. `user_version` belongs
         // to the migration ladder, `journal_mode` and `auto_vacuum` to the
-        // concurrency and reclaim stories.
-        AuthAction::Pragma { pragma_value, .. } if pragma_value.is_some() => Authorization::Deny,
+        // concurrency and reclaim stories. Which of the two this is cannot be
+        // read off the argument — see [`READ_ONLY_PRAGMAS`] — so the name
+        // decides.
+        AuthAction::Pragma {
+            pragma_name,
+            pragma_value: Some(_),
+        } if !is_read_only_pragma(pragma_name) => Authorization::Deny,
 
         // Adding an index to `events` is deliberately *allowed*: it changes no
         // data, and a caller that filters on something the shipped indices do
@@ -195,9 +231,11 @@ pub(crate) fn map_denial(error: Error) -> Error {
 fn denied() -> Error {
     Error::Unsupported(format!(
         "not authorized inside the hatch: writing {} , attaching a database, \
-         or setting a pragma. Append through a stream handle, remove through \
-         retention, and keep your own tables under your own names",
-        RESERVED_TABLES.join(" / ")
+         setting a pragma, or reading one with an argument outside {}. Append \
+         through a stream handle, remove through retention, and keep your own \
+         tables under your own names",
+        RESERVED_TABLES.join(" / "),
+        READ_ONLY_PRAGMAS.join(" / ")
     ))
 }
 

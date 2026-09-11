@@ -275,6 +275,82 @@ async fn the_hatch_refuses_to_attach_a_database_or_set_a_pragma() {
     assert!(matches!(pragma, Error::Unsupported(_)), "got {pragma}");
 }
 
+/// The other half of that promise: reading a pragma is allowed, and the
+/// introspection ones take the name of what to describe.
+///
+/// SQLite puts that name in the same slot as an assignment's value, so a rule
+/// reading "has a value" refuses `table_info` along with `user_version = 99`.
+/// The two are told apart by name, and this is the case the name has to let
+/// through.
+#[tokio::test]
+async fn the_hatch_reads_a_pragma_that_names_a_table() {
+    let log = seeded().await;
+
+    let columns: Vec<String> = log
+        .with_transaction(|tx| {
+            let mut stmt = tx.prepare("PRAGMA table_info(events)").map_err(sql_error)?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>("name"))
+                .map_err(sql_error)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(sql_error)?);
+            }
+            Ok(out)
+        })
+        .await
+        .unwrap();
+
+    for expected in ["position", "stream", "seq", "kind", "data"] {
+        assert!(
+            columns.contains(&expected.to_string()),
+            "`{expected}` missing from {columns:?}"
+        );
+    }
+}
+
+/// And through `query`, which has a second gate in front of the authorizer.
+///
+/// `sqlite3_stmt_readonly` answers *true* for `PRAGMA table_info`, so the
+/// statement reaches the authorizer and the allowlist is what decides.
+#[tokio::test]
+async fn query_reads_a_pragma_that_names_a_table() {
+    let log = seeded().await;
+
+    let rows = log
+        .query("PRAGMA table_info(events)", Vec::new())
+        .await
+        .unwrap();
+
+    let columns: Vec<&Value> = rows.iter().filter_map(|row| row.get("name")).collect();
+    for expected in ["position", "stream", "seq", "kind", "data"] {
+        assert!(
+            columns.contains(&&json!(expected)),
+            "`{expected}` missing from {columns:?}"
+        );
+    }
+}
+
+/// A pragma nobody here has considered is refused, argument or not.
+///
+/// `integrity_check` reads rather than writes, and it still does not get in:
+/// the rule is an allowlist, so the default for an unlisted name is refusal.
+/// A denylist of the state-bearing pragmas would have inverted that and
+/// admitted whatever SQLite adds next.
+#[tokio::test]
+async fn the_hatch_refuses_a_pragma_that_is_not_on_the_allowlist() {
+    let log = seeded().await;
+
+    let error = log
+        .with_transaction(|tx| {
+            tx.execute_batch("PRAGMA integrity_check(1)")
+                .map_err(sql_error)
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Unsupported(_)), "got {error}");
+}
+
 /// The failure that would be worst and quietest: an authorizer left installed
 /// would silently refuse the store's own writes from then on.
 #[tokio::test]
