@@ -289,6 +289,82 @@ impl<P: Projection> ProjectionRunner<P> {
         }
     }
 
+    /// Stay caught up: catch up, wait for the next commit, catch up again.
+    /// Returns only on error.
+    ///
+    /// This is [`ProjectionRunner::catch_up`] with the wait
+    /// [`EventLog::subscribe`] uses put between the rounds — the log's
+    /// in-process wake-up channel, with the poll interval as the ceiling that
+    /// covers a writer in another process. The mechanism is documented there
+    /// and not restated here; what is new is that a projection reaches it,
+    /// instead of the caller writing a sleep loop whose interval is either
+    /// slower than a subscriber of the same log or a transaction per tick on
+    /// an idle one.
+    ///
+    /// There is no task and no handle: the caller owns the future and runs it
+    /// under `tokio::select!` or a task of its own. The runner is still one
+    /// value holding its one name, so a follow does not slip past the registry
+    /// that refuses a second live runner for the same projection.
+    ///
+    /// # No lost wake-up
+    ///
+    /// The receiver is subscribed **before** the first catch-up, and every
+    /// round marks the channel's current value as seen before its reads, never
+    /// after them. So the only publish a round can mark away is one whose
+    /// commit the reads that follow are going to see anyway, and a commit that
+    /// lands after those reads — including in the gap between the last
+    /// `run_once` and the wait — leaves the receiver changed, which is what
+    /// makes `changed()` return at once rather than after the interval. The
+    /// price of that order is a spurious round now and then; the price of the
+    /// other order would be a batch left unfolded for a whole poll interval.
+    ///
+    /// # Cancellation
+    ///
+    /// The wait is the only place this parks, and it sits *between* batches. A
+    /// batch is one `IMMEDIATE` transaction on the writer, exactly as in
+    /// [`ProjectionRunner::run_once`], and none of it is held across the wait
+    /// — so dropping the future while it is parked stops the follow with the
+    /// read model and the cursor agreeing, and a later `catch_up` carries on
+    /// from that cursor. Dropping it *during* a batch leaves the database
+    /// consistent too, because the batch is one transaction and does whatever
+    /// it does whole; what does not survive is the runner, since the
+    /// projection has travelled into the transaction and is not handed back.
+    ///
+    /// # Errors
+    ///
+    /// The first one ends the follow and is returned. A projection whose
+    /// `apply` fails has not advanced, and retrying it without the caller
+    /// knowing is what the caller's own loop is for.
+    ///
+    /// # A wasted read
+    ///
+    /// Every commit on this log publishes, so a projection that names its
+    /// [`kinds`](Projection::kinds) is woken by commits it declines. The round
+    /// that follows reads, finds nothing to fold, and moves the cursor to the
+    /// head it has now seen through. That is a wasted read, not a wrong one,
+    /// and it is the same cost [`EventLog::subscribe`] pays for the same
+    /// reason.
+    ///
+    /// [`EventLog::subscribe`]: eventsdb_core::EventLog::subscribe
+    pub async fn follow(&mut self) -> Result<()> {
+        // Taken before the first catch-up. `subscribe` marks the value current
+        // at this moment as seen, and nothing after this line marks anything
+        // seen later than the reads it precedes — which is the whole no-lost-
+        // wake argument above.
+        let mut woken = self.shared.notify.subscribe();
+        let poll_interval = self.shared.poll_interval;
+
+        loop {
+            // Mark before the reads, never after them. Discarding a publish
+            // here costs nothing: its commit is already visible to the
+            // catch-up on the next line. Discarding one after the catch-up
+            // would cost a poll interval.
+            woken.borrow_and_update();
+            self.catch_up().await?;
+            let _ = tokio::time::timeout(poll_interval, woken.changed()).await;
+        }
+    }
+
     /// Empty the read model, rewind the cursor, and replay from the start.
     ///
     /// The reset and the rewind share one transaction, so the model is never

@@ -166,8 +166,9 @@ async fn a_subscriber_on_one_log_learns_of_the_others_write_by_polling() {
     b.shutdown().await.unwrap();
 }
 
-/// A projection is unaffected: it reads and checkpoints inside one
-/// transaction, and takes no notice of the watch at all.
+/// A projection driven by `catch_up` is unaffected: it reads and checkpoints
+/// inside one transaction, and takes no notice of the watch. `follow` is the
+/// runner that does, and `tests/project.rs` measures it across two logs.
 #[tokio::test]
 async fn a_projection_on_one_log_folds_events_written_through_the_other() {
     use eventsdb_core::error::{Error, Result};
