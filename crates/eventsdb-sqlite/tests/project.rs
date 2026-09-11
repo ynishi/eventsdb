@@ -4,10 +4,13 @@
 //! Everything else here is behaviour; that one is the property the design is
 //! built around.
 
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
 use eventsdb_core::error::{Error, Result};
 use eventsdb_core::position::Recorded;
 use eventsdb_core::{EventLog, EventStore, Position};
-use eventsdb_sqlite::{Projection, SqliteEventLog, Transaction};
+use eventsdb_sqlite::{OpenOptions, Projection, SqliteEventLog, Transaction};
 use serde_json::{json, Map, Value};
 
 /// Sums `data.n` per stream, for events of kind `scored`.
@@ -345,4 +348,254 @@ async fn two_projections_keep_separate_cursors() {
 
     assert_eq!(fast.position().await.unwrap(), Position::new(2));
     assert_eq!(slow.position().await.unwrap(), Position::new(2));
+}
+
+// ---------------------------------------------------------------------------
+// `follow`: catch up, then wait on the log's wake-up channel.
+//
+// Every test here that claims the wake-up opens the log with a poll interval
+// far longer than the test's own patience, so a pass cannot be the poll
+// arriving early. The one test that is *about* the poll says so in its name.
+// ---------------------------------------------------------------------------
+
+/// Long enough that nothing below can pass by polling.
+const SLOW_POLL: Duration = Duration::from_secs(30);
+
+async fn slow_polling_memory_log() -> Arc<SqliteEventLog> {
+    Arc::new(
+        SqliteEventLog::open_in_memory_with(OpenOptions::default().poll_interval(SLOW_POLL))
+            .await
+            .unwrap(),
+    )
+}
+
+/// Watch the read model until it says `want`, and report how long that took.
+///
+/// The read goes through the hatch on another handle to the same log, which is
+/// how a read model is looked at anywhere: the runner is busy following.
+async fn await_total(log: &SqliteEventLog, stream: &str, want: i64, within: Duration) -> Duration {
+    let started = Instant::now();
+    loop {
+        if totals_of(log, stream).await == Some(want) {
+            return started.elapsed();
+        }
+        assert!(
+            started.elapsed() < within,
+            "totals for `{stream}` never reached {want}; waited {:?} and it was {:?}",
+            started.elapsed(),
+            totals_of(log, stream).await
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
+/// The property the whole thing is for: a parked follow folds a commit on the
+/// wake-up, not on the poll.
+#[tokio::test]
+async fn a_parked_follow_folds_a_commit_well_inside_the_poll_interval() {
+    let log = slow_polling_memory_log().await;
+    let mut s = log.stream_handle("player-1");
+
+    let mut runner = log.runner_now(Totals::new());
+    runner.init().await.unwrap();
+    let follow = tokio::spawn(async move { runner.follow().await });
+
+    // Drive the follow into the parked state first. Folding this one proves it
+    // is running, and leaves it waiting on the channel — otherwise the
+    // measurement below would be of its opening catch-up.
+    s.append(scored(1)).await.unwrap();
+    await_total(&log, "player-1", 1, Duration::from_secs(5)).await;
+
+    s.append(scored(41)).await.unwrap();
+    let latency = await_total(&log, "player-1", 42, Duration::from_secs(5)).await;
+
+    println!("follow folded the commit in {latency:?} against a {SLOW_POLL:?} poll interval");
+    assert!(
+        latency < SLOW_POLL / 10,
+        "a commit on the follow's own log is woken directly, took {latency:?}"
+    );
+
+    follow.abort();
+    let _ = follow.await;
+}
+
+/// A commit landing between the last `run_once` and the wait must not sit
+/// there until the poll.
+///
+/// The timing of that gap cannot be hit on purpose, so this appends a burst
+/// across it instead: whichever of them falls in the gap, the read model has
+/// to reflect all of them long before the poll interval could have rescued a
+/// wake-up that was marked away.
+#[tokio::test]
+async fn a_burst_appended_across_the_gap_is_folded_without_the_poll() {
+    const N: i64 = 200;
+
+    let log = slow_polling_memory_log().await;
+    let mut s = log.stream_handle("player-1");
+
+    let mut runner = log.runner_now(Totals::new());
+    runner.init().await.unwrap();
+    let follow = tokio::spawn(async move { runner.follow().await });
+
+    for _ in 0..N {
+        s.append(scored(1)).await.unwrap();
+    }
+
+    let latency = await_total(&log, "player-1", N, Duration::from_secs(10)).await;
+    println!("the tail of a {N}-event burst was folded {latency:?} after the last append");
+    assert!(
+        latency < SLOW_POLL / 10,
+        "a wake-up was lost: the last events waited {latency:?}"
+    );
+
+    follow.abort();
+    let _ = follow.await;
+}
+
+/// And the poll is still there for the write the channel cannot announce.
+///
+/// `Shared::notify` is per-log, so an append through a second log on the same
+/// file reaches this follow only by looking — which is exactly what the poll
+/// interval is for. See `tests/two_logs.rs` for the same property under
+/// `subscribe`.
+#[tokio::test]
+async fn a_follow_picks_up_another_logs_write_on_the_poll_interval() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("events.db");
+
+    let poll = Duration::from_millis(400);
+    let a = Arc::new(
+        SqliteEventLog::open_with(&path, OpenOptions::default().poll_interval(poll))
+            .await
+            .unwrap(),
+    );
+    let b = SqliteEventLog::open(&path).await.unwrap();
+
+    let mut runner = a.runner_now(Totals::new());
+    runner.init().await.unwrap();
+    let follow = tokio::spawn(async move { runner.follow().await });
+
+    // Park it on a write through its own log first. That both proves the
+    // follow is running and pins the start of the wait to *now*, so the
+    // measurement below is nearly the whole interval rather than whatever is
+    // left of one that started at an unknown moment.
+    let mut through_a = a.stream_handle("player-1");
+    through_a.append(scored(1)).await.unwrap();
+    let local = await_total(&a, "player-1", 1, Duration::from_secs(5)).await;
+
+    let mut through_b = b.stream_handle("player-1");
+    through_b.append(scored(7)).await.unwrap();
+    let cross = await_total(&a, "player-1", 8, Duration::from_secs(5)).await;
+
+    println!("own log {local:?} / other log {cross:?} / poll {poll:?}");
+    assert!(
+        cross > poll / 4,
+        "the other log's write has no wake-up to arrive on, so it can only \
+         have come from the poll — took {cross:?} against a {poll:?} interval"
+    );
+
+    follow.abort();
+    let _ = follow.await;
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+}
+
+/// The error policy, stated as a test: the first one ends the follow, and the
+/// cursor is where the failed batch left it — which is where it started.
+#[tokio::test]
+async fn a_failing_apply_ends_the_follow_and_leaves_the_cursor() {
+    let log = SqliteEventLog::open_in_memory().await.unwrap();
+    let mut s = log.stream_handle("player-1");
+    for n in [1, 2, 3] {
+        s.append(scored(n)).await.unwrap();
+    }
+
+    let mut runner = log.runner_now(Totals::failing_at(2));
+    runner.init().await.unwrap();
+
+    let error = runner.follow().await.unwrap_err();
+    assert!(error.to_string().contains("on purpose"), "got {error}");
+
+    assert_eq!(
+        totals_of(&log, "player-1").await,
+        None,
+        "the failed batch is not visible"
+    );
+    assert_eq!(
+        runner.position().await.unwrap(),
+        Position::BEGINNING,
+        "the cursor did not move past the batch that failed"
+    );
+}
+
+/// Cancellation at the wait, which is where a follow spends its life.
+#[tokio::test]
+async fn dropping_a_parked_follow_leaves_the_cursor_for_the_next_catch_up() {
+    let log = SqliteEventLog::open_in_memory_with(OpenOptions::default().poll_interval(SLOW_POLL))
+        .await
+        .unwrap();
+    let mut s = log.stream_handle("player-1");
+    for n in [1, 2, 3] {
+        s.append(scored(n)).await.unwrap();
+    }
+
+    let mut runner = log.runner_now(Totals::new());
+    runner.init().await.unwrap();
+
+    // Nothing is left to fold after the opening catch-up, so the second the
+    // timeout expires on is the wait — between batches, not inside one.
+    let outcome = tokio::time::timeout(Duration::from_secs(1), runner.follow()).await;
+    assert!(outcome.is_err(), "a follow returns only on error");
+
+    assert_eq!(totals_of(&log, "player-1").await, Some(6));
+    assert_eq!(runner.position().await.unwrap(), Position::new(3));
+
+    // The runner survived the cancellation and resumes from that cursor.
+    s.append(scored(4)).await.unwrap();
+    assert_eq!(runner.catch_up().await.unwrap(), 1, "no event folded twice");
+    assert_eq!(totals_of(&log, "player-1").await, Some(10));
+    assert_eq!(runner.position().await.unwrap(), Position::new(4));
+}
+
+/// The wasted read: a projection that names its kinds is woken by a commit it
+/// declines, and the round that follows is correct rather than merely harmless
+/// — it moves the cursor to the head it has now seen through.
+#[tokio::test]
+async fn a_commit_of_a_declined_kind_wakes_the_follow_and_moves_the_cursor_to_the_head() {
+    let log = SqliteEventLog::open_in_memory_with(OpenOptions::default().poll_interval(SLOW_POLL))
+        .await
+        .unwrap();
+    let mut s = log.stream_handle("player-1");
+    s.append(scored(1)).await.unwrap();
+
+    let mut runner = log.runner_now(Totals::new());
+    runner.init().await.unwrap();
+
+    // Park it, caught up at the one event of its own kind.
+    let outcome = tokio::time::timeout(Duration::from_millis(500), runner.follow()).await;
+    assert!(outcome.is_err(), "a follow returns only on error");
+    assert_eq!(runner.position().await.unwrap(), Position::new(1));
+
+    // Now append a kind it declines, with the follow parked. The poll is 30
+    // seconds away, so the round that moves the cursor below can only have
+    // come from the wake-up.
+    tokio::select! {
+        result = runner.follow() => panic!("a follow returns only on error, got {result:?}"),
+        _ = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            s.append(noise()).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        } => {}
+    }
+
+    assert_eq!(
+        totals_of(&log, "player-1").await,
+        Some(1),
+        "a declined kind folds nothing"
+    );
+    assert_eq!(
+        runner.position().await.unwrap(),
+        log.head_position().await.unwrap(),
+        "the cursor tracks what was seen, so a decline still advances it"
+    );
 }

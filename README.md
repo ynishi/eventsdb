@@ -229,6 +229,13 @@ the fold and the cursor move together:
     let mut runner = log.runner(Totals::new());
     runner.init().await?;
     runner.catch_up().await?;   // or run_once(), or rebuild()
+    runner.follow().await?;     // and to stay current: returns only on error
+
+`follow` is `catch_up` with the wait `subscribe` uses put between the rounds,
+so a read model updates on the commit rather than on a poll of the caller's
+choosing. The caller owns the future — `tokio::select!`, or a task of its own —
+and dropping it between batches stops the follow with the model and the cursor
+agreeing.
 
 If `apply` fails part-way through a batch, neither the read model nor the
 cursor moves — so the retry neither double-counts nor skips. Writing the read
