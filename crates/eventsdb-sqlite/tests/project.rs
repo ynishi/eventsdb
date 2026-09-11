@@ -456,8 +456,16 @@ async fn a_burst_appended_across_the_gap_is_folded_without_the_poll() {
 ///
 /// `Shared::notify` is per-log, so an append through a second log on the same
 /// file reaches this follow only by looking — which is exactly what the poll
-/// interval is for. See `tests/two_logs.rs` for the same property under
-/// `subscribe`.
+/// interval is for. What is asserted is that it arrives. **There is no lower
+/// bound on how long it took**, and there was one once: it read
+/// `cross > poll / 4` and failed on CI at 3.98 ms, because whether the round
+/// that folded the write was the poll's or the one still finishing the local
+/// write below is not observable from outside — `await_total` sees the local
+/// fold the moment its transaction commits, while the follow is still in the
+/// `run_once` that finds nothing more, and a write landing before that read
+/// is folded by it. The ratio the poll costs is measured under `subscribe`
+/// in `tests/two_logs.rs`, where the reader is the test itself and there is
+/// no such gap.
 #[tokio::test]
 async fn a_follow_picks_up_another_logs_write_on_the_poll_interval() {
     let dir = tempfile::tempdir().unwrap();
@@ -475,24 +483,19 @@ async fn a_follow_picks_up_another_logs_write_on_the_poll_interval() {
     runner.init().await.unwrap();
     let follow = tokio::spawn(async move { runner.follow().await });
 
-    // Park it on a write through its own log first. That both proves the
-    // follow is running and pins the start of the wait to *now*, so the
-    // measurement below is nearly the whole interval rather than whatever is
-    // left of one that started at an unknown moment.
+    // A write through its own log first, which proves the follow is running.
     let mut through_a = a.stream_handle("player-1");
     through_a.append(scored(1)).await.unwrap();
     let local = await_total(&a, "player-1", 1, Duration::from_secs(5)).await;
 
+    // Then one the channel cannot announce. The bound is generous: the wait
+    // may have started at any moment, and a runner under load can miss a
+    // poll or two. What would fail here is a follow that never looks.
     let mut through_b = b.stream_handle("player-1");
     through_b.append(scored(7)).await.unwrap();
-    let cross = await_total(&a, "player-1", 8, Duration::from_secs(5)).await;
+    let cross = await_total(&a, "player-1", 8, poll * 10).await;
 
     println!("own log {local:?} / other log {cross:?} / poll {poll:?}");
-    assert!(
-        cross > poll / 4,
-        "the other log's write has no wake-up to arrive on, so it can only \
-         have come from the poll — took {cross:?} against a {poll:?} interval"
-    );
 
     follow.abort();
     let _ = follow.await;
