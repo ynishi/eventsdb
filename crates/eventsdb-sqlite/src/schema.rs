@@ -16,8 +16,9 @@
 //! already ran it will not run it again.
 
 use eventsdb_core::error::{Error, Result};
-use rusqlite::{Connection, TransactionBehavior};
+use rusqlite::{Connection, Transaction, TransactionBehavior};
 
+use crate::hatch::RESERVED_TABLES;
 use crate::shared::classify;
 
 /// The version this build expects. Bumped with every appended step.
@@ -187,12 +188,58 @@ const STEP_5: &str = "
 /// exists yet, so no such step is written.
 const LADDER: &[&str] = &[STEP_1, STEP_2, STEP_3, STEP_4, STEP_5];
 
+/// Refuse a file that already carries a table under one of this crate's names.
+///
+/// Only meaningful at `user_version` 0, and only called there: from version 1
+/// on, those tables are the ladder's own work and refusing them would refuse
+/// every database this crate has ever written.
+///
+/// `sqlite_sequence` is deliberately not checked, although it is in
+/// [`RESERVED_TABLES`]. SQLite creates it for any table with an
+/// `AUTOINCREMENT` column and leaves it behind when that table is dropped, so
+/// a file can hold it at `user_version` 0 with nothing foreign in it at all —
+/// and `STEP_1` does not create it either, it asks for `AUTOINCREMENT` and
+/// lets SQLite reuse the one already there. Its presence says nothing about a
+/// foreign log, so it refuses nothing.
+fn refuse_a_foreign_table(tx: &Transaction<'_>) -> Result<()> {
+    let mut stmt = tx
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .map_err(classify)?;
+    let present: Vec<String> = stmt
+        .query_map([], |row| row.get(0))
+        .map_err(classify)?
+        .collect::<rusqlite::Result<_>>()
+        .map_err(classify)?;
+    drop(stmt);
+
+    // Case-insensitively, as SQLite matches a table name.
+    let taken = present.iter().find(|name| {
+        RESERVED_TABLES
+            .iter()
+            .filter(|reserved| !reserved.eq_ignore_ascii_case("sqlite_sequence"))
+            .any(|reserved| reserved.eq_ignore_ascii_case(name))
+    });
+
+    match taken {
+        None => Ok(()),
+        Some(name) => Err(Error::Unsupported(format!(
+            "the file holds a table named `{name}` that this crate did not create \
+             (`user_version` is 0, so the ladder has never run here). Rename it, \
+             and rename or drop any index whose name the ladder uses, then open \
+             the file and bring the old rows in through `import`. The README's \
+             \"A table this crate did not create\" section is the whole sequence"
+        ))),
+    }
+}
+
 /// Bring `conn` up to [`TARGET_USER_VERSION`], one transaction per step.
 ///
 /// Runs once at open and before any handle is issued, so no append is ever
 /// served against a half-migrated schema. A database from a *newer* build is
 /// refused rather than used: this build does not know what the extra steps
-/// did, and writing under that assumption is how a log gets corrupted.
+/// did, and writing under that assumption is how a log gets corrupted. So is a
+/// file that already holds one of this crate's table names at `user_version` 0
+/// — see `refuse_a_foreign_table`.
 pub fn migrate(conn: &mut Connection) -> Result<()> {
     for (index, step) in LADDER.iter().enumerate() {
         let from = index as i64;
@@ -209,6 +256,11 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
         // like corruption and is not classified `Busy`, so nothing retries it.
         // Under `IMMEDIATE` only one of them holds the write lock here, and
         // the other sees the version the winner committed.
+        //
+        // With that closed, the remaining way a reserved name is already taken
+        // at version 0 is a table this crate did not create, which
+        // `refuse_a_foreign_table` answers below — so the SQLite message is
+        // not something a caller can reach by either route.
         let current: i64 = tx
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .map_err(classify)?;
@@ -224,6 +276,10 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
             // got here first. Dropping the transaction rolls back a read that
             // changed nothing.
             continue;
+        }
+
+        if from == 0 {
+            refuse_a_foreign_table(&tx)?;
         }
 
         tx.execute_batch(step).map_err(classify)?;

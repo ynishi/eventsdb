@@ -265,6 +265,51 @@ a log that cannot do this declines rather than offering a partial import: a
 transfer that stopped half way is worse than one that refused, because from the
 outside there is no way to tell how far it got.
 
+### A table this crate did not create
+
+The file can already hold an `events` table — a hand-rolled log from before
+this crate was adopted, in the file this crate is now asked to open. Opening
+it is refused rather than migrated over, because adopting a table of unknown
+shape under this crate's `user_version` would be a claim about columns nobody
+checked. The refusal names the table and says `user_version` is 0, so a reader
+who has hit it is reading the right section.
+
+The way in is a rename and an `import`. Through a raw connection, before the
+log is opened:
+
+    ALTER TABLE events RENAME TO legacy_events;
+    DROP INDEX events_stream_kind_seq;
+
+The second line is the one that surprises. SQLite carries an index's name
+across `ALTER TABLE ... RENAME`, so an index on the renamed table still holds
+the name the ladder is about to create, and the open fails a step later than
+before. `schema.rs` is where the ladder's index names are; rename or drop
+whichever of them the old table carries.
+
+Then the ladder runs clean and the rows come in through the front door:
+
+    let log = SqliteEventLog::open(&path).await?;
+
+    // The hatch reads anything, the old table included.
+    let rows = log.query("SELECT * FROM legacy_events ORDER BY id", vec![]).await?;
+
+    // One record per row, carrying the position it had over there.
+    let report = log.import(rows.iter().map(to_exported_event).collect()).await?;
+
+    // The old table goes once the report is right.
+    log.with_transaction(|tx| {
+        tx.execute_batch("DROP TABLE legacy_events")?;
+        Ok(())
+    }).await?;
+
+Each record's `position` is the coordinate the row had in the old table, and
+it is a witness rather than an instruction, as in any other import. So
+`reproduced_coordinates` is true only when the import happened to land every
+event back on it — which it does when the old keys ran from 1 with no gaps and
+the log was empty, and does not when they did not.
+
+`tests/adopt.rs` is this sequence, run.
+
 ## The escape hatch
 
 Without one, anyone needing a query the API does not have opens the database

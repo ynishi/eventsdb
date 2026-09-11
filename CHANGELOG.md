@@ -5,6 +5,23 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- **A table this crate did not create is refused at open.** At `user_version`
+  0, `migrate` looks in `sqlite_master` before the first ladder step and
+  returns `Error::Unsupported` if the file already holds a table under one of
+  the names in `RESERVED_TABLES`. It used to run `CREATE TABLE` at such a file
+  and pass SQLite's "table events already exists" through as
+  `Error::Storage` — corruption's word for something that is not corrupt, on
+  a path where retrying is not the question. The check is inside the same
+  `IMMEDIATE` transaction that reads the version, so the concurrent-open race
+  stays closed. `sqlite_sequence` is excluded: SQLite creates it for any
+  `AUTOINCREMENT` table and leaves it behind when that table is dropped, so
+  its presence says nothing about a foreign log. The README's "Moving a log"
+  now carries the way in — rename the table and any index whose name the
+  ladder uses, open, read the old rows through the hatch, `import`, drop what
+  is left.
+
 ### Changed
 
 - The escape hatch's prose says what its code does. `query_timeout` documented
