@@ -99,6 +99,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use crate::log::SqliteEventLog;
 use crate::shared::{classify, map_isle};
+use crate::trace::{self, span};
 
 /// What to remove.
 ///
@@ -387,6 +388,13 @@ impl SqliteEventLog {
     /// [`Plan::describe_archived`].
     async fn apply(&self, plan: Plan, guard: Guard, described: String) -> Result<Report> {
         let shared = self.shared_handle();
+        let span = span!(
+            "eventsdb.retain",
+            plan = %described,
+            guard = ?guard,
+            removed = tracing::field::Empty,
+            highest_removed = tracing::field::Empty,
+        );
 
         let job = move |conn: &mut Connection| {
             Ok((|| {
@@ -479,10 +487,22 @@ impl SqliteEventLog {
             })())
         };
 
-        match shared.isle.call(job).await {
-            Ok(inner) => inner,
-            Err(isle) => Err(map_isle(isle)),
-        }
+        let report = trace::refusal(
+            match trace::instrument(span.clone(), shared.isle.call(job)).await {
+                Ok(inner) => inner,
+                Err(isle) => Err(map_isle(isle)),
+            },
+        )?;
+
+        span.record("removed", report.removed);
+        // `0` is [`Position::BEGINNING`], which is never an event's position,
+        // so it is the reading of "nothing was removed" rather than a second
+        // field saying whether the first one means anything.
+        span.record(
+            "highest_removed",
+            report.highest_removed.map_or(0, |position| position.get()),
+        );
+        Ok(report)
     }
 
     /// Export what `plan` would remove, then apply it under
@@ -559,29 +579,55 @@ impl SqliteEventLog {
             ));
         }
 
-        let Some(target) = self.plan_reach(&plan).await? else {
+        // A span of its own, and not only because it is a loop with a
+        // duration: the removal underneath it is already `eventsdb.retain`,
+        // and what this adds is how much went to the sink before that ran —
+        // which is the number an operator watching an archive wants and the
+        // one the removal cannot report, because the events it removed and
+        // the events that were exported are deliberately not the same set.
+        let span = span!(
+            "eventsdb.archive",
+            plan = %plan.describe(),
+            page = page,
+            pages = tracing::field::Empty,
+            exported = tracing::field::Empty,
+        );
+
+        let Some(target) = trace::instrument(span.clone(), self.plan_reach(&plan)).await? else {
             // Nothing matches, so there is nothing to preserve and nothing to
             // remove. Handing the sink an empty page would be a write the
             // caller has to interpret.
+            span.record("pages", 0);
+            span.record("exported", 0);
             return Ok(Report::nothing());
         };
 
         let mut cursor = self.exported_through().await?;
+        let mut pages = 0usize;
+        let mut exported = 0usize;
         while cursor < target {
-            let (events, receipt) = self.export_recorded(cursor, &Filter::all(), page).await?;
+            let (events, receipt) = trace::instrument(
+                span.clone(),
+                self.export_recorded(cursor, &Filter::all(), page),
+            )
+            .await?;
             if events.is_empty() {
                 // The log ran dry below the reach — something removed those
                 // events between the two reads. Stop rather than spin; the
                 // guard below decides whether what is left is covered.
                 break;
             }
+            pages += 1;
+            exported += events.len();
             sink.write(&events).await?;
             self.confirm_export(receipt.id).await?;
             cursor = receipt.through;
         }
+        span.record("pages", pages);
+        span.record("exported", exported);
 
         let described = plan.describe_archived();
-        self.apply(plan, Guard::Exported, described).await
+        trace::instrument(span, self.apply(plan, Guard::Exported, described)).await
     }
 
     /// How far [`highest_matching`] says `plan` reaches, off a reader.

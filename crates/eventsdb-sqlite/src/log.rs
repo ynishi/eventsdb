@@ -158,6 +158,7 @@ use crate::row;
 use crate::schema;
 use crate::shared::{classify, map_isle, Shared};
 use crate::store::{clamp_limit, SqliteEventStore};
+use crate::trace::{self, span, Span};
 
 /// Default wait before a subscriber looks again when nothing woke it.
 ///
@@ -281,45 +282,69 @@ impl SqliteEventLog {
     pub async fn open_with(path: impl AsRef<Path>, options: OpenOptions) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let busy_timeout = options.busy_timeout;
+        // The whole open: the writer, the readers, and the ladder `finish`
+        // runs. `path` as given, before canonicalisation, because that is the
+        // string the caller passed and would recognise.
+        let span = span!(
+            "eventsdb.open",
+            path = %path.display(),
+            user_version_before = tracing::field::Empty,
+            user_version_after = tracing::field::Empty,
+        );
 
-        let (isle, driver) =
-            AsyncIsle::spawn(&path, move |conn| schema::apply_pragmas(conn, busy_timeout))
-                .await
-                .map_err(map_isle)?;
+        // One instrumented future for the whole open rather than a guard held
+        // across these awaits — see [`crate::trace`] for why this crate never
+        // holds one.
+        trace::instrument(span.clone(), async move {
+            let (isle, driver) =
+                AsyncIsle::spawn(&path, move |conn| schema::apply_pragmas(conn, busy_timeout))
+                    .await
+                    .map_err(map_isle)?;
 
-        // Canonicalised *after* the open, because the file may not have
-        // existed before it. `database` is an identity — two handles answer
-        // with the same string exactly when they are on the same database —
-        // and `./a.db` next to `a.db` would otherwise read as two.
-        let database = std::fs::canonicalize(&path)
-            .unwrap_or_else(|_| path.clone())
-            .display()
-            .to_string();
+            // Canonicalised *after* the open, because the file may not have
+            // existed before it. `database` is an identity — two handles answer
+            // with the same string exactly when they are on the same database —
+            // and `./a.db` next to `a.db` would otherwise read as two.
+            let database = std::fs::canonicalize(&path)
+                .unwrap_or_else(|_| path.clone())
+                .display()
+                .to_string();
 
-        // After the writer, so the WAL files it creates already exist — a
-        // read-only connection cannot create them.
-        let mut readers = Vec::with_capacity(options.readers);
-        let mut reader_drivers = Vec::with_capacity(options.readers);
-        for _ in 0..options.readers {
-            let (reader, reader_driver) = AsyncIsle::builder()
-                .open_flags(
-                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
-                        | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-                )
-                .busy_timeout(busy_timeout)
-                .spawn(&path, move |conn| {
-                    // Belt to the open flag's braces: a statement that would
-                    // write is refused by SQLite rather than by us noticing.
-                    conn.execute_batch("PRAGMA query_only = 1;")
-                })
-                .await
-                .map_err(map_isle)?;
-            readers.push(reader);
-            reader_drivers.push(reader_driver);
-        }
+            // After the writer, so the WAL files it creates already exist — a
+            // read-only connection cannot create them.
+            let mut readers = Vec::with_capacity(options.readers);
+            let mut reader_drivers = Vec::with_capacity(options.readers);
+            for _ in 0..options.readers {
+                let (reader, reader_driver) = AsyncIsle::builder()
+                    .open_flags(
+                        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+                            | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+                    )
+                    .busy_timeout(busy_timeout)
+                    .spawn(&path, move |conn| {
+                        // Belt to the open flag's braces: a statement that would
+                        // write is refused by SQLite rather than by us noticing.
+                        conn.execute_batch("PRAGMA query_only = 1;")
+                    })
+                    .await
+                    .map_err(map_isle)?;
+                readers.push(reader);
+                reader_drivers.push(reader_driver);
+            }
 
-        Self::finish(isle, driver, readers, reader_drivers, database, options).await
+            Self::finish(
+                isle,
+                driver,
+                readers,
+                reader_drivers,
+                database,
+                options,
+                span,
+            )
+            .await
+        })
+        .await
     }
 
     /// A log with no file behind it. Durable in every other respect — the
@@ -330,15 +355,34 @@ impl SqliteEventLog {
 
     pub async fn open_in_memory_with(options: OpenOptions) -> Result<Self> {
         let busy_timeout = options.busy_timeout;
-        let (isle, driver) =
-            AsyncIsle::open_in_memory(move |conn| schema::apply_pragmas(conn, busy_timeout))
-                .await
-                .map_err(map_isle)?;
+        let span = span!(
+            "eventsdb.open",
+            path = ":memory:",
+            user_version_before = tracing::field::Empty,
+            user_version_after = tracing::field::Empty,
+        );
 
-        let database = format!("memory:{}", MEMORY_COUNTER.fetch_add(1, Ordering::Relaxed));
-        // No readers: each `:memory:` open is a separate database, so a second
-        // connection would see an empty one.
-        Self::finish(isle, driver, Vec::new(), Vec::new(), database, options).await
+        trace::instrument(span.clone(), async move {
+            let (isle, driver) =
+                AsyncIsle::open_in_memory(move |conn| schema::apply_pragmas(conn, busy_timeout))
+                    .await
+                    .map_err(map_isle)?;
+
+            let database = format!("memory:{}", MEMORY_COUNTER.fetch_add(1, Ordering::Relaxed));
+            // No readers: each `:memory:` open is a separate database, so a second
+            // connection would see an empty one.
+            Self::finish(
+                isle,
+                driver,
+                Vec::new(),
+                Vec::new(),
+                database,
+                options,
+                span,
+            )
+            .await
+        })
+        .await
     }
 
     async fn finish(
@@ -348,18 +392,31 @@ impl SqliteEventLog {
         reader_drivers: Vec<AsyncIsleDriver>,
         database: String,
         options: OpenOptions,
+        span: Span,
     ) -> Result<Self> {
         // The ladder runs here rather than in the isle's init closure: it
         // reports in this crate's error type, and the init closure can only
         // return rusqlite's. Nothing has a handle yet, so "before any append
         // is served" still holds.
-        match isle
-            .call(|conn: &mut Connection| Ok(schema::migrate(conn)))
+        //
+        // The version is read either side of the ladder in the same call, so
+        // the two numbers are the ones this run saw rather than two separate
+        // questions. Both reads are instrumentation and are not made at all
+        // with the feature off — see [`crate::trace::user_version`].
+        let versions = match isle
+            .call(|conn: &mut Connection| {
+                let before = trace::user_version(conn);
+                let migrated = schema::migrate(conn);
+                let after = trace::user_version(conn);
+                Ok(migrated.map(|()| (before, after)))
+            })
             .await
         {
             Ok(inner) => inner?,
             Err(isle) => return Err(map_isle(isle)),
-        }
+        };
+        span.record("user_version_before", versions.0);
+        span.record("user_version_after", versions.1);
 
         // Seed the watch with the head, so a subscriber that starts before the
         // first write of this process is not told the log is empty when it is
@@ -832,7 +889,19 @@ fn paged(
             // Caught up. Wake on an in-process commit, or look again
             // after the interval — which is what covers a writer in
             // another process.
-            let _ = tokio::time::timeout(poll_interval, woken.changed()).await;
+            //
+            // Which of the two woke it is the difference the README quotes in
+            // microseconds against milliseconds, and it is not visible from
+            // outside this loop: both come back as a batch. So it is recorded
+            // here, at `trace`, because a busy log emits one of these per
+            // commit per subscriber.
+            trace::woke(
+                match tokio::time::timeout(poll_interval, woken.changed()).await {
+                    Ok(_) => "commit",
+                    Err(_) => "interval",
+                },
+                cursor.get(),
+            );
         }
     };
 

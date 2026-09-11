@@ -20,6 +20,12 @@ include = ["src/**/*.rs", "README.md", "LICENSE-MIT", "LICENSE-APACHE"]
 [features]
 sqlite = ["dep:eventsdb-sqlite"]
 
+# Forwarded rather than reinvented: the instrumentation is the backend's, and
+# a caller who took the backend through this name has no other way to reach
+# its feature. Weak (`?`), so asking for it without `sqlite` turns nothing on
+# instead of quietly pulling SQLite in.
+tracing = ["eventsdb-sqlite?/tracing"]
+
 [dependencies]
 eventsdb-core.workspace = true
 eventsdb-sqlite = { path = "../eventsdb-sqlite", version = "0.5.0", optional = true }

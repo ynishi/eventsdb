@@ -524,6 +524,16 @@ Numbers that should get better go in benches; properties that must not regress
 stay in tests, where a failure is a failure rather than a slower bar on a
 chart.
 
+**The same numbers, on your own log.** Every figure quoted above was taken on
+a synthetic log, and the interesting question is what your streams do. Build
+`eventsdb-sqlite` with the `tracing` feature and point a subscriber at it: the
+lock hold is the duration of the `eventsdb.decide` span, the batch is
+`eventsdb.project`'s `batch` and `applied`, and whether a subscription woke on
+the channel or on the poll interval is the `woken_by` field of a `trace` event
+per wake. The full list of spans, events and fields — and the rule that no
+event's `data` or `meta` is ever one of them — is in the crate's rustdoc under
+"Instrumentation".
+
 ## Schema evolution
 
 Two axes, and they are not the same one:

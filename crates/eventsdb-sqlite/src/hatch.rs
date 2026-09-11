@@ -89,6 +89,7 @@ use serde_json::{Map, Value};
 
 use crate::log::SqliteEventLog;
 use crate::shared::{classify, map_isle};
+use crate::trace::{self, span};
 use crate::txn::TxnContext;
 
 /// Tables this crate owns. Reading them is fine; writing them is not.
@@ -609,6 +610,12 @@ impl SqliteEventLog {
         options: QueryOptions,
     ) -> Result<Vec<Map<String, Value>>> {
         let shared = self.shared_handle();
+        let span = span!("eventsdb.hatch", op = "query", rows = tracing::field::Empty);
+        // Entered for the emit alone — no await point inside it — so a
+        // subscriber at `trace` reads the statement against the span that
+        // runs it. The text is the caller's and is bounded; see
+        // [`crate::trace::statement`].
+        span.in_scope(|| trace::statement(sql));
         let sql = sql.to_string();
         let lossy = options.lossy;
         let job = move |conn: &mut Connection| {
@@ -622,15 +629,20 @@ impl SqliteEventLog {
         // A reader: `query` only reads, and running it on the writer is what
         // let one expensive statement stall every append.
         let isle = shared.reader();
-        let outcome = match options.timeout {
-            Some(timeout) => isle.call_timeout(timeout, job).await,
-            None => isle.call(job).await,
-        };
+        let outcome = trace::instrument(span.clone(), async move {
+            match options.timeout {
+                Some(timeout) => isle.call_timeout(timeout, job).await,
+                None => isle.call(job).await,
+            }
+        })
+        .await;
 
-        match outcome {
+        let rows = trace::refusal(match outcome {
             Ok(inner) => inner,
             Err(isle) => Err(map_isle(isle)),
-        }
+        })?;
+        span.record("rows", rows.len());
+        Ok(rows)
     }
 
     /// Your writes and the log's own, in one `IMMEDIATE` transaction.
@@ -685,6 +697,16 @@ impl SqliteEventLog {
         let chain = shared.chain.clone();
         let trusted = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&trusted);
+        // The same span name as `query`, because it is the same door: what
+        // differs is `op`, and that a transaction reports what it appended
+        // where a query reports what it read. There is no `sql` — the
+        // statements are inside the caller's closure and this crate never
+        // sees them.
+        let span = span!(
+            "eventsdb.hatch",
+            op = "transaction",
+            appended = tracing::field::Empty,
+        );
 
         let job = move |conn: &mut Connection| {
             Ok(guarded(conn, trusted, move |conn| {
@@ -700,11 +722,13 @@ impl SqliteEventLog {
             }))
         };
 
-        let (value, positions) = match shared.isle.call(job).await {
-            Ok(inner) => inner?,
+        let (value, positions) = match trace::instrument(span.clone(), shared.isle.call(job)).await
+        {
+            Ok(inner) => trace::refusal(inner)?,
             Err(isle) => return Err(map_isle(isle)),
         };
 
+        span.record("appended", positions.len());
         if let Some(highest) = positions.into_iter().max() {
             shared.publish(highest);
         }
