@@ -5,8 +5,45 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- **The calls that hold a connection longest are on the trace.** Behind the
+  same `tracing` feature, four more spans at `debug`: `eventsdb.backup` on
+  `backup_to` (`path` as given, `pages` — every page of the file, which is
+  what the reader's transaction was held across, and what a WAL checkpoint
+  could not pass for that long); `eventsdb.reclaim` on `reclaim` (`freed`,
+  `freelist_count` before minus after); `eventsdb.index` on `index_meta`
+  (`key`, the `meta` key's *name*, and `created` — `false` when the index
+  was already there and the call was the promised no-op, so a wait on the
+  writer can be told apart from a scan); and `eventsdb.export` on both doors
+  a page leaves by — `export_recorded` with the receipt's own `exported`,
+  `through`, `whole` and `receipt`, and `EventLog::export` with `exported`.
+  Under `archive_then_retain` the export span nests inside `eventsdb.archive`,
+  which keeps its totals: the parent says how far the loop got, the child what
+  one page was.
+
+  The first round instrumented the paths the README quotes in numbers. These
+  four share something else: a duration set by the file rather than by a page
+  or a batch, and a connection held for the whole of it — so "how long, and
+  what for" is the question, and it had no answer. The two reads that exist
+  only to answer it, `freelist_count` and one row of `sqlite_master`, follow
+  `user_version`: constants with the feature off. A refused backup
+  destination is not a `warn` refusal event; it is a bad argument, refused
+  before the span opens, where the four refusals are the store declining a
+  legitimate request. **Still no event's `data` or `meta` at any level** —
+  `tests/tracing.rs` runs every new path over a payload carrying its needle
+  and finds it nowhere, and now asserts span nesting rather than describing
+  it.
+
 ### Fixed
 
+- **`reclaim` frees the whole free list.** It freed one page per call and
+  returned `Ok`. `PRAGMA incremental_vacuum` is a loop that frees a page and
+  yields a row, going on only when stepped again; `execute_batch` steps once.
+  The pragma is now stepped to the end. The one test that covered it asserted
+  the free list went *down*, which one page satisfies; it asserts `0` now,
+  and the new `freed` field — whose arithmetic against the pragma is what
+  caught the defect — is asserted equal to the whole list.
 - The Instrumentation section's dependency line asks for `version = "0.6"`,
   which is the first release that has the `tracing` feature; it said `"0.5"`,
   the number the workspace stood at when the line was written, and a reader

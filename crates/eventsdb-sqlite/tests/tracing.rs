@@ -21,7 +21,8 @@ use std::time::Duration;
 use eventsdb_core::error::Error;
 use eventsdb_core::{EventLog, EventStore, Filter, Position, Result};
 use eventsdb_sqlite::{
-    Guard, OpenOptions, Plan, Projection, ProjectionRunner, SqliteEventLog, Transaction,
+    Guard, JsonLinesSink, OpenOptions, Plan, Projection, ProjectionRunner, SqliteEventLog,
+    Transaction,
 };
 use futures_util::StreamExt;
 use serde_json::{json, Map, Value};
@@ -51,6 +52,9 @@ struct Captured {
     level: Level,
     /// The span's name, or the event's target.
     name: String,
+    /// The name of the span this one was opened under, when there was one.
+    /// Always `None` for an event; only the nesting of spans is under test.
+    parent: Option<String>,
     fields: Vec<(String, String)>,
 }
 
@@ -119,10 +123,12 @@ where
         let mut fields = Fields::default();
         attrs.record(&mut fields);
         let span = ctx.span(id).expect("a span that was just created");
+        let parent = span.parent().map(|parent| parent.name().to_string());
         span.extensions_mut().insert(Captured {
             kind: Kind::Span,
             level: *attrs.metadata().level(),
             name: attrs.metadata().name().to_string(),
+            parent,
             fields: fields.0,
         });
     }
@@ -155,6 +161,7 @@ where
             kind: Kind::Event,
             level: *event.metadata().level(),
             name: event.metadata().target().to_string(),
+            parent: None,
             fields: fields.0,
         });
     }
@@ -300,10 +307,33 @@ async fn the_payload_reaches_nothing_that_is_captured() {
         .await;
     assert_eq!(replayed.len(), 7);
 
-    // retain, last so that nothing above is refused for a missing front
+    // export by both doors: the page is the payload itself, and the span must
+    // carry nothing of it
+    let page = log
+        .export(Position::BEGINNING, &Filter::all(), 10)
+        .await
+        .unwrap();
+    assert_eq!(page.len(), 7);
+    let (page, receipt) = log
+        .export_recorded(Position::BEGINNING, &Filter::all(), 10)
+        .await
+        .unwrap();
+    assert_eq!(page.len(), 7);
+    log.confirm_export(receipt.id).await.unwrap();
+
+    // index: the key is a name under `meta`, never the value under it
+    log.index_meta("tenant").await.unwrap();
+
+    // backup: the whole file, payload included, goes past the span
+    let dir = tempfile::tempdir().unwrap();
+    log.backup_to(dir.path().join("copy.db")).await.unwrap();
+
+    // retain, late so that nothing above is refused for a missing front,
+    // and reclaim after it, which is the order they run in
     log.retain(Plan::Before(Position::new(2)), Guard::Force)
         .await
         .unwrap();
+    log.reclaim().await.unwrap();
 
     let records = captured.taken();
     assert!(
@@ -507,4 +537,226 @@ async fn the_project_span_reports_the_batch_and_the_cursor() {
     assert_eq!(project[0].field("batch"), Some("2"));
     assert_eq!(project[0].field("applied"), Some("2"));
     assert_eq!(project[0].field("cursor"), Some("2"));
+}
+
+// ------------------------------------------------- the second round (#54)
+
+/// The page count is the whole file — which is the number that says what
+/// the reader's transaction was pinned across.
+#[tokio::test]
+async fn the_backup_span_carries_the_page_count_of_the_file() {
+    let (captured, _guard) = capturing();
+    let dir = tempfile::tempdir().unwrap();
+    let log = SqliteEventLog::open(dir.path().join("events.db"))
+        .await
+        .unwrap();
+    let mut orders = log.stream_handle("order-1");
+    for kind in ["placed", "paid", "shipped"] {
+        orders.append(event(kind)).await.unwrap();
+    }
+
+    let copy = dir.path().join("copy.db");
+    log.backup_to(&copy).await.unwrap();
+
+    let backup = captured.spans("eventsdb.backup");
+    assert_eq!(backup.len(), 1, "one copy, one span");
+    assert_eq!(backup[0].level, Level::DEBUG);
+    assert_eq!(
+        backup[0].field("path"),
+        Some(copy.display().to_string().as_str()),
+        "the path as the caller gave it"
+    );
+    let pages: i64 = backup[0].field("pages").unwrap().parse().unwrap();
+    assert!(pages > 0, "a file with a schema in it has pages: {pages}");
+
+    // The copy is that many pages, which is the same statement made twice.
+    let restored = SqliteEventLog::open(&copy).await.unwrap();
+    let rows = restored.query("PRAGMA page_count", vec![]).await.unwrap();
+    let copied = rows[0].values().next().and_then(Value::as_i64).unwrap();
+    assert_eq!(copied, pages);
+}
+
+/// A refused destination is a bad argument, not a declined request: it is
+/// refused before the copy begins, so before the span opens, and no `warn`
+/// is raised for it.
+#[tokio::test]
+async fn a_refused_destination_is_not_a_refusal_event() {
+    let (captured, _guard) = capturing();
+    let dir = tempfile::tempdir().unwrap();
+    let log = SqliteEventLog::open(dir.path().join("events.db"))
+        .await
+        .unwrap();
+    let occupied = dir.path().join("taken.db");
+    std::fs::write(&occupied, b"not a backup").unwrap();
+
+    let error = log.backup_to(&occupied).await.unwrap_err();
+    assert!(matches!(error, Error::Validation(_)));
+
+    assert!(
+        captured.spans("eventsdb.backup").is_empty(),
+        "refused before the copy began, so before the span opened"
+    );
+    assert!(
+        captured
+            .events()
+            .iter()
+            .all(|record| record.level != Level::WARN),
+        "no refusal event for a bad argument"
+    );
+}
+
+/// `reclaim` on the writer, and how many pages it handed back — the number
+/// that separates a vacuum that did something from the no-op on an older
+/// file.
+#[tokio::test]
+async fn the_reclaim_span_counts_the_pages_it_freed() {
+    let (captured, _guard) = capturing();
+    let dir = tempfile::tempdir().unwrap();
+    let log = SqliteEventLog::open(dir.path().join("events.db"))
+        .await
+        .unwrap();
+    let mut s = log.stream_handle("s");
+    let filler = "x".repeat(400);
+    for n in 0..600 {
+        s.append(
+            json!({ "kind": "k", "data": { "n": n, "filler": filler } })
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+        .await
+        .unwrap();
+    }
+    log.retain(Plan::Before(Position::new(500)), Guard::Force)
+        .await
+        .unwrap();
+
+    let before = freelist(&log).await;
+    assert!(before > 0, "the removal left pages on the free list");
+    log.reclaim().await.unwrap();
+    let after = freelist(&log).await;
+
+    let reclaim = captured.spans("eventsdb.reclaim");
+    assert_eq!(reclaim.len(), 1);
+    assert_eq!(reclaim[0].level, Level::DEBUG);
+    let freed: i64 = reclaim[0].field("freed").unwrap().parse().unwrap();
+    assert_eq!(
+        freed,
+        before - after,
+        "`freed` is the free list's own arithmetic: {before} -> {after}"
+    );
+    // The pragma with no count frees every page on the list, and one call
+    // is the whole pragma — not one step of it. This is the assertion that
+    // caught `reclaim` freeing a single page per call.
+    assert_eq!(freed, before, "one call is the whole vacuum");
+    assert_eq!(after, 0);
+
+    // A second pass has nothing to give back, and the span says so rather
+    // than staying silent.
+    log.reclaim().await.unwrap();
+    let reclaim = captured.spans("eventsdb.reclaim");
+    assert_eq!(reclaim.len(), 2);
+    assert_eq!(reclaim[1].field("freed"), Some("0"));
+}
+
+/// `PRAGMA freelist_count`, through the hatch.
+async fn freelist(log: &SqliteEventLog) -> i64 {
+    let rows = log.query("PRAGMA freelist_count", vec![]).await.unwrap();
+    rows[0].values().next().and_then(Value::as_i64).unwrap()
+}
+
+/// `index_meta` twice: a scan the first time, the promised no-op the second,
+/// and the span is what tells them apart.
+#[tokio::test]
+async fn the_index_span_says_whether_it_created_the_index() {
+    let (captured, _guard) = capturing();
+    let log = SqliteEventLog::open_in_memory().await.unwrap();
+    let mut orders = log.stream_handle("order-1");
+    orders.append(event("placed")).await.unwrap();
+
+    log.index_meta("tenant").await.unwrap();
+    log.index_meta("tenant").await.unwrap();
+
+    let index = captured.spans("eventsdb.index");
+    assert_eq!(index.len(), 2);
+    assert_eq!(index[0].level, Level::DEBUG);
+    assert_eq!(index[0].field("key"), Some("tenant"));
+    assert_eq!(index[0].field("created"), Some("true"));
+    assert_eq!(index[1].field("key"), Some("tenant"));
+    assert_eq!(index[1].field("created"), Some("false"));
+}
+
+/// Both doors emit the same span. The receipted one carries the receipt's
+/// own fields; the plain one carries what a page without a receipt has.
+#[tokio::test]
+async fn the_export_span_carries_the_receipt_by_one_door_and_the_count_by_both() {
+    let (captured, _guard) = capturing();
+    let log = SqliteEventLog::open_in_memory().await.unwrap();
+    let mut orders = log.stream_handle("order-1");
+    for kind in ["placed", "paid", "shipped"] {
+        orders.append(event(kind)).await.unwrap();
+    }
+
+    let page = log
+        .export(Position::BEGINNING, &Filter::all(), 2)
+        .await
+        .unwrap();
+    assert_eq!(page.len(), 2);
+    let (page, receipt) = log
+        .export_recorded(Position::new(2), &Filter::kinds(["shipped"]), 10)
+        .await
+        .unwrap();
+    assert_eq!(page.len(), 1);
+
+    let export = captured.spans("eventsdb.export");
+    assert_eq!(export.len(), 2, "one span per door");
+
+    let plain = &export[0];
+    assert_eq!(plain.level, Level::DEBUG);
+    assert_eq!(plain.field("from"), Some("0"));
+    assert_eq!(plain.field("limit"), Some("2"));
+    assert_eq!(plain.field("exported"), Some("2"));
+    assert_eq!(plain.field("receipt"), None, "no receipt by this door");
+
+    let recorded = &export[1];
+    assert_eq!(recorded.field("from"), Some("2"));
+    assert_eq!(recorded.field("limit"), Some("10"));
+    assert_eq!(recorded.field("exported"), Some("1"));
+    assert_eq!(recorded.field("through"), Some("3"));
+    assert_eq!(recorded.field("whole"), Some("false"), "a filter was on");
+    assert_eq!(
+        recorded.field("receipt"),
+        Some(receipt.id.to_string().as_str())
+    );
+}
+
+/// Under the archive loop the page span nests inside `eventsdb.archive`,
+/// which keeps its totals: the parent says how far the loop got, the child
+/// says what one page was.
+#[tokio::test]
+async fn the_export_span_nests_under_the_archive_span() {
+    let (captured, _guard) = capturing();
+    let log = SqliteEventLog::open_in_memory().await.unwrap();
+    let mut orders = log.stream_handle("order-1");
+    for kind in ["placed", "paid", "shipped", "returned", "refunded"] {
+        orders.append(event(kind)).await.unwrap();
+    }
+
+    let mut sink = JsonLinesSink::new(Vec::new());
+    log.archive_then_retain(Plan::Before(Position::new(4)), &mut sink, 2)
+        .await
+        .unwrap();
+
+    let archive = captured.spans("eventsdb.archive");
+    assert_eq!(archive.len(), 1);
+    assert_eq!(archive[0].field("pages"), Some("2"));
+    assert_eq!(archive[0].field("exported"), Some("4"));
+
+    let export = captured.spans("eventsdb.export");
+    assert_eq!(export.len(), 2, "one page span per page the loop took");
+    for page in &export {
+        assert_eq!(page.parent.as_deref(), Some("eventsdb.archive"));
+        assert_eq!(page.field("exported"), Some("2"));
+        assert_eq!(page.field("whole"), Some("true"));
+    }
 }

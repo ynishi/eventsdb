@@ -38,18 +38,23 @@
 //!
 //! With it off, `tracing` is not in the dependency graph and the call sites
 //! compile to the code that was there before. With it on, a subscriber sees
-//! what the paths this crate documents in numbers are actually doing on the
-//! caller's own log: how long a decision held the write lock, how large a
-//! batch the runner chose, whether a subscription woke on the channel or on
-//! the interval. Nothing is emitted unless a subscriber is installed.
+//! two kinds of path. The ones this crate documents in numbers, doing what
+//! they do on the caller's own log: how long a decision held the write lock,
+//! how large a batch the runner chose, whether a subscription woke on the
+//! channel or on the interval. And the ones that hold a connection for a
+//! duration set by the file rather than by a page — the physical copy on a
+//! reader, the vacuum and the index build on the writer, a page leaving by
+//! export — where the question is how long that hold was and what it did.
+//! Nothing is emitted unless a subscriber is installed.
 //!
 //! **The payload is never a field.** `data` and `meta` are the caller's and
 //! may hold anything — a tenant, a customer, a name. Neither appears in a
 //! span or an event at any level. What does appear: coordinates (`position`,
-//! `seq`, a cursor), counts, a consumer or projection name, and — at `debug`,
-//! never above — a stream id and a kind. The one caller-authored text that is
-//! emitted at all is the hatch's `sql`, which is at `trace` and is bounded;
-//! see the last row of the table.
+//! `seq`, a cursor), counts, a consumer or projection name, a path the caller
+//! passed, and — at `debug`, never above — a stream id, a kind, and the
+//! *name* of a `meta` key (never a value under it). The one caller-authored
+//! text that is emitted at all is the hatch's `sql`, which is at `trace` and
+//! is bounded; see the `eventsdb.hatch` rows of the table.
 //!
 //! | path | span, at `debug` | fields |
 //! |---|---|---|
@@ -62,6 +67,11 @@
 //! | [`SqliteEventLog::open`] and the rest of the constructors | `eventsdb.open` | `path`, `user_version_before` and `user_version_after` the ladder |
 //! | [`SqliteEventLog::query`] and its variants | `eventsdb.hatch` | `op = "query"`, `rows` on exit; the `sql` is a **`trace`** event inside the span, clipped to its first 256 characters and marked with `…` when there were more |
 //! | [`SqliteEventLog::with_transaction`] | `eventsdb.hatch` | `op = "transaction"`, `appended` |
+//! | [`SqliteEventLog::backup_to`] | `eventsdb.backup` | `path` as the caller gave it, `pages` on exit — every page of the file, which is what the reader's transaction was held across |
+//! | [`SqliteEventLog::reclaim`] | `eventsdb.reclaim` | `freed` on exit — `freelist_count` before the vacuum minus after it |
+//! | [`SqliteEventLog::index_meta`] | `eventsdb.index` | `key` (the `meta` key's name), `created` on exit — `false` when the index was already there and the call was the promised no-op |
+//! | [`SqliteEventLog::export_recorded`] | `eventsdb.export` | `from`, `limit`; on exit the receipt's own `exported`, `through`, `whole` and `receipt` (its id). Under `archive_then_retain` this nests inside `eventsdb.archive`, one per page |
+//! | [`EventLog::export`] | `eventsdb.export` | `from`, `limit`, `exported` on exit — the same name with the fields a page without a receipt has |
 //!
 //! Two things are events rather than spans:
 //!
@@ -84,6 +94,7 @@
 //! [`EventStore::append_if`]: eventsdb_core::EventStore::append_if
 //! [`EventStore::append_expecting`]: eventsdb_core::EventStore::append_expecting
 //! [`EventLog::subscribe`]: eventsdb_core::EventLog::subscribe
+//! [`EventLog::export`]: eventsdb_core::EventLog::export
 
 mod backup;
 mod catalog;

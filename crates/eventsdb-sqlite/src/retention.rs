@@ -681,7 +681,28 @@ impl SqliteEventLog {
         filter: &Filter,
         limit: usize,
     ) -> Result<(Vec<ExportedEvent>, ExportReceipt)> {
-        let events = crate::transfer::export(self, from, filter, limit).await?;
+        // The page and its receipt under one span, named the same as the one
+        // [`EventLog::export`](eventsdb_core::EventLog::export) gets, so a
+        // subscriber that filters on `eventsdb.export` sees every page that
+        // left the log by either door. Under `archive_then_retain` this nests
+        // inside `eventsdb.archive`, which keeps its own totals: the parent
+        // says how far the loop got, this says what one page was. The fields
+        // on exit are the receipt's own.
+        let span = span!(
+            "eventsdb.export",
+            from = from.get(),
+            limit = limit,
+            exported = tracing::field::Empty,
+            through = tracing::field::Empty,
+            whole = tracing::field::Empty,
+            receipt = tracing::field::Empty,
+        );
+
+        let events = trace::instrument(
+            span.clone(),
+            crate::transfer::export(self, from, filter, limit),
+        )
+        .await?;
         // `export` fills the witness on every record it produces, so the
         // fallback is the empty page's, not a record's missing one.
         let through = events.last().and_then(|last| last.position).unwrap_or(from);
@@ -703,30 +724,38 @@ impl SqliteEventLog {
         let taken_ms = now_ms() as i64;
         let from_stored = crate::log::stored_position(from)?;
         let through_stored = crate::log::stored_position(through)?;
-        let id = match shared
-            .isle
-            .call(move |conn: &mut Connection| {
-                Ok(conn
-                    .execute(
-                        "INSERT INTO exports \
-                         (taken_ms, from_position, through, count, whole, landed_ms) \
-                         VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
-                        rusqlite::params![
-                            taken_ms,
-                            from_stored,
-                            through_stored,
-                            count as i64,
-                            i64::from(whole)
-                        ],
-                    )
-                    .map(|_| conn.last_insert_rowid())
-                    .map_err(classify))
-            })
-            .await
-        {
-            Ok(inner) => inner?,
-            Err(isle) => return Err(map_isle(isle)),
-        };
+        let id = trace::instrument(span.clone(), async move {
+            match shared
+                .isle
+                .call(move |conn: &mut Connection| {
+                    Ok(conn
+                        .execute(
+                            "INSERT INTO exports \
+                             (taken_ms, from_position, through, count, whole, landed_ms) \
+                             VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+                            rusqlite::params![
+                                taken_ms,
+                                from_stored,
+                                through_stored,
+                                count as i64,
+                                i64::from(whole)
+                            ],
+                        )
+                        .map(|_| conn.last_insert_rowid())
+                        .map_err(classify))
+                })
+                .await
+            {
+                Ok(inner) => inner,
+                Err(isle) => Err(map_isle(isle)),
+            }
+        })
+        .await?;
+
+        span.record("exported", count);
+        span.record("through", through.get());
+        span.record("whole", whole);
+        span.record("receipt", id);
 
         Ok((
             events,
@@ -825,18 +854,49 @@ impl SqliteEventLog {
     /// lock. It depends on `auto_vacuum = INCREMENTAL` having been set when
     /// the database was created — on an older file it is a no-op.
     pub async fn reclaim(&self) -> Result<()> {
+        // On the writer, so every append waits behind it, and for a duration
+        // set by how many pages the free list holds rather than by anything
+        // the caller passed — which is why the span carries how many it gave
+        // back: a long `reclaim` that freed nothing is the older file the doc
+        // above describes, and nothing else says so.
+        let span = span!("eventsdb.reclaim", freed = tracing::field::Empty);
+
         let shared = self.shared_handle();
-        match shared
-            .isle
-            .call(|conn: &mut Connection| {
-                Ok(conn
-                    .execute_batch("PRAGMA incremental_vacuum;")
-                    .map_err(classify))
-            })
-            .await
-        {
-            Ok(inner) => inner,
-            Err(isle) => Err(map_isle(isle)),
-        }
+        let freed = trace::instrument(span.clone(), async move {
+            match shared
+                .isle
+                .call(|conn: &mut Connection| {
+                    Ok((|| {
+                        // Both reads are the instrumentation's and cost
+                        // nothing with the feature off — see
+                        // [`trace::freelist_count`].
+                        let before = trace::freelist_count(conn);
+                        // Stepped to the end, not executed once. SQLite
+                        // compiles this pragma as a loop that frees one page
+                        // and then yields a row — `OP_IncrVacuum`,
+                        // `OP_ResultRow`, back to the top — so every
+                        // `sqlite3_step` is one page, and a caller that
+                        // steps once, which is what `execute_batch` does,
+                        // frees one page and returns. The row carries no
+                        // columns; it is the pragma's way of saying "again".
+                        {
+                            let mut statement = conn
+                                .prepare("PRAGMA incremental_vacuum")
+                                .map_err(classify)?;
+                            let mut steps = statement.query([]).map_err(classify)?;
+                            while steps.next().map_err(classify)?.is_some() {}
+                        }
+                        Ok(before - trace::freelist_count(conn))
+                    })())
+                })
+                .await
+            {
+                Ok(inner) => inner,
+                Err(isle) => Err(map_isle(isle)),
+            }
+        })
+        .await?;
+        span.record("freed", freed);
+        Ok(())
     }
 }
