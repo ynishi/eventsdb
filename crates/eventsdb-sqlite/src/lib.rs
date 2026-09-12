@@ -33,7 +33,7 @@
 //! Behind the **`tracing`** feature, off by default:
 //!
 //! ```toml
-//! eventsdb-sqlite = { version = "0.5", features = ["tracing"] }
+//! eventsdb-sqlite = { version = "0.6", features = ["tracing"] }
 //! ```
 //!
 //! With it off, `tracing` is not in the dependency graph and the call sites

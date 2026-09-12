@@ -5,6 +5,13 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Fixed
+
+- The Instrumentation section's dependency line asks for `version = "0.6"`,
+  which is the first release that has the `tracing` feature; it said `"0.5"`,
+  the number the workspace stood at when the line was written, and a reader
+  who pasted it got Cargo refusing a feature 0.5.x does not have. Prose only.
+
 ## [0.6.0] - 2026-09-12
 
 A minor rather than a patch, and this time nothing in it breaks a caller. Every
