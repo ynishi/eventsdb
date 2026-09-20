@@ -5,6 +5,21 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-09-20
+
+The first patch this project has cut that carries anything. 0.1.1, the only
+other one, shipped sources identical to the release before it. A patch and not
+a minor because the public API is byte-for-byte what 0.6.0 published — no item
+added, none changed, none removed — and the `tracing` feature the additions sit
+behind shipped in 0.6.0 too. What is new under it is span output, which a
+caller opts into and reads rather than compiles against.
+
+That leaves the fix as the reason to take this release: `reclaim` freed one
+page per call and reported success, so a caller who trusted it to return space
+to the filesystem has been running with a free list that never emptied. The
+method has shipped since 0.1.0 (`405405d`), so that is every release this
+project has published. Anyone on 0.6.0 wants 0.6.1.
+
 ### Added
 
 - **The calls that hold a connection longest are on the trace.** Behind the
@@ -680,7 +695,8 @@ implemented and tested.
   and `retention`, against a file-backed log. Contention questions live in
   `tests/` instead, where a regression is a failure rather than a slower bar.
 
-[Unreleased]: https://github.com/ynishi/eventsdb/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/ynishi/eventsdb/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/ynishi/eventsdb/releases/tag/v0.6.1
 [0.6.0]: https://github.com/ynishi/eventsdb/releases/tag/v0.6.0
 [0.5.0]: https://github.com/ynishi/eventsdb/releases/tag/v0.5.0
 [0.4.0]: https://github.com/ynishi/eventsdb/releases/tag/v0.4.0
